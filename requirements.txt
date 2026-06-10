@@ -1,0 +1,7 @@
+# 核心依赖
+prompt_toolkit>=3.0.0
+pydantic>=2.7,<3
+rich>=13.0.0
+
+# 开发依赖(可选)
+# pytest>=7.0.0  # 如果使用pytest代替unittest

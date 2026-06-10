@@ -1,0 +1,11 @@
+{
+  "api_key": "",
+  "api_base": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+  "model": "gpt-5.5",
+  "log_level": "ERROR",
+  "notes": "请填入您的 API Key。如果使用 DeepSeek、通义千问等，请修改 api_base 和 model。log_level 可选：DEBUG, INFO, WARNING, ERROR, CRITICAL。",
+  "auth_mode": "codex_cli",
+  "codex_command": "codex",
+  "codex_timeout": 120,
+  "validation_retry_limit": 3
+}

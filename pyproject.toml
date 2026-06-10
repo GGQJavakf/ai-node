@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-todo-assistant"
+version = "0.1.0"
+description = "A local Python todo manager with an AI agent CLI."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "prompt_toolkit>=3.0.0",
+    "pydantic>=2.7,<3",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+ai-todo = "ai_todo_assistant.presentation.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
