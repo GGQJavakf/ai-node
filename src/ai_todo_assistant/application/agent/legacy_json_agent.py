@@ -50,17 +50,24 @@ class AITodoAgent:
         self.manager = manager
         # 统一配置优先级：默认值 < config/settings.json < 环境变量。
         config = load_settings(PROJECT_ROOT)
+        self.config = config
         self.api_key = config["api_key"]
         self.api_base = config["api_base"]
         self.model = config["model"]
         self.auth_mode = config["auth_mode"]
         self.codex_command = config["codex_command"]
         self.codex_timeout = config["codex_timeout"]
+        self.request_timeout = int(
+            config.get("request_timeout")
+            or config.get("codex_request_timeout")
+            or config.get("codex_timeout", 30)
+        )
         self.llm_client = build_llm_client(self._client_config())
 
     def _client_config(self):
         """构造 LLM 客户端配置"""
         return {
+            **self.config,
             "auth_mode": self.auth_mode,
             "api_key": self.api_key,
             "api_base": self.api_base,
@@ -132,7 +139,7 @@ class AITodoAgent:
         }
         
         try:
-            resp_data = self.llm_client.request(data, timeout=15)
+            resp_data = self.llm_client.request(data, timeout=self.request_timeout)
             logger.debug(f"AI 原始响应: {resp_data}")
             ai_text = resp_data['choices'][0]['message']['content'].strip()
             # 兼容即使AI强行带了Markdown包裹块

@@ -27,6 +27,14 @@ class TestToolValidation(unittest.TestCase):
         self.assertEqual(args["title"], "明天要开GPT会员")
         self.assertEqual(args["priority"], "high")
 
+    def test_treats_blank_optional_start_time_as_omitted(self):
+        name, args = validate_tool_call(
+            self._tool_call("add_todo", '{"title":"920 需求评审修改","start_time":"   "}')
+        )
+
+        self.assertEqual(name, "add_todo")
+        self.assertIsNone(args["start_time"])
+
     def test_rejects_unknown_tool_name(self):
         with self.assertRaises(ToolValidationError) as ctx:
             validate_tool_call(self._tool_call("create_payment", "{}"))

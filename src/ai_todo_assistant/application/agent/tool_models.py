@@ -1,6 +1,7 @@
 """Agent 工具参数模型。"""
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -10,6 +11,7 @@ Priority = Literal["high", "medium", "low"]
 TodoFilter = Literal["all", "pending", "completed", "overdue", "upcoming"]
 TimeRange = Literal["today", "week", "month", "all"]
 PriorityFilter = Literal["high", "medium", "low", "all"]
+EvidenceKind = Literal["command", "test", "note", "review", "link", "snapshot"]
 
 
 def _strip_required_text(value: str) -> str:
@@ -26,6 +28,13 @@ def _strip_optional_text(value: str | None) -> str | None:
     if not value:
         raise ValueError("不能为空")
     return value
+
+
+def _strip_optional_time(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
 
 
 class ToolArgsModel(BaseModel):
@@ -79,7 +88,7 @@ class AddTodoArgs(ToolArgsModel):
     @field_validator("start_time", "end_time")
     @classmethod
     def validate_optional_time_text(cls, value: str | None) -> str | None:
-        return _strip_optional_text(value)
+        return _strip_optional_time(value)
 
 
 class DeleteTodosArgs(ToolArgsModel):
@@ -149,6 +158,90 @@ class SearchTodosArgs(ToolArgsModel):
         return _strip_required_text(value)
 
 
+class RememberPreferenceArgs(ToolArgsModel):
+    key: str = Field(min_length=1, description="偏好名称，例如 工作时间、称呼、默认项目")
+    value: str = Field(min_length=1, description="偏好内容，需要稳定且可复用")
+
+    @field_validator("key", "value")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class ForgetPreferenceArgs(ToolArgsModel):
+    key: str = Field(min_length=1, description="要删除的偏好名称")
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class CreateWorkItemArgs(ToolArgsModel):
+    title: str = Field(min_length=1, description="工作项标题")
+    priority: Priority = Field(default="medium", description="优先级")
+    next_action: str = Field(default="", description="建议下一步")
+    project_path: str = Field(default="", description="项目路径")
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class ImportRedmineWorkItemArgs(ToolArgsModel):
+    issue_id: str = Field(min_length=1, description="Redmine issue id")
+    project_path: str = Field(default="", description="Playbook workspace path, empty means current directory")
+
+    @field_validator("issue_id")
+    @classmethod
+    def validate_issue_id(cls, value: str) -> str:
+        value = _strip_required_text(value)
+        if not value.isdigit():
+            raise ValueError("Redmine issue id 必须是数字")
+        return value
+
+
+class RecordEvidenceArgs(ToolArgsModel):
+    work_item_id: str = Field(min_length=1, description="工作项 ID")
+    evidence_type: EvidenceKind = Field(default="note", description="证据类型")
+    summary: str = Field(min_length=1, description="证据摘要")
+    command: str = Field(default="", description="命令文本")
+    output_excerpt: str = Field(default="", description="输出摘录")
+    success: bool | None = Field(default=None, description="是否成功")
+
+    @field_validator("work_item_id", "summary")
+    @classmethod
+    def validate_required(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class WorkItemIdArgs(ToolArgsModel):
+    work_item_id: str = Field(min_length=1, description="工作项 ID")
+
+    @field_validator("work_item_id")
+    @classmethod
+    def validate_work_item_id(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class SyncWorkflowArgs(ToolArgsModel):
+    project_path: str = Field(default="", description="项目路径，空表示当前目录")
+    openspec_change: str | None = Field(default=None, description="OpenSpec change name")
+
+    @field_validator("openspec_change")
+    @classmethod
+    def validate_openspec_change(cls, value: str | None) -> str | None:
+        value = _strip_optional_text(value)
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value):
+            raise ValueError("OpenSpec change name 只能包含字母、数字、下划线、点和连字符")
+        return value
+
+
+class ReadCodexReportsArgs(ToolArgsModel):
+    import_items: bool = Field(default=True, description="是否将未完成/阻塞项导入 WorkItem")
+
+
 TOOL_ARG_MODELS: dict[str, type[ToolArgsModel]] = {
     "list_todos": ListTodosArgs,
     "add_todo": AddTodoArgs,
@@ -158,4 +251,16 @@ TOOL_ARG_MODELS: dict[str, type[ToolArgsModel]] = {
     "search_todos": SearchTodosArgs,
     "get_statistics": EmptyArgs,
     "clear_completed": EmptyArgs,
+    "remember_preference": RememberPreferenceArgs,
+    "list_preferences": EmptyArgs,
+    "forget_preference": ForgetPreferenceArgs,
+    "create_work_item": CreateWorkItemArgs,
+    "import_redmine_work_item": ImportRedmineWorkItemArgs,
+    "list_work_status": EmptyArgs,
+    "sync_workflow_context": SyncWorkflowArgs,
+    "recommend_next_work_action": EmptyArgs,
+    "record_work_evidence": RecordEvidenceArgs,
+    "summarize_work_evidence": WorkItemIdArgs,
+    "read_codex_task_reports": ReadCodexReportsArgs,
+    "generate_daily_workflow_review": EmptyArgs,
 }

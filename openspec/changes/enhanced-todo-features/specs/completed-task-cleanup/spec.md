@@ -17,8 +17,8 @@ The system SHALL allow users to remove all completed tasks with a single command
 - **WHEN** user executes `/clear` with no completed tasks
 - **THEN** system displays "No completed tasks to clear"
 
-### Requirement: User can undo clear operation
-The system SHOULD provide a way to recover recently cleared tasks (optional enhancement).
+### Requirement: User MUST understand clear operation is irreversible
+The system MUST treat cleared completed tasks as permanently removed unless a future undo capability is explicitly added.
 
 #### Scenario: No undo available (basic implementation)
 - **WHEN** user clears completed tasks

@@ -32,6 +32,18 @@ TOOL_DESCRIPTIONS = {
     "search_todos": "搜索待办事项，按关键词匹配标题或描述。当用户说'搜索'、'查找'、'找到关于...的任务'时调用。",
     "get_statistics": "获取待办事项的统计信息（总数、完成数、待完成数、过期数、即将到期数、完成率）。当用户问进度、效率、整体情况、汇报、总结等时调用。",
     "clear_completed": "清除所有已完成的待办事项。当用户说'清理已完成'、'删除已完成任务'时调用。",
+    "remember_preference": "持久化记住用户的稳定偏好，例如称呼、工作时间、默认项目、写作风格。只在用户明确要求记住或长期使用时调用。",
+    "list_preferences": "查看已经记住的用户偏好。当用户问你记住了什么、我的偏好是什么时调用。",
+    "forget_preference": "删除一条已记住的用户偏好。当用户要求忘记、删除某个偏好时调用。",
+    "create_work_item": "创建个人工作项，用于跟踪 Redmine/OpenSpec/Git/Codex 之外的手工工作。",
+    "import_redmine_work_item": "通过 Playbook 只读导入 Redmine issue 为本地 WorkItem，不写 Redmine。",
+    "list_work_status": "查看本地 WorkItem 与同步状态摘要。",
+    "sync_workflow_context": "只读同步当前项目 Git/OpenSpec/Playbook 上下文，缺少外部命令时返回不可用状态。",
+    "recommend_next_work_action": "从活动 WorkItem 中推荐下一步。",
+    "record_work_evidence": "为 WorkItem 追加命令、测试、备注、评审或链接证据。",
+    "summarize_work_evidence": "汇总 WorkItem 的证据，用于日报、closeout 或 MR/Redmine 草稿。",
+    "read_codex_task_reports": "读取 Codex 每日任务 JSON/Markdown 报告，并可导入未完成/阻塞项为 WorkItem。",
+    "generate_daily_workflow_review": "基于 WorkItem 与 Evidence 生成工作日复盘草稿。",
 }
 
 

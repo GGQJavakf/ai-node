@@ -1,0 +1,11 @@
+✅ 使用配置文件: ~/.config\md2wechat\config.yaml
+{"level":"info","ts":1781969127.183357,"caller":"image/processor.go:188","msg":"generating image via AI","prompt":"为公众号文章生成封面图提示词。\n标题：从 0 造一个个人 AI 傀儡｜第 2 天：给傀儡铸行动法脉\n摘要：从修仙视角写个人 AI 傀儡的行动法脉：账册、识海、禁制、法阵如何让它从会说走向会做。\n视觉风格：editorial clean\n画幅：16:9\n\n要求：\n1. 适合 16:9 横版封面\n2. 主题聚焦，视觉锚点明确\n3. 避免堆砌文字，优先图像叙事\n"}
+{
+  "success": false,
+  "code": "IMAGE_GENERATE_FAILED",
+  "message": "generate image: [Volcengine] Volcengine API Key 无效或已过期\n提示: 请检查配置文件中的 api.image_key 是否正确，或前往火山引擎 Ark 控制台获取新的 API Key",
+  "schema_version": "v1",
+  "status": "failed",
+  "retryable": false,
+  "error": "generate image: [Volcengine] Volcengine API Key 无效或已过期\n提示: 请检查配置文件中的 api.image_key 是否正确，或前往火山引擎 Ark 控制台获取新的 API Key"
+}

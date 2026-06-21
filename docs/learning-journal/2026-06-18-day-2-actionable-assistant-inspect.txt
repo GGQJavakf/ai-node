@@ -1,0 +1,25 @@
+Article: D:\IdeaProjects\npki\ai\ai-node\docs\learning-journal\2026-06-18-day-2-actionable-assistant.md
+Metadata
+- title: 从 0 造一个个人 AI 傀儡｜第 2 天：给傀儡铸行动法脉
+  source: frontmatter.title
+  limit: 32
+- author: 龙神帝霸皇
+  source: frontmatter.author
+  limit: 16
+- digest: 从修仙视角写个人 AI 傀儡的行动法脉：账册、识海、禁制、法阵如何让它从会说走向会做。
+  source: frontmatter.digest
+  limit: 128
+Structure
+- body_h1: —
+- duplicate_title_risk: false
+- images: 1
+- preview_fidelity: exact
+- convert_ready: true
+- upload_ready: true
+- draft_ready: false
+Checks
+- INFO DIGEST_METADATA_ONLY: Digest affects draft metadata, not body HTML rendering
+  fix: use body content or theme behavior to control visible article summary inside the HTML
+- INFO IMAGE_REPLACEMENT_REQUIRES_UPLOAD_OR_DRAFT: Images are only uploaded and replaced during upload or draft flows
+  fix: use --upload or --draft when you need local/remote/AI image references rewritten to published URLs
+✅ 使用配置文件: ~/.config\md2wechat\config.yaml

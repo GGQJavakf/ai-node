@@ -16,10 +16,17 @@ env/
 
 # Local runtime state
 todos.json
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/backups/
+data/codex_home/
+data/codex-task-reports/
 log/
 .agent/
 .codegraph/
 .omx/
+tmp_*.txt
 
 # Local editor/system files
 .idea/

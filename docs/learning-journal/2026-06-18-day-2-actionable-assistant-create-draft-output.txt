@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "code": "OK",
+  "message": "Success",
+  "schema_version": "v1",
+  "status": "completed",
+  "retryable": false,
+  "data": {
+    "media_id": "0kFK7R1IvXhbHuHNWaZ96WmSJkA53g-qMzgl4_b4Y_dIFMlV8IVR1mpin7qAExyX"
+  }
+}

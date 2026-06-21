@@ -8,9 +8,29 @@ DEFAULT_SETTINGS = {
     "api_key": "",
     "api_base": "https://api.openai.com/v1/chat/completions",
     "model": "gpt-3.5-turbo",
+    "request_timeout": 45,
+    "api_retry_limit": 2,
+    "api_retry_backoff": 1.0,
     "codex_command": "codex",
     "codex_timeout": 120,
+    "codex_request_timeout": 240,
+    "codex_use_app_server": True,
+    "codex_app_server_timeout": 240,
+    "codex_app_server_start_timeout": 45,
+    "codex_app_server_fallback_to_exec": True,
+    "codex_home": "",
+    "codex_source_home": "",
+    "codex_retry_limit": 1,
+    "codex_ignore_user_config": True,
+    "codex_ignore_rules": True,
     "validation_retry_limit": 3,
+    "session_memory_limit": 20,
+    "storage_backend": "sqlite",
+    "sqlite_path": "data/todos.db",
+    "todo_data_file": "todos.json",
+    "workflow_data_file": "data/workflow.json",
+    "codex_task_report_dir": "data/codex-task-reports",
+    "auto_migrate_json": True,
 }
 
 
@@ -39,11 +59,65 @@ def load_settings(project_root: str | None = None) -> dict:
     config["api_base"] = os.getenv("AI_API_BASE", config["api_base"])
     config["model"] = os.getenv("AI_MODEL", config["model"])
     config["auth_mode"] = os.getenv("AI_AUTH_MODE", config["auth_mode"])
+    config["request_timeout"] = int(os.getenv("AI_REQUEST_TIMEOUT", config["request_timeout"]))
+    config["api_retry_limit"] = int(os.getenv("AI_API_RETRY_LIMIT", config["api_retry_limit"]))
+    config["api_retry_backoff"] = float(
+        os.getenv("AI_API_RETRY_BACKOFF", config["api_retry_backoff"])
+    )
     config["codex_command"] = os.getenv("AI_CODEX_COMMAND", config["codex_command"])
     config["codex_timeout"] = int(os.getenv("AI_CODEX_TIMEOUT", config["codex_timeout"]))
+    config["codex_request_timeout"] = int(
+        os.getenv("AI_CODEX_REQUEST_TIMEOUT", config["codex_request_timeout"])
+    )
+    config["codex_use_app_server"] = _as_bool(
+        os.getenv("AI_CODEX_USE_APP_SERVER", config["codex_use_app_server"])
+    )
+    config["codex_app_server_timeout"] = int(
+        os.getenv("AI_CODEX_APP_SERVER_TIMEOUT", config["codex_app_server_timeout"])
+    )
+    config["codex_app_server_start_timeout"] = int(
+        os.getenv("AI_CODEX_APP_SERVER_START_TIMEOUT", config["codex_app_server_start_timeout"])
+    )
+    config["codex_app_server_fallback_to_exec"] = _as_bool(
+        os.getenv(
+            "AI_CODEX_APP_SERVER_FALLBACK_TO_EXEC",
+            config["codex_app_server_fallback_to_exec"],
+        )
+    )
+    config["codex_home"] = os.getenv("AI_CODEX_HOME", config["codex_home"])
+    config["codex_source_home"] = os.getenv("AI_CODEX_SOURCE_HOME", config["codex_source_home"])
+    config["codex_retry_limit"] = int(os.getenv("AI_CODEX_RETRY_LIMIT", config["codex_retry_limit"]))
+    config["codex_ignore_user_config"] = _as_bool(
+        os.getenv("AI_CODEX_IGNORE_USER_CONFIG", config["codex_ignore_user_config"])
+    )
+    config["codex_ignore_rules"] = _as_bool(
+        os.getenv("AI_CODEX_IGNORE_RULES", config["codex_ignore_rules"])
+    )
     config["validation_retry_limit"] = int(
         os.getenv("AI_VALIDATION_RETRY_LIMIT", config["validation_retry_limit"])
     )
+    config["session_memory_limit"] = int(
+        os.getenv("AI_SESSION_MEMORY_LIMIT", config["session_memory_limit"])
+    )
+    config["storage_backend"] = os.getenv("TODO_STORAGE_BACKEND", config["storage_backend"])
+    config["sqlite_path"] = os.getenv("TODO_SQLITE_PATH", config["sqlite_path"])
+    config["todo_data_file"] = os.getenv("TODO_DATA_FILE", config["todo_data_file"])
+    config["workflow_data_file"] = os.getenv("WORKFLOW_DATA_FILE", config["workflow_data_file"])
+    config["codex_task_report_dir"] = os.getenv(
+        "AI_CODEX_TASK_REPORT_DIR", config["codex_task_report_dir"]
+    )
+    config["auto_migrate_json"] = _as_bool(
+        os.getenv("TODO_AUTO_MIGRATE_JSON", config["auto_migrate_json"])
+    )
+    config["project_root"] = root
     return config
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 

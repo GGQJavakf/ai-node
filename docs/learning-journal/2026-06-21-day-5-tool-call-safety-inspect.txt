@@ -1,0 +1,26 @@
+Article: docs\learning-journal\2026-06-21-day-5-tool-call-safety.md
+
+✅ 使用配置文件: ~/.config\md2wechat\config.yaml
+Metadata
+- title: 从 0 造一个个人 AI 助手｜第 5 天：工具调用别掉链
+  source: frontmatter.title
+  limit: 32
+- author: 龙神帝霸皇
+  source: frontmatter.author
+  limit: 16
+- digest: 把工具调用从能跑推进到可靠，记录个人 AI 助手如何用校验、重试、记忆和边界守住真实执行。
+  source: frontmatter.digest
+  limit: 128
+
+Structure
+- body_h1: —
+- duplicate_title_risk: false
+- images: 0
+- preview_fidelity: exact
+- convert_ready: true
+- upload_ready: true
+- draft_ready: false
+
+Checks
+- INFO DIGEST_METADATA_ONLY: Digest affects draft metadata, not body HTML rendering
+  fix: use body content or theme behavior to control visible article summary inside the HTML

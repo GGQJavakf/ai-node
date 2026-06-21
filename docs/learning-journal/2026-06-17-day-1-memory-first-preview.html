@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>从 0 造一个个人 AI 助手｜第 1 天：给助手开辟识海</title>
+  <style>
+    body { margin: 0; background: #ffffff; }
+    @media (max-width: 520px) { .article-wrap { padding: 16px 14px !important; } }
+  </style>
+</head>
+<body>
+<section class="article-wrap" style="max-width:760px;margin:0 auto;padding:20px 16px;background:#ffffff;font-size:15px;line-height:1.68;color:#2b2f36;letter-spacing:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif;box-sizing:border-box;">
+  <section style="margin:0 0 14px;padding:12px 14px;border-left:4px solid #576b95;background:#f7f8fb;border-radius:6px;color:#3f4652;">
+    <p style="margin:0;">把 AI Agent 比喻成一名修仙者：识海、藏经阁、戒律堂、历练札记，刚好对应一个可靠助手需要处理的四类信息。</p>
+  </section>
+
+  <p style="margin:0 0 10px;">把 AI Agent 比喻成一名刚入山门的修士，第一件事不是御剑飞天，而是先开辟识海。</p>
+  <p style="margin:0 0 10px;">修士没有识海，功法再多也只是乱翻书；Agent 没有记忆体系，模型再强也容易上一句答应、下一句忘记，刚查过的事实转头又凭感觉编。所谓“让 Agent 变聪明”，第一步其实不是给它堆更多工具，而是让它知道：什么放在识海里，什么去藏经阁查，什么必须听戒律堂，什么才配写进历练札记。</p>
+  <p style="margin:0 0 10px;">AI Agent 的记忆，可以借修仙设定拆成四层。</p>
+  <p style="margin:12px 0 4px;text-align:center;"><img src="2026-06-17-day-1-inline-08-xianxia-four-realms.png" alt="四层记忆结构示意" style="max-width:100%;height:auto;border-radius:6px;display:block;margin:0 auto;" /></p>
+  <p style="margin:0 0 12px;text-align:center;color:#888;font-size:13px;line-height:1.45;">图 1：四层记忆像一座宗门：识海管眼前心念，藏经阁管事实，戒律堂管边界，历练札记管经验。</p>
+
+  <h2 style="margin:18px 0 10px;padding:0 0 0 9px;border-left:4px solid #576b95;font-size:18px;line-height:1.4;font-weight:700;color:#1f2937;">一、识海：当前对话</h2>
+  <p style="margin:0 0 10px;">第一层是识海，也就是当前对话。修士斗法时不能忘了上一招怎么起手，Agent 对话时也不能忘了用户刚刚补充的限制。用户说“不要太代码化”，下一句又说“用生活例子讲”，这就是识海里正在翻涌的心念。</p>
+  <p style="margin:0 0 10px;">但识海不能无限大。把每一次工具调用、每一段日志、每一个中间结果都塞进去，就像修士把杂物全扔进识海，最后不是悟道，是走火入魔。短期记忆只需要保存当前任务真正相关的意图、约束和结论。</p>
+
+  <h2 style="margin:18px 0 10px;padding:0 0 0 9px;border-left:4px solid #576b95;font-size:18px;line-height:1.4;font-weight:700;color:#1f2937;">二、藏经阁：事实来源</h2>
+  <p style="margin:0 0 10px;">第二层是藏经阁，也就是事实来源。任务有没有完成、配置现在是什么、接口返回了什么、测试是否通过，这些不是靠识海回忆的。修士想确认一门功法的原文，要进藏经阁翻玉简；Agent 想确认当前状态，也应该查数据库、文件、接口、日志或测试结果。</p>
+  <p style="margin:0 0 10px;">这里有个铁律：聊天记录不是事实。它只证明“曾经有人这么说过”，不证明“现在仍然如此”。一个可靠 Agent 必须养成习惯：凡是会变化的东西，先查证，再回答。</p>
+
+  <h2 style="margin:18px 0 10px;padding:0 0 0 9px;border-left:4px solid #576b95;font-size:18px;line-height:1.4;font-weight:700;color:#1f2937;">三、戒律堂：行为边界</h2>
+  <p style="margin:0 0 10px;">第三层是戒律堂，也就是规则记忆。宗门弟子下山，不是只看自己想做什么，还要看门规：哪些法器不能乱用，哪些秘境必须结伴，哪些话不能泄露。Agent 也是一样。系统提示词、团队规范、工具权限、安全边界、发布审核流程，都属于戒律堂。</p>
+  <p style="margin:0 0 10px;">规则记忆的价值，是让 Agent 不必每次都重新猜“该不该做”。它会先问：这件事能不能执行？是否需要确认？有没有隐私和安全风险？输出格式有没有要求？有了戒律堂，Agent 才不只是会回答，而是知道边界。</p>
+
+  <h2 style="margin:18px 0 10px;padding:0 0 0 9px;border-left:4px solid #576b95;font-size:18px;line-height:1.4;font-weight:700;color:#1f2937;">四、历练札记：长期经验</h2>
+  <p style="margin:0 0 10px;">第四层是历练札记，也就是长期经验。修士下山吃过亏，回来会写札记：某类阵法看似无害，实际入口在侧峰；某种丹方容易失败，关键在火候。Agent 也需要这种经验层。比如某类故障表面像凭证问题，实际常见原因是配置入口变了；某类需求看似要加功能，真正要先确认事实来源。</p>
+  <p style="margin:0 0 10px;">但历练札记不能什么都写。临时情绪、一次性路径、过期配置、工具噪声，都不该沉淀成长期记忆。旧札记能指路，也可能误导；它永远只是线索，最终仍要回到当前证据。</p>
+  <p style="margin:12px 0 4px;text-align:center;"><img src="2026-06-17-day-1-inline-09-xianxia-route.png" alt="记忆归档判断流程" style="max-width:100%;height:auto;border-radius:6px;display:block;margin:0 auto;" /></p>
+  <p style="margin:0 0 12px;text-align:center;color:#888;font-size:13px;line-height:1.45;">图 2：一次请求进来，先入识海理解意图，再查藏经阁确认事实，过戒律堂检查边界，最后才决定是否写入历练札记。</p>
+
+  <h2 style="margin:18px 0 10px;padding:0 0 0 9px;border-left:4px solid #576b95;font-size:18px;line-height:1.4;font-weight:700;color:#1f2937;">五、四层如何一起运转</h2>
+  <p style="margin:0 0 10px;">真正设计 Agent 时，四层记忆不能是四个孤立抽屉，而要像一次出山任务的流程。</p>
+  <section style="margin:12px 0 14px;padding:12px 14px;background:#fbfbfc;border:1px solid #e6e8ef;border-radius:6px;">
+    <ol style="margin:0;padding-left:1.25em;color:#2b2f36;font-size:15px;line-height:1.65;"><li style="margin:0 0 6px;"><span style="color:#576b95;font-weight:600;">入识海</span>：读当前对话，判断用户此刻要解决什么问题。</li><li style="margin:0 0 6px;"><span style="color:#576b95;font-weight:600;">查藏经阁</span>：凡是状态、配置、数量、权限，都从可信来源取证。</li><li style="margin:0 0 6px;"><span style="color:#576b95;font-weight:600;">过戒律堂</span>：执行前检查规则、权限、隐私和输出格式。</li><li style="margin:0;"><span style="color:#576b95;font-weight:600;">写札记</span>：任务结束后，只沉淀可复用经验。</li></ol>
+  </section>
+  <p style="margin:0 0 10px;">写长期记忆前，还要过三问：未来会不会重复出现？能不能被证据验证？会不会带来隐私或安全风险？三问过关，再写入长期记忆。</p>
+
+  <p style="margin:12px 0 4px;text-align:center;"><img src="2026-06-17-day-1-inline-10-xianxia-panorama.png" alt="四层记忆协作全景" style="max-width:100%;height:auto;border-radius:6px;display:block;margin:0 auto;" /></p>
+  <p style="margin:0 0 12px;text-align:center;color:#888;font-size:13px;line-height:1.45;">图 3：全景看四层记忆：识海居中调度，藏经阁、戒律堂、事实水域和历练玉简各守其位，可靠性来自分工，而不是把所有东西混成一团。</p>
+
+  <h2 style="margin:18px 0 10px;padding:0 0 0 9px;border-left:4px solid #576b95;font-size:18px;line-height:1.4;font-weight:700;color:#1f2937;">六、最佳实践</h2>
+  <p style="margin:0 0 10px;">第一，识海要清。短期记忆只放当前任务需要的东西，不让日志和工具细节污染上下文。</p>
+  <p style="margin:0 0 10px;">第二，事实要查。会变化的信息都交给外部事实源，模型只负责理解和推理，不负责凭空记账。</p>
+  <p style="margin:0 0 10px;">第三，戒律要硬。规则、权限、格式、安全边界要稳定存在，不能靠临场发挥。</p>
+  <p style="margin:0 0 10px;">第四，札记要慎。长期记忆不是垃圾桶，而是经验库；写进去之前先确认它可复用、可验证、不过界。</p>
+
+  <p style="margin:0;">一个成熟的个人 AI 助手，不是记性无限好的修士，而是有识海、有藏经阁、有戒律堂、也有历练札记的修行者。它真正可靠的地方，不是永远不忘，而是知道什么时候该想、什么时候该查、什么时候该守规矩、什么时候才值得记下来。</p>
+</section>
+</body>
+</html>

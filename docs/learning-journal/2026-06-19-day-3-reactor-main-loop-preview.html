@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>从 0 造一个个人 AI 助手｜第 3 天：Reactor主循环</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f4ef;
+      --panel: #fffdf7;
+      --ink: #1f1f1f;
+      --muted: #5f5a52;
+      --border: #ddd6c7;
+      --warn: #8c5c00;
+      --error: #9b1c1c;
+      --info: #1f5d8a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Noto Serif SC", serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #efede5 0%, #f9f7f1 100%);
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 24px;
+      padding: 24px;
+      min-height: 100vh;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 12px 32px rgba(59, 43, 17, 0.08);
+    }
+    h1, h2, h3 { margin: 0 0 12px; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-top: 24px; }
+    .meta-row { margin-bottom: 14px; }
+    .meta-label { font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.08em; }
+    .meta-value { font-size: 16px; margin-top: 4px; word-break: break-word; }
+    .meta-source { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      margin-right: 8px;
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
+      background: #fbf8f0;
+    }
+    .check {
+      border-left: 4px solid var(--border);
+      padding: 10px 12px;
+      background: #fcfaf4;
+      margin-bottom: 10px;
+      border-radius: 8px;
+    }
+    .check.warn { border-color: var(--warn); }
+    .check.error { border-color: var(--error); }
+    .check.info { border-color: var(--info); }
+    .check-code { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .article-shell {
+      max-width: 760px;
+      margin: 0 auto;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: 0 16px 40px rgba(40, 33, 18, 0.10);
+    }
+    .banner {
+      border: 1px dashed var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 18px;
+      background: #faf6ec;
+      color: var(--muted);
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f6f3eb;
+      border-radius: 12px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      overflow: auto;
+    }
+    @media (max-width: 960px) {
+      .shell { grid-template-columns: 1fr; }
+      .article-shell { max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="panel">
+      <h1>Publish Preview</h1>
+      <div class="meta-source">docs\learning-journal\2026-06-19-day-3-reactor-main-loop.md</div>
+
+      <h2>Resolved Metadata</h2>
+      <div class="meta-row">
+        <div class="meta-label">Title</div>
+        <div class="meta-value">从 0 造一个个人 AI 助手｜第 3 天：Reactor主循环</div>
+        <div class="meta-source">frontmatter.title · 32 / 32</div>
+      </div>
+      <div class="meta-row">
+        <div class="meta-label">Author</div>
+        <div class="meta-value">龙神帝霸皇</div>
+        <div class="meta-source">frontmatter.author · 5 / 16</div>
+      </div>
+      <div class="meta-row">
+        <div class="meta-label">Digest</div>
+        <div class="meta-value">从 AgentCore 拆出 Reactor 主循环，记录个人 AI 助手如何把模型、工具、记忆和错误恢复放进可测试轨道。</div>
+        <div class="meta-source">frontmatter.digest · 61 / 128</div>
+      </div>
+
+      <h2>Context</h2>
+      <span class="pill">mode: api</span>
+      <span class="pill">theme: default</span>
+      <span class="pill">font: medium</span>
+      <span class="pill">background: none</span>
+      <span class="pill">preview: degraded</span>
+
+      <h2>Structure</h2>
+      <div class="meta-row">
+        <div class="meta-label">Body H1</div>
+        <div class="meta-value">—</div>
+      </div>
+      <div class="meta-row">
+        <div class="meta-label">Images</div>
+        <div class="meta-value">0 total · 0 local · 0 remote · 0 ai</div>
+      </div>
+
+      <h2>Checks</h2>
+      
+        
+          <div class="check info">
+            <div class="check-code">info · DIGEST_METADATA_ONLY</div>
+            <div>Digest affects draft metadata, not body HTML rendering</div>
+            <div class="meta-source">use body content or theme behavior to control visible article summary inside the HTML</div>
+          </div>
+        
+      
+    </aside>
+
+    <main class="panel">
+      <div class="article-shell">
+        
+          <div class="banner">Preview degraded: exact HTML could not be rendered in the current environment.</div>
+        
+        
+          <div class="banner">Render error: API call failed: API_ERROR: API returned error code 401: Invalid API Key format. Supported prefixes: wme_, wme2_, wmt_.</div>
+        
+        
+          <h1 style="margin-bottom:12px;">从 0 造一个个人 AI 助手｜第 3 天：Reactor主循环</h1>
+          <p style="color:#666; margin-top:0;">龙神帝霸皇</p>
+          <p style="color:#666;">从 AgentCore 拆出 Reactor 主循环，记录个人 AI 助手如何把模型、工具、记忆和错误恢复放进可测试轨道。</p>
+          <h2 style="margin-top:24px;">Markdown Body</h2>
+          <pre>昨天我写到“会聊天”和“能行动”之间隔着一条工程轨道。今天继续往里挖，发现真正难的不是再加一个工具，也不是再接一个更强的模型，而是给整个助手设计一颗稳定的心脏。今天这颗心脏在代码里叫 Reactor。
+
+刚开始做 ai-node 时，`AgentCore.chat()` 是一个很好理解的入口：收到用户输入，拼 system prompt，带上当前待办和偏好，请求 LLM，模型如果返回 tool_calls，就校验参数、执行工具、再把工具结果送回模型。这个流程直观，也适合第一个版本。但当项目开始有 SQLite、短期记忆、长期偏好、Codex 接入、校验重试和流式输出以后，一个函数继续扛所有事情就会变得危险。危险不在于它不能运行，而在于它越来越难解释。
+
+所以今天最重要的变化，是把推理循环拆成了三个概念：事件、状态和副作用。
+
+事件是外部世界发生了什么，比如用户说了一句话、LLM 返回了一条消息、工具执行完成。状态是当前这一轮对话进行到哪里了，比如消息列表、校验失败次数、工具调用轮次、最终回复和停止原因。副作用则是下一步要做什么，比如请求 LLM 或执行工具。
+
+这个拆法最打动我的地方，是它把“决定”和“执行”分开了。`AgentReactor.step(state, event)` 只负责判断：现在该请求模型，还是该执行工具，还是该因为参数错误让模型重试。它不直接访问网络，不写数据库，也不操作终端。真正的网络请求、工具执行和错误恢复交给 `AgentRuntime` 处理。工程上可靠的自主，不是让模型在黑盒里自由发挥，而是让每一次动作都落在明确的状态转换上。
+
+今天的测试也很有意思。`tests/test_reactor_runtime.py` 不是去模拟一个完整聊天，而是逐个验证状态机行为：用户消息会产生 `RequestLlm` effect；普通助手回复会进入 final 状态；合法 tool call 会变成 `ExecuteTools`；非法参数不会执行本地工具，而是追加 `role=tool` 的错误反馈，再请求模型重新生成。工具参数校验失败时，工具尚未执行；错误信息通过 Chat Completions 能理解的 `role=tool` 协议回给模型；超过重试次数就停住，避免错误参数写入本地待办。这不是提示词技巧，而是安全边界。
+
+短期记忆也在这个结构里变得更清楚。`SessionMemory` 只保存 user 和 assistant 的自然语言消息，不保存 tool_call 和工具结果。今天再看这个选择，我觉得它比一开始想象得更重要。个人助手需要记住“我刚才说了什么”，但不应该把每个数据库返回、每个校验错误都塞进对话窗口。真实待办和长期偏好应该从仓储读取，工具链噪音应该留在执行链里。
+
+Codex 接入这一段也暴露了本地助手的复杂度。README 里现在写得很明确：默认 LLM 后端是 OpenAI 兼容 API Key，Codex 登录态只是可选后备；Codex 模式优先使用 `app-server --listen stdio://`，并把 auth 复制到项目私有的 `data/codex_home`，只复用登录态，不加载用户个人配置、插件、MCP 和 hooks。这个设计不是为了炫技，而是为了隔离边界。
+
+今天还有一个现实取舍：带工具时仍然保守地关闭流式工具链。流式输出当然更像真人聊天，但当前工具循环依赖完整的 `message.tool_calls`。如果为了“看起来更快”而破坏工具调用闭环，最后得到的是半截回答和不可验证的操作。
+
+把第 3 天的进展串起来，我看到 ai-node 正在从“一个能调用工具的 CLI demo”变成“一个有主循环的个人助手雏形”。SQLite 负责事实，SessionMemory 负责短期上下文，ToolExecutor 负责本地动作，LLM client 负责模型适配，而 Reactor 负责把它们编排成一条可测试的行动链。
+
+这也改变了我对“成熟”的定义。成熟不是代码变多，也不是模型名字变新，而是每个边界都能被解释：为什么这里要校验，为什么这里不能执行，为什么这里要重试，为什么这里要停止。个人 AI 助手的主循环必须先于炫酷能力稳定下来。没有主循环，记忆、工具、RAG、MCP 都只是散落的零件；有了主循环，它们才有机会被接进同一套状态机里，成为可观察、可测试、可演进的能力。
+
+所以第 3 天的标题我想叫“Reactor 让助手开始有主循环”。从今天开始，这个项目不只是让模型回答我，而是在给模型搭一条能长期运转的执行神经。</pre>
+        
+      </div>
+    </main>
+  </div>
+</body>
+</html>

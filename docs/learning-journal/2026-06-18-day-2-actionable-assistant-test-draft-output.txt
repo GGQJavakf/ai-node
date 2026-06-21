@@ -1,0 +1,12 @@
+﻿{
+  "success": true,
+  "code": "TEST_DRAFT_CREATED",
+  "message": "Draft created successfully",
+  "schema_version": "v1",
+  "status": "completed",
+  "retryable": false,
+  "data": {
+    "media_id": "0kFK7R1IvXhbHuHNWaZ96dkuKpC7d-2ZCkhIxGz6hn2vpWRoRy2z6v4cMTQtBgPi",
+    "message": "Draft created successfully! You can check it in WeChat backend."
+  }
+}

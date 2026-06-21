@@ -1,9 +1,9 @@
 """
 JSON 持久化适配器。
 
-当前版本仍使用 `todos.json` 保存数据。这个类保留历史名称 `TodoManager`，
-方便旧代码兼容；从 DDD 视角看，它承担的是仓储实现和查询服务职责。
-SQLite 替换时优先新增同接口实现，不需要改领域实体和 Agent 工具层。
+默认版本已使用 SQLite。这个 JSON 仓储保留历史名称 `TodoManager`，
+方便旧代码、测试和迁移场景兼容；从 DDD 视角看，它承担的是可替换的
+仓储实现和查询服务职责。
 """
 import json
 import os
@@ -18,6 +18,7 @@ class TodoManager:
 
     def __init__(self, data_file: str = "todos.json"):
         self.data_file = data_file
+        self.preferences_file = self._preferences_file_for(data_file)
         self.todos: List[Todo] = []
         self.load()
 
@@ -228,7 +229,7 @@ class TodoManager:
         }
 
     def save(self) -> None:
-        """保存到 JSON 文件。SQLite 迁移前暂不改变写入策略。"""
+        """保存到 JSON 文件。仅用于兼容旧版存储后端。"""
         data = [todo.to_dict() for todo in self.todos]
         with open(self.data_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -255,6 +256,52 @@ class TodoManager:
             self.save()
         return cleared_count
 
+    def remember_preference(self, key: str, value: str) -> None:
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            raise ValueError("偏好名称不能为空")
+        if not value:
+            raise ValueError("偏好内容不能为空")
+        preferences = self.list_preferences()
+        preferences[key] = value
+        self._save_preferences(preferences)
+
+    def list_preferences(self) -> Dict[str, str]:
+        if not os.path.exists(self.preferences_file):
+            return {}
+        try:
+            with open(self.preferences_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            return {
+                str(key): str(value)
+                for key, value in data.items()
+                if str(key).strip() and str(value).strip()
+            }
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def forget_preference(self, key: str) -> bool:
+        preferences = self.list_preferences()
+        removed = preferences.pop(key.strip(), None) is not None
+        if removed:
+            self._save_preferences(preferences)
+        return removed
+
+    def _save_preferences(self, preferences: Dict[str, str]) -> None:
+        directory = os.path.dirname(os.path.abspath(self.preferences_file))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(self.preferences_file, "w", encoding="utf-8") as f:
+            json.dump(preferences, f, ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _preferences_file_for(data_file: str) -> str:
+        base, _ = os.path.splitext(data_file)
+        return f"{base}.preferences.json"
+
     @staticmethod
     def _parse_datetime(value: str) -> Optional[datetime]:
         """集中解析日期时间，减少各查询方法重复判断格式。"""
@@ -270,4 +317,7 @@ class TodoManager:
     def _date_part(cls, value: Optional[str]):
         parsed = cls._parse_datetime(value) if value else None
         return parsed.date() if parsed else None
+
+
+JsonTodoRepository = TodoManager
 

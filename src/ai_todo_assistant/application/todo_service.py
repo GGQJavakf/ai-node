@@ -2,19 +2,22 @@
 待办应用服务。
 
 应用服务提供稳定的用例入口，避免 UI、Agent 工具或未来 API 层直接依赖
-持久化实现细节。当前仍复用 TodoManager 的能力，后续切 SQLite 时只需替换仓储。
+持久化实现细节。默认仓储由工厂创建，目前使用 SQLite，测试或兼容场景
+仍可注入 JSON 仓储。
 """
 from typing import Optional
 
+from ai_todo_assistant.application.ports import TodoRepository
 from ai_todo_assistant.domain.models import Todo
-from ai_todo_assistant.infrastructure.persistence.json_todo_repository import TodoManager
+from ai_todo_assistant.infrastructure.config import load_settings
+from ai_todo_assistant.infrastructure.persistence import build_todo_repository
 
 
 class TodoApplicationService:
     """面向上层接口的待办用例服务。"""
 
-    def __init__(self, manager: Optional[TodoManager] = None):
-        self.manager = manager or TodoManager()
+    def __init__(self, manager: Optional[TodoRepository] = None):
+        self.manager = manager or build_todo_repository(load_settings())
 
     def create_todo(
         self,

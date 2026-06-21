@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>从 0 造一个个人 AI 助手｜第 4 天：Codex工作雷达</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f4ef;
+      --panel: #fffdf7;
+      --ink: #1f1f1f;
+      --muted: #5f5a52;
+      --border: #ddd6c7;
+      --warn: #8c5c00;
+      --error: #9b1c1c;
+      --info: #1f5d8a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Georgia, "Noto Serif SC", serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #efede5 0%, #f9f7f1 100%);
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 24px;
+      padding: 24px;
+      min-height: 100vh;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 12px 32px rgba(59, 43, 17, 0.08);
+    }
+    h1, h2, h3 { margin: 0 0 12px; }
+    h1 { font-size: 24px; }
+    h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-top: 24px; }
+    .meta-row { margin-bottom: 14px; }
+    .meta-label { font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.08em; }
+    .meta-value { font-size: 16px; margin-top: 4px; word-break: break-word; }
+    .meta-source { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 12px;
+      margin-right: 8px;
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
+      background: #fbf8f0;
+    }
+    .check {
+      border-left: 4px solid var(--border);
+      padding: 10px 12px;
+      background: #fcfaf4;
+      margin-bottom: 10px;
+      border-radius: 8px;
+    }
+    .check.warn { border-color: var(--warn); }
+    .check.error { border-color: var(--error); }
+    .check.info { border-color: var(--info); }
+    .check-code { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .article-shell {
+      max-width: 760px;
+      margin: 0 auto;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px;
+      box-shadow: 0 16px 40px rgba(40, 33, 18, 0.10);
+    }
+    .banner {
+      border: 1px dashed var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 18px;
+      background: #faf6ec;
+      color: var(--muted);
+    }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #f6f3eb;
+      border-radius: 12px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      overflow: auto;
+    }
+    @media (max-width: 960px) {
+      .shell { grid-template-columns: 1fr; }
+      .article-shell { max-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="panel">
+      <h1>Publish Preview</h1>
+      <div class="meta-source">docs\learning-journal\2026-06-20-day-4-codex-work-radar.md</div>
+
+      <h2>Resolved Metadata</h2>
+      <div class="meta-row">
+        <div class="meta-label">Title</div>
+        <div class="meta-value">从 0 造一个个人 AI 助手｜第 4 天：Codex工作雷达</div>
+        <div class="meta-source">frontmatter.title · 31 / 32</div>
+      </div>
+      <div class="meta-row">
+        <div class="meta-label">Author</div>
+        <div class="meta-value">龙神帝霸皇</div>
+        <div class="meta-source">frontmatter.author · 5 / 16</div>
+      </div>
+      <div class="meta-row">
+        <div class="meta-label">Digest</div>
+        <div class="meta-value">把 Codex 每日任务报告接进个人助手，记录一个 AI Agent 如何从会执行任务走向会整理工作现场。</div>
+        <div class="meta-source">frontmatter.digest · 53 / 128</div>
+      </div>
+
+      <h2>Context</h2>
+      <span class="pill">mode: api</span>
+      <span class="pill">theme: default</span>
+      <span class="pill">font: medium</span>
+      <span class="pill">background: none</span>
+      <span class="pill">preview: degraded</span>
+
+      <h2>Structure</h2>
+      <div class="meta-row">
+        <div class="meta-label">Body H1</div>
+        <div class="meta-value">—</div>
+      </div>
+      <div class="meta-row">
+        <div class="meta-label">Images</div>
+        <div class="meta-value">0 total · 0 local · 0 remote · 0 ai</div>
+      </div>
+
+      <h2>Checks</h2>
+      
+        
+          <div class="check info">
+            <div class="check-code">info · DIGEST_METADATA_ONLY</div>
+            <div>Digest affects draft metadata, not body HTML rendering</div>
+            <div class="meta-source">use body content or theme behavior to control visible article summary inside the HTML</div>
+          </div>
+        
+      
+    </aside>
+
+    <main class="panel">
+      <div class="article-shell">
+        
+          <div class="banner">Preview degraded: exact HTML could not be rendered in the current environment.</div>
+        
+        
+          <div class="banner">Render error: API call failed: API_ERROR: API returned error code 401: Invalid API Key format. Supported prefixes: wme_, wme2_, wmt_.</div>
+        
+        
+          <h1 style="margin-bottom:12px;">从 0 造一个个人 AI 助手｜第 4 天：Codex工作雷达</h1>
+          <p style="color:#666; margin-top:0;">龙神帝霸皇</p>
+          <p style="color:#666;">把 Codex 每日任务报告接进个人助手，记录一个 AI Agent 如何从会执行任务走向会整理工作现场。</p>
+          <h2 style="margin-top:24px;">Markdown Body</h2>
+          <pre>第 4 天，我开始处理一个更贴近真实工作的痛点：AI 助手不能只等我发指令，它还得知道我昨天让 Codex 跑了什么、哪些线程没有收尾、哪些任务已经完成但缺少证据。一个个人 AI 助手如果只会管理待办，其实还停留在“记事本增强版”；它要变成工作助手，第一步就是把外部工作现场变成可读、可追踪、可复盘的事实。
+
+前几天我把注意力放在记忆、工具调用和 Reactor 主循环上。那些能力解决的是“对话时怎么安全行动”。今天的重点变了，变成“对话之前，助手怎么知道我手里发生了什么”。这也是 AI Agent 很容易被低估的一层：模型本身再强，如果没有稳定的上下文入口，就只能靠用户不断复述现状。复述多了，人会烦，助手也会漏。
+
+仓库里的新材料给了我一个方向：让 Codex 自动化负责检查线程和任务，把结果写成本地每日快照；ai-node 只读取这些稳定文件，再把未完成、阻塞、已完成的条目同步进个人工作项。这里的边界很重要。助手不直接钻进 Codex 的内部会话存储，也不替 Codex 判断所有细节，它只消费一个约定好的日报目录：结构化 JSON 用来判断状态，配套 Markdown 用来给人读。
+
+这个设计看上去简单，其实是在给个人助手补一块“工作雷达”。雷达不是执行器，它先负责发现目标。日报里会有生成时间、未完成数量、阻塞任务、已完成任务和摘要；任务条目再带上线程标识、状态、工作目录、下一步、证据和完成信号。这样助手不需要猜“我是不是还有事没做”，它可以从快照里读到明确事实。
+
+我很喜欢这个取舍，因为它没有把个人助手做成另一个全能调度中心。它更像一个本地工作台：把 Git、OpenSpec、Playbook、Codex 报告这几类事实拉进来，统一存成工作项和证据。读 Git 时看分支、脏状态和 diff 摘要；读规范变更时看当前活跃项和应用指令状态；读 Playbook 时只做工作区状态、缺口和 Redmine 快照；读 Codex 日报时只消费自动化已经整理好的文件。整个链路都偏只读，默认不写 Redmine、不合并 MR、不清理工作区、不做发布。这种克制比“什么都能帮我点一下”更适合第一个个人助手。
+
+今天让我重新理解了“记忆”和“证据”的区别。记忆解决的是对话连续性，证据解决的是工作可信度。短期记忆可以记住我刚刚说过什么，但它不能证明一个任务已经完成；长期偏好可以记住我喜欢怎样排优先级，但它不能替代一条验证输出。真正的工作助手必须能把“我觉得完成了”拆成“有什么完成信号”“证据从哪里来”“下一步是否为空”。否则它给我的只是情绪安慰，不是可交付判断。
+
+测试也在逼我把这个边界说清楚。Codex 日报的测试不会真的去翻 Codex 会话，而是构造一份本地 JSON 和 Markdown，验证助手能读出任务状态、完成信号和日报路径。同步服务的测试也不依赖真实 Git 或 Playbook，而是用替身返回快照，验证多个来源会被合并成一个项目同步上下文，并追加证据。连接器测试覆盖了命令不存在、输出不是 JSON 这类失败场景。
+
+这类测试看起来不炫，但它们决定了个人助手能不能长期跑。真实工作环境里，外部命令经常不稳定：可能没安装，可能网络失败，也可能输出格式变了。一个成熟一点的 AI Agent 不能因为某个外部状态取不到就把整个 CLI 弄挂。今天的代码方向，是把失败也纳入事实模型：成功有摘要，失败也有错误和输出片段。
+
+我还意识到，日报同步不是为了制造更多待办，而是为了减少脑内缓存。以前我每天打开多个 Codex 线程，靠记忆判断哪个还没闭环；现在更好的方式是让自动化把线程状态沉淀成每日任务报告，再由个人助手在 `/codex tasks`、`/continue`、`/start day`、`/review day` 这些入口里给我重新排序。人负责判断价值，助手负责把散落的现场整理成可行动列表。
+
+这也解释了为什么今天没有急着上更复杂的 RAG。RAG 适合从大量知识里检索答案，但我现在更需要的是一条可靠的工作事实管道。日报、快照、证据、工作项，这些东西不像知识库那样追求召回率，而是追求来源清晰和状态可追溯。等这条管道稳定以后，再把文档检索、历史复盘和项目知识接进来，才不会把“看起来聪明”建立在混乱数据上。
+
+第 4 天的收获是：个人 AI 助手的成熟，不只是会调用工具，也不是多接几个模型，而是开始拥有自己的工作现场感。它知道事实从哪里来，知道哪些动作只能读不能写，知道完成必须有信号，知道失败也要留下可解释的快照。
+
+从今天开始，ai-node 不再只是一个待办助手。它开始像一个小型工作雷达，先把我散落在 Codex、Git、规范和项目工具里的状态扫出来，再提醒我下一步真正该做什么。这个能力不花哨，但我觉得它很关键。因为一个助手只有先看见现场，才有资格谈自动化。</pre>
+        
+      </div>
+    </main>
+  </div>
+</body>
+</html>

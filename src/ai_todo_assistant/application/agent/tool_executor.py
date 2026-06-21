@@ -1,7 +1,18 @@
 """Agent 工具执行器。"""
+from datetime import datetime
+import os
 from typing import Any
 
-from ai_todo_assistant.infrastructure.persistence.json_todo_repository import TodoManager
+from ai_todo_assistant.application.ports import TodoRepository
+from ai_todo_assistant.application.workflow import (
+    CodexTaskReportService,
+    ContinueService,
+    DailyReviewService,
+    EvidenceService,
+    WorkItemService,
+    WorkflowSyncService,
+)
+from ai_todo_assistant.infrastructure.persistence import build_workflow_repository
 
 
 class ToolExecutor:
@@ -12,8 +23,10 @@ class ToolExecutor:
     真正的数据变更仍由本地应用代码执行。
     """
 
-    def __init__(self, manager: TodoManager):
+    def __init__(self, manager: TodoRepository, config: dict | None = None, workflow_repository=None):
         self.manager = manager
+        self.config = config or {}
+        self.workflow_repository = workflow_repository or build_workflow_repository(self.config)
         self._dispatch: dict[str, Any] = {
             "list_todos": self._list_todos,
             "add_todo": self._add_todo,
@@ -23,6 +36,18 @@ class ToolExecutor:
             "search_todos": self._search_todos,
             "get_statistics": self._get_statistics,
             "clear_completed": self._clear_completed,
+            "remember_preference": self._remember_preference,
+            "list_preferences": self._list_preferences,
+            "forget_preference": self._forget_preference,
+            "create_work_item": self._create_work_item,
+            "import_redmine_work_item": self._import_redmine_work_item,
+            "list_work_status": self._list_work_status,
+            "sync_workflow_context": self._sync_workflow_context,
+            "recommend_next_work_action": self._recommend_next_work_action,
+            "record_work_evidence": self._record_work_evidence,
+            "summarize_work_evidence": self._summarize_work_evidence,
+            "read_codex_task_reports": self._read_codex_task_reports,
+            "generate_daily_workflow_review": self._generate_daily_workflow_review,
         }
 
     def execute(self, tool_name: str, tool_args: dict) -> str:
@@ -78,10 +103,16 @@ class ToolExecutor:
         self,
         title: str,
         description: str = "",
-        start_time: str = None,
-        end_time: str = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
         priority: str = "medium",
     ) -> str:
+        now = datetime.now()
+        if start_time is None:
+            start_time = now.strftime("%Y-%m-%d %H:%M:%S")
+        if end_time is None:
+            end_time = now.strftime("%Y-%m-%d 23:59:59")
+
         todo = self.manager.add(
             title=title,
             description=description,
@@ -110,11 +141,11 @@ class ToolExecutor:
     def _update_todo(
         self,
         id: str,
-        title: str = None,
-        description: str = None,
-        start_time: str = None,
-        end_time: str = None,
-        priority: str = None,
+        title: str | None = None,
+        description: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        priority: str | None = None,
     ) -> str:
         todo = self.manager.update(
             todo_id=id,
@@ -155,5 +186,94 @@ class ToolExecutor:
     def _clear_completed(self) -> str:
         count = self.manager.clear_completed()
         return f"已清除 {count} 条已完成的待办事项。"
+
+    def _remember_preference(self, key: str, value: str) -> str:
+        self.manager.remember_preference(key, value)
+        return f"已记住偏好：{key} = {value}"
+
+    def _list_preferences(self) -> str:
+        preferences = self.manager.list_preferences()
+        if not preferences:
+            return "当前还没有记住任何长期偏好。"
+        return "已记住的偏好：\n" + "\n".join(
+            f"  - {key}: {value}" for key, value in preferences.items()
+        )
+
+    def _forget_preference(self, key: str) -> str:
+        if self.manager.forget_preference(key):
+            return f"已忘记偏好：{key}"
+        return f"未找到偏好：{key}"
+
+    def _create_work_item(self, title: str, priority: str = "medium", next_action: str = "", project_path: str = "") -> str:
+        item = WorkItemService(self.workflow_repository).create_manual(
+            title=title,
+            priority=priority,
+            next_action=next_action,
+            project_path=project_path,
+        )
+        return f"已创建工作项：{item.title} (ID:{item.id})"
+
+    def _import_redmine_work_item(self, issue_id: str, project_path: str = "") -> str:
+        try:
+            item = WorkflowSyncService(self.workflow_repository).import_redmine(project_path or os.getcwd(), issue_id)
+        except RuntimeError as exc:
+            return f"Redmine 工作项导入失败：{exc}"
+        return f"已导入 Redmine 工作项：{item.title} (ID:{item.id})"
+
+    def _list_work_status(self) -> str:
+        return WorkItemService(self.workflow_repository).status_summary()
+
+    def _sync_workflow_context(self, project_path: str = "", openspec_change: str | None = None) -> str:
+        snapshots = WorkflowSyncService(self.workflow_repository).sync_project(project_path or os.getcwd(), openspec_change)
+        lines = []
+        for snapshot in snapshots:
+            status = "OK" if snapshot.success else "UNAVAILABLE"
+            lines.append(f"[{status}] {snapshot.source}: {snapshot.summary}")
+        return "\n".join(lines) if lines else "没有同步结果"
+
+    def _recommend_next_work_action(self) -> str:
+        return ContinueService(self.workflow_repository).recommend()
+
+    def _record_work_evidence(
+        self,
+        work_item_id: str,
+        evidence_type: str = "note",
+        summary: str = "",
+        command: str = "",
+        output_excerpt: str = "",
+        success: bool | None = None,
+    ) -> str:
+        evidence = EvidenceService(self.workflow_repository).record(
+            work_item_id,
+            evidence_type,
+            summary,
+            command=command,
+            output_excerpt=output_excerpt,
+            success=success,
+        )
+        return f"已记录证据：{evidence.summary}"
+
+    def _summarize_work_evidence(self, work_item_id: str) -> str:
+        return EvidenceService(self.workflow_repository).summarize(work_item_id)
+
+    def _read_codex_task_reports(self, import_items: bool = True) -> str:
+        report_dir = self.config.get("codex_task_report_dir", "data/codex-task-reports")
+        if not os.path.isabs(report_dir):
+            report_dir = os.path.join(self.config.get("project_root", os.getcwd()), report_dir)
+        report = CodexTaskReportService(report_dir).latest_report()
+        if not report:
+            return f"暂无 Codex 任务报告: {report_dir}"
+        imported = []
+        if import_items:
+            imported = WorkItemService(self.workflow_repository).import_codex_report(report)
+        return (
+            f"Codex 报告: {report.generated_at}\n"
+            f"未完成/阻塞: {report.total_unfinished}\n"
+            f"最近完成: {len(report.completed)}\n"
+            f"已同步工作项: {len(imported)}"
+        )
+
+    def _generate_daily_workflow_review(self) -> str:
+        return DailyReviewService(self.workflow_repository).review_day()
 
 

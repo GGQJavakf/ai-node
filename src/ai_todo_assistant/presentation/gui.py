@@ -6,7 +6,8 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
-from ai_todo_assistant.infrastructure.persistence import TodoManager
+from ai_todo_assistant.infrastructure.config import load_settings
+from ai_todo_assistant.infrastructure.persistence import build_todo_repository
 from ai_todo_assistant.presentation.calendar_view import CalendarView
 
 
@@ -25,7 +26,7 @@ class TodoGUI:
         # 设置主题样式
         self.setup_styles()
         
-        self.manager = TodoManager()
+        self.manager = build_todo_repository(load_settings())
         self.calendar_view = CalendarView()
         self.current_year, self.current_month = CalendarView.get_current_month()
         

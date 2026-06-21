@@ -1,0 +1,13 @@
+{
+  "success": true,
+  "code": "CONFIG_VALIDATED",
+  "message": "Configuration is valid",
+  "schema_version": "v1",
+  "status": "completed",
+  "retryable": false,
+  "data": {
+    "message": "Configuration is valid",
+    "valid": true
+  }
+}
+✅ 使用配置文件: ~/.config\md2wechat\config.yaml

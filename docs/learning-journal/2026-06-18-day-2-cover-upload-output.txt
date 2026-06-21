@@ -1,0 +1,14 @@
+{
+  "success": true,
+  "code": "OK",
+  "message": "Success",
+  "schema_version": "v1",
+  "status": "completed",
+  "retryable": false,
+  "data": {
+    "media_id": "0kFK7R1IvXhbHuHNWaZ96bwEkMlgVYRLias15IIOFDfMzdfWleMYMYH9CUXFy10L",
+    "wechat_url": "http://mmbiz.qpic.cn/sz_mmbiz_png/ianVXxyH87TFKicGApRSMUpVf7SKiaJJhWUUbezINxAURlaewibt1qTN7rBUib1Lge13ica50j3DCticib963NqUDUNAUtJTpdEtNOOKlGlbFG9bl2o/0?wx_fmt=png",
+    "width": 0,
+    "height": 0
+  }
+}

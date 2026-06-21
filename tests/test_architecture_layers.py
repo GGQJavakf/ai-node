@@ -12,11 +12,13 @@ from ai_todo_assistant.application.todo_service import TodoApplicationService
 from ai_todo_assistant.domain.models import Todo
 from ai_todo_assistant.infrastructure.persistence.json_todo_repository import TodoManager
 from ai_todo_assistant.infrastructure.llm.clients import (
+    CodexAppServerClient,
     CodexCliClient,
     OpenAICompatibleClient,
     build_llm_client,
 )
 from ai_todo_assistant.application.agent.tool_executor import ToolExecutor
+from ai_todo_assistant.application.reactor import AgentReactor, AgentRuntime, ReactorState
 
 
 class TestArchitectureLayers(unittest.TestCase):
@@ -56,7 +58,8 @@ class TestArchitectureLayers(unittest.TestCase):
         codex_client = build_llm_client({"auth_mode": "codex_cli"})
 
         self.assertIsInstance(openai_client, OpenAICompatibleClient)
-        self.assertIsInstance(codex_client, CodexCliClient)
+        self.assertIsInstance(codex_client, CodexAppServerClient)
+        self.assertIsInstance(codex_client.exec_client, CodexCliClient)
 
     def test_agent_core_uses_configured_request_timeout(self):
         from ai_todo_assistant.application.agent import AgentCore
@@ -64,9 +67,18 @@ class TestArchitectureLayers(unittest.TestCase):
         agent = AgentCore(self.manager, {
             "auth_mode": "codex_cli",
             "codex_timeout": 120,
+            "codex_request_timeout": 180,
         })
 
-        self.assertEqual(agent.request_timeout, 120)
+        self.assertEqual(agent.request_timeout, 180)
+
+    def test_reactor_runtime_components_are_importable(self):
+        reactor = AgentReactor(model="test-model", tool_definitions=[], validation_retry_limit=1)
+        state = ReactorState()
+
+        self.assertIsInstance(reactor, AgentReactor)
+        self.assertIsInstance(state, ReactorState)
+        self.assertTrue(callable(AgentRuntime))
 
 
 if __name__ == "__main__":

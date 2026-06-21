@@ -1,0 +1,12 @@
+✅ 使用配置文件: ~/.config\md2wechat\config.yaml
+{"level":"info","ts":1781845478.734671,"caller":"md2wechat/convert.go:121","msg":"starting conversion","file":"docs\\learning-journal\\2026-06-19-day-3-reactor-main-loop.md","mode":"api","theme":"default"}
+{"level":"error","ts":1781845479.4748836,"caller":"converter/api.go:102","msg":"API conversion failed","theme":"default","error":"API_ERROR: API returned error code 401: Invalid API Key format. Supported prefixes: wme_, wme2_, wmt_.","stacktrace":"github.com/geekjourneyx/md2wechat-skill/internal/converter.(*converter).convertViaAPI\n\tgithub.com/geekjourneyx/md2wechat-skill/internal/converter/api.go:102\ngithub.com/geekjourneyx/md2wechat-skill/internal/converter.(*converter).Convert\n\tgithub.com/geekjourneyx/md2wechat-skill/internal/converter/converter.go:123\ngithub.com/geekjourneyx/md2wechat-skill/internal/publish.(*Service).Convert\n\tgithub.com/geekjourneyx/md2wechat-skill/internal/publish/service.go:89\nmain.runConvert\n\tgithub.com/geekjourneyx/md2wechat-skill/cmd/md2wechat/convert.go:181\nmain.init.func9\n\tgithub.com/geekjourneyx/md2wechat-skill/cmd/md2wechat/convert.go:69\ngithub.com/spf13/cobra.(*Command).execute\n\tgithub.com/spf13/cobra@v1.8.1/command.go:985\ngithub.com/spf13/cobra.(*Command).ExecuteC\n\tgithub.com/spf13/cobra@v1.8.1/command.go:1117\ngithub.com/spf13/cobra.(*Command).Execute\n\tgithub.com/spf13/cobra@v1.8.1/command.go:1041\nmain.main\n\tgithub.com/geekjourneyx/md2wechat-skill/cmd/md2wechat/main.go:307\nruntime.main\n\truntime/proc.go:290"}
+{
+  "success": false,
+  "code": "CONVERT_FAILED",
+  "message": "conversion failed: API call failed: API_ERROR: API returned error code 401: Invalid API Key format. Supported prefixes: wme_, wme2_, wmt_.",
+  "schema_version": "v1",
+  "status": "failed",
+  "retryable": false,
+  "error": "conversion failed: API call failed: API_ERROR: API returned error code 401: Invalid API Key format. Supported prefixes: wme_, wme2_, wmt_."
+}
