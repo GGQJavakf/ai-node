@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import _path  # noqa: F401
 from ai_todo_assistant.application.workflow import WorkItemService, WorkflowSyncService
 from ai_todo_assistant.application.workflow.codex_reports import CodexTaskReport
-from ai_todo_assistant.domain.workflow import Evidence, EvidenceType, WorkItem
+from ai_todo_assistant.domain.workflow import Evidence, EvidenceType, WorkItem, WorkItemStatus
 from ai_todo_assistant.domain.workflow import SourceSnapshot
 from ai_todo_assistant.infrastructure.persistence import SQLiteWorkflowRepository
 
@@ -368,6 +368,128 @@ class TestWorkflowSyncServices(unittest.TestCase):
 
         self.assertIn("同步已过期", summary)
         self.assertIn("/sync", summary)
+
+    def test_completion_signals_in_unfinished_and_blocked_close_codex_items(self):
+        for thread_id, title in [
+            ("thread-mr", "MR merged task"),
+            ("thread-redmine", "Redmine resolved task"),
+            ("thread-openspec", "OpenSpec archived task"),
+            ("thread-playbook", "Playbook closeout task"),
+            ("thread-validation", "Validation passed task"),
+        ]:
+            self.repository.save_work_item(WorkItem(title=title, source="codex", source_ref=thread_id))
+        blocked = self.repository.find_work_item_by_source("codex", "thread-redmine")
+        blocked.status = WorkItemStatus.BLOCKED.value
+        self.repository.save_work_item(blocked)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=5,
+            unfinished=[
+                {
+                    "thread_id": "thread-mr",
+                    "title": "MR merged task",
+                    "completion_signals": ["MR !42 merged"],
+                },
+                {
+                    "thread_id": "thread-openspec",
+                    "title": "OpenSpec archived task",
+                    "summary": "OpenSpec change archived and tasks complete",
+                },
+                {
+                    "thread_id": "thread-playbook",
+                    "title": "Playbook closeout task",
+                    "evidence": "Playbook closeout verified",
+                },
+                {
+                    "thread_id": "thread-validation",
+                    "title": "Validation passed task",
+                    "next_action": "final validation passed with no follow-up",
+                },
+            ],
+            blocked=[
+                {
+                    "thread_id": "thread-redmine",
+                    "title": "Redmine resolved task",
+                    "summary": "Redmine 232211 resolved",
+                }
+            ],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).import_codex_report(report)
+
+        self.assertEqual(result.completed, 5)
+        for thread_id in ["thread-mr", "thread-redmine", "thread-openspec", "thread-playbook", "thread-validation"]:
+            item = self.repository.find_work_item_by_source("codex", thread_id)
+            self.assertEqual(item.status, WorkItemStatus.DONE.value)
+            self.assertTrue(self.repository.list_evidence(item.id))
+
+    def test_done_items_become_reopen_candidates_without_status_regression(self):
+        done = WorkItem(title="已闭环但又出现", source="codex", source_ref="thread-done")
+        done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(done)
+        strong_done = WorkItem(title="已闭环且有完成证据", source="codex", source_ref="thread-strong")
+        strong_done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(strong_done)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=2,
+            unfinished=[
+                {"thread_id": "thread-done", "title": "已闭环但又出现", "next_action": "继续处理"},
+                {
+                    "thread_id": "thread-strong",
+                    "title": "已闭环且有完成证据",
+                    "completion_signals": ["writeback complete"],
+                },
+            ],
+            blocked=[],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).import_codex_report(report)
+
+        self.assertEqual(result.reopen_candidates, 1)
+        self.assertEqual(result.unchanged, 2)
+        self.assertIn("reopen candidate", " ".join(result.details))
+        self.assertEqual(self.repository.find_work_item_by_source("codex", "thread-done").status, WorkItemStatus.DONE.value)
+        self.assertEqual(self.repository.find_work_item_by_source("codex", "thread-strong").status, WorkItemStatus.DONE.value)
+        self.assertTrue(self.repository.list_evidence(strong_done.id))
+
+    def test_preview_completion_signal_detection_does_not_write(self):
+        self.repository.save_work_item(WorkItem(title="待预览闭环", source="codex", source_ref="thread-preview"))
+        done = WorkItem(title="预览 reopen 候选", source="codex", source_ref="thread-reopen")
+        done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(done)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=2,
+            unfinished=[
+                {
+                    "thread_id": "thread-preview",
+                    "title": "待预览闭环",
+                    "completion_signals": ["MR !42 merged"],
+                },
+                {"thread_id": "thread-reopen", "title": "预览 reopen 候选"},
+            ],
+            blocked=[],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).preview_codex_report(report)
+
+        self.assertEqual(result.completed, 1)
+        self.assertEqual(result.reopen_candidates, 1)
+        self.assertEqual(
+            self.repository.find_work_item_by_source("codex", "thread-preview").status,
+            WorkItemStatus.ACTIVE.value,
+        )
+        self.assertEqual(self.repository.list_evidence(self.repository.find_work_item_by_source("codex", "thread-preview").id), [])
 
 
 if __name__ == "__main__":

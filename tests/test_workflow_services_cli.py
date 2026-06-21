@@ -545,6 +545,55 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertIn("跳过: 标题冲突任务", response)
         self.assertIn("保留 done: 已闭环任务", response)
 
+    def test_cli_sync_reports_detected_completion_and_reopen_candidates(self):
+        self.repository.save_work_item(WorkItem(title="MR 已合并任务", source="codex", source_ref="thread-mr"))
+        done = WorkItem(title="疑似重开任务", source="codex", source_ref="thread-reopen")
+        done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(done)
+        with open(os.path.join(self.report_dir, "2026-06-21.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-21T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-mr",
+                            "title": "MR 已合并任务",
+                            "completion_signals": ["MR !42 merged"],
+                        },
+                        {
+                            "thread_id": "thread-reopen",
+                            "title": "疑似重开任务",
+                            "next_action": "继续验证",
+                        },
+                    ],
+                    "blocked": [],
+                    "completed": [],
+                },
+                handle,
+            )
+
+        class FakeSyncService:
+            def __init__(self, repository):
+                self.repository = repository
+
+            def sync_project(self, project_path):
+                return [SourceSnapshot(source="git", project_path=project_path, summary="branch=main")]
+
+        with patch("ai_todo_assistant.presentation.cli.WorkflowSyncService", FakeSyncService):
+            response = self.cli._handle_slash_command("/sync D:/repo")
+
+        self.assertIn("completed=1", response)
+        self.assertIn("reopen_candidates=1", response)
+        self.assertIn("reopen candidate", response)
+        self.assertEqual(
+            self.repository.find_work_item_by_source("codex", "thread-mr").status,
+            WorkItemStatus.DONE.value,
+        )
+        self.assertEqual(
+            self.repository.find_work_item_by_source("codex", "thread-reopen").status,
+            WorkItemStatus.DONE.value,
+        )
+
     def test_cli_sync_reports_codex_merge_summary(self):
         with open(os.path.join(self.report_dir, "2026-06-20.json"), "w", encoding="utf-8") as handle:
             json.dump(

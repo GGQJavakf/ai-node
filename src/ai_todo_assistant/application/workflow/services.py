@@ -26,6 +26,7 @@ class CodexImportResult:
     blocked: int = 0
     reactivated: int = 0
     unchanged: int = 0
+    reopen_candidates: int = 0
 
     def __len__(self) -> int:
         return len(self.items)
@@ -39,7 +40,8 @@ class CodexImportResult:
             f"恢复 {self.reactivated} 项，未变化 {self.unchanged} 项；"
             f"导入: 新建 {self.created} / 更新 {self.updated} / 合并 {self.merged} / 跳过 {self.skipped} "
             f"(created={self.created}, updated={self.updated}, merged={self.merged}, skipped={self.skipped}, "
-            f"completed={self.completed}, blocked={self.blocked}, reactivated={self.reactivated}, unchanged={self.unchanged})"
+            f"completed={self.completed}, blocked={self.blocked}, reactivated={self.reactivated}, "
+            f"unchanged={self.unchanged}, reopen_candidates={self.reopen_candidates})"
         )
 
 
@@ -149,8 +151,7 @@ class WorkItemService:
                 item.next_action = str(entry.get("next_action") or item.next_action)
 
             item.status = _next_codex_status(previous_status, target_status)
-            if previous_status == WorkItemStatus.DONE.value and target_status != WorkItemStatus.DONE.value:
-                result.details.append(f"保留 done: {item.title} | Codex 报告仍列为未完成/阻塞")
+            _record_reopen_candidate_detail(result, previous_status, target_status, item.title)
             saved = self.repository.save_work_item(item)
             if matched_by_identity:
                 result.merged += 1
@@ -293,8 +294,7 @@ class WorkItemService:
             if target_status != WorkItemStatus.DONE.value:
                 item.next_action = str(entry.get("next_action") or item.next_action)
             item.status = _next_codex_status(previous_status, target_status)
-            if previous_status == WorkItemStatus.DONE.value and target_status != WorkItemStatus.DONE.value:
-                result.details.append(f"保留 done: {item.title} | Codex 报告仍列为未完成/阻塞")
+            _record_reopen_candidate_detail(result, previous_status, target_status, item.title)
             if matched_by_identity:
                 result.merged += 1
                 matched_identity = next(
@@ -804,7 +804,7 @@ def _has_title_collision(repository: WorkflowRepository, title: str) -> bool:
 
 def _ordered_codex_entries(report) -> list[tuple[dict, str]]:
     ordered: list[tuple[dict, str]] = []
-    seen: set[str] = set()
+    positions: dict[str, int] = {}
     sections = [
         (list(getattr(report, "completed", [])), WorkItemStatus.DONE.value),
         (list(getattr(report, "blocked", [])), WorkItemStatus.BLOCKED.value),
@@ -815,11 +815,32 @@ def _ordered_codex_entries(report) -> list[tuple[dict, str]]:
             if not isinstance(entry, dict):
                 continue
             source_ref = _codex_source_ref(entry)
-            if source_ref in seen:
+            target_status = _classify_codex_entry_status(entry, status)
+            if source_ref in positions:
+                index = positions[source_ref]
+                _, existing_status = ordered[index]
+                if _codex_status_priority(target_status) < _codex_status_priority(existing_status):
+                    ordered[index] = (entry, target_status)
                 continue
-            seen.add(source_ref)
-            ordered.append((entry, status))
+            positions[source_ref] = len(ordered)
+            ordered.append((entry, target_status))
     return ordered
+
+
+def _classify_codex_entry_status(entry: dict, section_status: str) -> str:
+    if section_status == WorkItemStatus.DONE.value:
+        return section_status
+    if _codex_strong_completion_signals(entry):
+        return WorkItemStatus.DONE.value
+    return section_status
+
+
+def _codex_status_priority(status: str) -> int:
+    if status == WorkItemStatus.DONE.value:
+        return 0
+    if status == WorkItemStatus.BLOCKED.value:
+        return 1
+    return 2
 
 
 def _codex_source_ref(entry: dict) -> str:
@@ -854,6 +875,95 @@ def _entry_identity_text(entry: dict) -> str:
         entry.get("summary"),
     ]
     return " ".join(str(part) for part in text_parts if part)
+
+
+def _codex_strong_completion_signals(entry: dict) -> list[str]:
+    signals: list[str] = []
+    for text in _codex_signal_texts(entry):
+        if _is_strong_completion_text(text):
+            signals.append(text)
+    return list(dict.fromkeys(signals))
+
+
+def _codex_signal_texts(entry: dict) -> list[str]:
+    values = [
+        entry.get("source_ref"),
+        entry.get("title"),
+        entry.get("name"),
+        entry.get("status"),
+        entry.get("summary"),
+        entry.get("next_action"),
+    ]
+    raw_signals = entry.get("completion_signals")
+    if isinstance(raw_signals, list):
+        values.extend(raw_signals)
+    raw_evidence = entry.get("evidence")
+    if isinstance(raw_evidence, list):
+        values.extend(raw_evidence)
+    else:
+        values.append(raw_evidence)
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _is_strong_completion_text(text: str) -> bool:
+    normalized = text.lower()
+    if _has_pending_closeout_language(normalized):
+        return False
+    patterns = [
+        r"\b(?:mr|pr)\s*!?\d*\s*(?:was\s+)?merged\b",
+        r"\bmerge request\b.*\bmerged\b",
+        r"\b(?:branch|remote)\b.*\bmerged\b",
+        r"\b(?:publish|published|release|released)\b.*\b(?:succeeded|success|complete|completed|done)\b",
+        r"\bredmine\b.*\b(?:resolved|closed|done)\b",
+        r"\bissue\b.*\b(?:resolved|closed|done)\b",
+        r"\bopenspec\b.*\b(?:archived|complete|completed)\b",
+        r"\bchange\b.*\barchived\b",
+        r"\btasks?\b.*\b(?:complete|completed|checked)\b",
+        r"\bplaybook\b.*\bcloseout\b.*\b(?:verified|complete|completed|done)\b",
+        r"\bcloseout\b.*\b(?:verified|complete|completed|done)\b",
+        r"\bfinali[sz]e\b.*\b(?:complete|completed|done)\b",
+        r"\bwriteback\b.*\b(?:complete|completed|done)\b",
+        r"\bfinal validation\b.*\bpassed\b",
+        r"\b(?:tests?|build|compile|review|validation)\b.*\bpassed\b.*\bno (?:required )?(?:follow-up|followup|next action)\b",
+        r"\bcodex\b.*\b(?:cleanup|merge|publish|writeback)\b.*\b(?:complete|completed|done)\b",
+        r"\b(?:cleanup|merge|publish|writeback)\b.*\b(?:complete|completed|done)\b",
+        r"已合并",
+        r"合并完成",
+        r"已解决",
+        r"已关闭",
+        r"已归档",
+        r"归档完成",
+        r"任务完成",
+        r"closeout\s*已验证",
+        r"闭环已验证",
+        r"闭环完成",
+        r"验证通过.*无后续",
+        r"写回完成",
+        r"发布成功",
+    ]
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _has_pending_closeout_language(normalized_text: str) -> bool:
+    if "no follow-up" in normalized_text or "no followup" in normalized_text or "无后续" in normalized_text:
+        return False
+    pending_terms = [
+        "closeout missing",
+        "missing closeout",
+        "not complete",
+        "not completed",
+        "pending",
+        "needs ",
+        "need ",
+        "仍需",
+        "还需",
+        "需要",
+        "缺少",
+        "未完成",
+        "未关闭",
+        "未归档",
+    ]
+    return any(term in normalized_text for term in pending_terms)
 
 
 def _openspec_change_ids(text: str) -> list[str]:
@@ -898,8 +1008,18 @@ def _codex_completion_signals(entry: dict, report) -> list[str]:
         signals.extend(str(signal).strip() for signal in raw_evidence if str(signal).strip())
     elif isinstance(raw_evidence, str) and raw_evidence.strip():
         signals.append(raw_evidence.strip())
+    strong_signals = _codex_strong_completion_signals(entry)
+    for signal in strong_signals:
+        if signal not in signals:
+            signals.append(signal)
     if not signals:
-        fallback = str(entry.get("status") or entry.get("summary") or getattr(report, "summary", "") or "completed")
+        fallback = str(
+            entry.get("status")
+            or entry.get("summary")
+            or entry.get("next_action")
+            or getattr(report, "summary", "")
+            or "completed"
+        )
         signals.append(fallback.strip() or "completed")
     return list(dict.fromkeys(signals))
 
@@ -935,6 +1055,19 @@ def _count_codex_outcome(result: CodexImportResult, previous_status: str | None,
         result.reactivated += 1
     elif previous_status is not None:
         result.unchanged += 1
+
+
+def _record_reopen_candidate_detail(
+    result: CodexImportResult,
+    previous_status: str | None,
+    target_status: str,
+    title: str,
+) -> None:
+    if previous_status == WorkItemStatus.DONE.value and target_status != WorkItemStatus.DONE.value:
+        result.reopen_candidates += 1
+        result.details.append(
+            f"保留 done: {title} | reopen candidate，Codex 报告仍列为未完成/阻塞"
+        )
 
 
 def _is_stale(last_synced_at: str | None, stale_after_hours: int) -> bool:
