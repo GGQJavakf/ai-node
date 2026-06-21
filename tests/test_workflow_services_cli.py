@@ -267,6 +267,76 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         completed_line = next(line for line in rendered.splitlines() if "recently completed" in line)
         self.assertNotIn("[stale]", completed_line)
 
+    def test_list_default_uses_local_evidence_for_closeout_gap_reasons(self):
+        today = datetime.now().strftime("%Y-%m-%d 09:00:00")
+        mr_redmine = WorkItem(
+            title="MR !42 closeout",
+            source="codex",
+            source_ref="thread-mr",
+            last_synced_at=today,
+        )
+        mr_redmine = self.repository.save_work_item(mr_redmine)
+        redmine_validation = WorkItem(
+            title="Redmine 232212 validation",
+            source="redmine",
+            source_ref="232212",
+            last_synced_at=today,
+        )
+        redmine_validation = self.repository.save_work_item(redmine_validation)
+        openspec = WorkItem(
+            title="OpenSpec add-closeout",
+            source="openspec",
+            source_ref="add-closeout",
+            last_synced_at=today,
+        )
+        openspec = self.repository.save_work_item(openspec)
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-1",
+                work_item_id=mr_redmine.id,
+                evidence_type="snapshot",
+                summary="closeout gap: MR merged but Redmine not closed",
+                command="playbook workspace task closeout --dry-run --output json",
+                output_excerpt="",
+                success=True,
+                source="playbook",
+                created_at=today,
+            )
+        )
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-2",
+                work_item_id=redmine_validation.id,
+                evidence_type="snapshot",
+                summary="closeout gap: Redmine resolved but validation evidence missing",
+                command="playbook workspace task closeout --dry-run --output json",
+                output_excerpt="",
+                success=True,
+                source="playbook",
+                created_at=today,
+            )
+        )
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-3",
+                work_item_id=openspec.id,
+                evidence_type="snapshot",
+                summary="closeout gap: OpenSpec completed but not archived",
+                command="openspec list --json",
+                output_excerpt="",
+                success=True,
+                source="openspec",
+                created_at=today,
+            )
+        )
+
+        rendered = _render_table(self.cli._handle_slash_command("/list"))
+
+        self.assertEqual(rendered.count("waiting closeout"), 3)
+        self.assertIn("MR merged but Redmine not closed", rendered)
+        self.assertIn("Redmine resolved; validation missing", rendered)
+        self.assertIn("OpenSpec completed but not archived", rendered)
+
     def test_list_default_source_todo_filter_suppresses_work_items(self):
         self.cli.manager.add("只看 Todo")
         WorkItemService(self.repository).create_manual("不应出现", next_action="继续")

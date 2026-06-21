@@ -56,7 +56,22 @@ class TestWorkflowConnectors(unittest.TestCase):
         connector = PlaybookConnector(FakeRunner([
             CommandResult(["playbook"], "repo", 0, stdout=json.dumps({"id": 232211, "subject": "敏感日志"})),
             CommandResult(["playbook"], "repo", 0, stdout=json.dumps({"tasks": [{"id": "t1"}]})),
-            CommandResult(["playbook"], "repo", 0, stdout=json.dumps({"gaps": [{"name": "mr"}]})),
+            CommandResult(
+                ["playbook"],
+                "repo",
+                0,
+                stdout=json.dumps(
+                    {
+                        "gaps": [
+                            {
+                                "name": "redmine",
+                                "mr": {"iid": 42, "state": "merged"},
+                                "redmine": {"id": 232211, "status": "open"},
+                            }
+                        ]
+                    }
+                ),
+            ),
         ]))
 
         redmine = connector.redmine_issue("repo", "232211")
@@ -65,7 +80,9 @@ class TestWorkflowConnectors(unittest.TestCase):
 
         self.assertIn("232211", redmine.summary)
         self.assertEqual(workspace.facts["tasks"][0]["id"], "t1")
-        self.assertEqual(closeout.facts["gaps"][0]["name"], "mr")
+        self.assertEqual(closeout.facts["gaps"][0]["redmine"]["id"], 232211)
+        self.assertIn("--dry-run", closeout.command)
+        self.assertIn("1 closeout gaps", closeout.summary)
 
     def test_missing_command_and_invalid_json_degrade_to_unavailable_snapshot(self):
         missing = GitConnector(FakeRunner([

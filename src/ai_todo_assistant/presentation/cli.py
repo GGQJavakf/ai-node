@@ -407,8 +407,18 @@ class TodoCLI:
             if source_filter:
                 work_items = [item for item in work_items if item.source == source_filter]
             work_items = _dedupe_work_items(work_items)
+        evidence_by_item = {}
+        if work_items:
+            try:
+                repo = self._workflow_repo()
+                evidence_by_item = {
+                    item.id: repo.list_evidence(item.id)
+                    for item in work_items
+                }
+            except Exception:
+                evidence_by_item = {}
 
-        rows = _daily_triage_work_item_rows(work_items)
+        rows = _daily_triage_work_item_rows(work_items, evidence_by_item)
         for todo in self._rank_tasks(todos):
             rows.append(
                 {
@@ -1230,10 +1240,11 @@ def _dedupe_work_items(items):
     return deduped
 
 
-def _daily_triage_work_item_rows(items):
+def _daily_triage_work_item_rows(items, evidence_by_item=None):
+    evidence_by_item = evidence_by_item or {}
     grouped = {name: [] for name in _DAILY_TRIAGE_GROUPS}
     for item in items:
-        group = _daily_triage_group(item)
+        group = _daily_triage_group(item, evidence_by_item.get(item.id, []))
         if not group:
             continue
         grouped[group].append(item)
@@ -1245,7 +1256,7 @@ def _daily_triage_work_item_rows(items):
         if limit:
             candidates = candidates[:limit]
         for item in candidates:
-            reason = _work_item_triage_reason(item)
+            reason = _work_item_triage_reason(item, evidence_by_item.get(item.id, []))
             stale = _is_work_item_stale_today(item)
             reason_text = f"{reason} [stale]" if stale and item.status != WorkItemStatus.DONE.value else reason
             status_style = "yellow" if item.status == "blocked" else "grey50" if item.status == "done" else "cyan"
@@ -1274,16 +1285,19 @@ _DAILY_TRIAGE_GROUPS = [
 ]
 
 
-def _daily_triage_group(item):
+def _daily_triage_group(item, evidence=None):
     if item.status == WorkItemStatus.ARCHIVED.value:
         return ""
     if item.status == WorkItemStatus.DONE.value:
         return "recently completed"
-    reason = _work_item_triage_reason(item)
+    reason = _work_item_triage_reason(item, evidence)
     stale = _is_work_item_stale_today(item)
     if item.status == WorkItemStatus.BLOCKED.value:
         return "blocked"
     if reason in {
+        "MR merged but Redmine not closed",
+        "Redmine resolved; validation missing",
+        "OpenSpec completed but not archived",
         "MR merged but closeout missing",
         "Redmine closeout missing",
         "OpenSpec closeout missing",
@@ -1301,10 +1315,10 @@ def _daily_triage_group(item):
     return "active needs action" if item.status == WorkItemStatus.ACTIVE.value else ""
 
 
-def _work_item_triage_reason(item):
+def _work_item_triage_reason(item, evidence=None):
     if item.status == WorkItemStatus.DONE.value:
         return "recently completed"
-    text = _work_item_context_text(item)
+    text = _work_item_context_text(item, evidence)
     if item.merge_conflicts:
         return "merge conflict needs manual resolution"
     if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "redmine"):
@@ -1313,6 +1327,32 @@ def _work_item_triage_reason(item):
         return "blocked by MR"
     if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "openspec"):
         return "blocked by OpenSpec"
+    if _mentions(text, "mr merged but redmine not closed", "mr merged redmine not closed"):
+        return "MR merged but Redmine not closed"
+    if (
+        _mentions(text, "mr", "gitlab", "merge_request", "!")
+        and _mentions(text, "merged")
+        and _mentions(text, "redmine")
+        and _mentions(text, "not closed", "still open", "open", "unresolved", "未关闭")
+    ):
+        return "MR merged but Redmine not closed"
+    if _mentions(text, "redmine resolved but validation evidence missing"):
+        return "Redmine resolved; validation missing"
+    if (
+        _mentions(text, "redmine")
+        and _mentions(text, "resolved", "closed", "已解决", "已关闭")
+        and _mentions(text, "validation", "validate", "test", "review", "evidence", "验证")
+        and _mentions(text, "missing", "required", "缺少", "需要", "未")
+    ):
+        return "Redmine resolved; validation missing"
+    if _mentions(text, "openspec completed but not archived"):
+        return "OpenSpec completed but not archived"
+    if (
+        _mentions(text, "openspec")
+        and _mentions(text, "completed", "complete", "done", "tasks complete", "artifacts complete", "已完成")
+        and _mentions(text, "not archived", "archive missing", "unarchived", "未归档")
+    ):
+        return "OpenSpec completed but not archived"
     if _mentions(text, "mr", "gitlab", "!") and _mentions(text, "merged") and _mentions(text, "closeout", "missing"):
         return "MR merged but closeout missing"
     if _mentions(text, "redmine") and _mentions(text, "closeout", "closed_loop", "resolution", "missing"):
@@ -1329,12 +1369,16 @@ def _work_item_triage_reason(item):
     return "blocked" if item.status == WorkItemStatus.BLOCKED.value else "needs action"
 
 
-def _work_item_context_text(item):
+def _work_item_context_text(item, evidence=None):
     refs = [
         f"{ref.get('source', '')}:{ref.get('source_ref', '')}"
         for ref in item.source_refs
         if isinstance(ref, dict)
     ]
+    evidence_parts = []
+    for entry in evidence or []:
+        evidence_parts.append(getattr(entry, "summary", ""))
+        evidence_parts.append(getattr(entry, "output_excerpt", ""))
     parts = [
         item.source,
         item.source_ref,
@@ -1344,6 +1388,7 @@ def _work_item_context_text(item):
         *item.source_identities,
         *refs,
         *item.merge_conflicts,
+        *evidence_parts,
     ]
     return " ".join(str(part) for part in parts if part).lower()
 

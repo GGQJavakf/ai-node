@@ -24,7 +24,7 @@ The assistant SHALL make bare `/list` render a daily triage view that groups loc
 
 #### Scenario: Closeout work is grouped separately
 
-- **GIVEN** a local WorkItem contains local text, identities, or source refs indicating MR, Redmine, or OpenSpec closeout is still pending
+- **GIVEN** a local WorkItem contains local text, identities, source refs, sync summaries, or Evidence indicating MR, Redmine, or OpenSpec closeout is still pending
 - **WHEN** the user runs `/list`
 - **THEN** the output SHALL include a `waiting closeout` group
 - **AND** that WorkItem SHALL show a closeout-specific reason.
@@ -102,6 +102,30 @@ The assistant SHALL show a concise local reason for each high-priority or delive
 - **GIVEN** an active WorkItem comes from a Codex thread and has no more specific risk reason
 - **WHEN** the user runs `/list`
 - **THEN** the WorkItem row SHALL show `Codex thread still active` or an equivalent short active-thread reason.
+
+#### Scenario: MR merged but Redmine not closed reason
+
+- **GIVEN** a local WorkItem has Evidence indicating an MR is merged but the related Redmine issue is not closed
+- **WHEN** the user runs `/list`
+- **THEN** the WorkItem row SHALL show `MR merged but Redmine not closed` or an equivalent short closeout reason.
+
+#### Scenario: Redmine resolved but validation evidence missing reason
+
+- **GIVEN** a local WorkItem has Evidence indicating Redmine is resolved or closed but local validation evidence is missing
+- **WHEN** the user runs `/list`
+- **THEN** the WorkItem row SHALL show `Redmine resolved but validation evidence missing` or an equivalent short closeout reason.
+
+#### Scenario: OpenSpec completed but not archived reason
+
+- **GIVEN** a local WorkItem has Evidence indicating OpenSpec tasks or artifacts are completed but the change is not archived
+- **WHEN** the user runs `/list`
+- **THEN** the WorkItem row SHALL show `OpenSpec completed but not archived` or an equivalent short closeout reason.
+
+#### Scenario: List remains local-only
+
+- **WHEN** the user runs `/list`
+- **THEN** the assistant SHALL derive closeout reasons from local WorkItems and Evidence only
+- **AND** it SHALL NOT invoke Redmine, GitLab/MR, OpenSpec, Playbook, Git, or Codex commands.
 
 ### Requirement: Stale marker is based on today's sync date
 

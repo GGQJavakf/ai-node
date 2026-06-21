@@ -27,6 +27,25 @@ class FakeOpenSpec:
         return SourceSnapshot(source="openspec", project_path=project_path, summary="apply ready")
 
 
+class CloseoutGapOpenSpec(FakeOpenSpec):
+    def list_changes(self, project_path):
+        return SourceSnapshot(
+            source="openspec",
+            project_path=project_path,
+            summary="1 active changes",
+            command="openspec list --json",
+            facts={
+                "changes": [
+                    {
+                        "name": "add-closeout",
+                        "tasks": {"complete": 3, "total": 3},
+                        "archived": False,
+                    }
+                ]
+            },
+        )
+
+
 class FakePlaybook:
     def redmine_issue(self, project_path, issue_id):
         return SourceSnapshot(
@@ -41,6 +60,56 @@ class FakePlaybook:
 
     def closeout_gaps(self, project_path):
         return SourceSnapshot(source="playbook", project_path=project_path, summary="0 closeout gaps")
+
+
+class CloseoutGapPlaybook(FakePlaybook):
+    def closeout_gaps(self, project_path):
+        return SourceSnapshot(
+            source="playbook",
+            project_path=project_path,
+            summary="3 closeout gaps",
+            command="playbook workspace task closeout --dry-run --output json",
+            facts={
+                "gaps": [
+                    {
+                        "name": "redmine",
+                        "mr": {"iid": 42, "state": "merged"},
+                        "redmine": {"id": 232211, "status": "open"},
+                    },
+                    {
+                        "name": "validation",
+                        "redmine": {"id": 232212, "status": "resolved"},
+                        "validation": {"missing": True},
+                    },
+                    {
+                        "name": "openspec",
+                        "openspec": {"change": "add-closeout", "tasks_complete": True, "archived": False},
+                    },
+                ]
+            },
+        )
+
+
+class UnavailableSnapshotPlaybook(FakePlaybook):
+    def workspace_status(self, project_path):
+        return SourceSnapshot(
+            source="playbook",
+            project_path=project_path,
+            summary="playbook unavailable",
+            command="playbook workspace task status --output json --full",
+            success=False,
+            error="playbook missing",
+        )
+
+    def closeout_gaps(self, project_path):
+        return SourceSnapshot(
+            source="playbook",
+            project_path=project_path,
+            summary="playbook unavailable",
+            command="playbook workspace task closeout --dry-run --output json",
+            success=False,
+            error="closeout dry-run unavailable",
+        )
 
 
 class UnavailablePlaybook(FakePlaybook):
@@ -358,6 +427,88 @@ class TestWorkflowSyncServices(unittest.TestCase):
         self.assertEqual(items[0].source_ref, "sync:repo")
         self.assertIsNotNone(items[0].last_synced_at)
         self.assertEqual(len(self.repository.list_evidence(items[0].id)), 6)
+
+    def test_sync_project_records_closeout_gap_evidence_on_matching_work_items(self):
+        redmine = WorkItem(title="Redmine 232211 closeout", source="redmine", source_ref="232211")
+        redmine.source_identities = ["redmine:232211", "gitlab-mr:repo:42"]
+        redmine.project_path = "repo"
+        self.repository.save_work_item(redmine)
+        validation = WorkItem(title="Redmine 232212 validation", source="redmine", source_ref="232212")
+        validation.source_identities = ["redmine:232212"]
+        validation.project_path = "repo"
+        self.repository.save_work_item(validation)
+        openspec = WorkItem(title="OpenSpec add-closeout", source="openspec", source_ref="add-closeout")
+        openspec.source_identities = ["openspec:add-closeout"]
+        openspec.project_path = "repo"
+        self.repository.save_work_item(openspec)
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=CloseoutGapPlaybook(),
+        )
+
+        service.sync_project("repo")
+
+        redmine_evidence = [item.summary for item in self.repository.list_evidence(redmine.id)]
+        validation_evidence = [item.summary for item in self.repository.list_evidence(validation.id)]
+        openspec_evidence = [item.summary for item in self.repository.list_evidence(openspec.id)]
+        self.assertTrue(any("MR merged but Redmine not closed" in summary for summary in redmine_evidence))
+        self.assertTrue(any("Redmine resolved but validation evidence missing" in summary for summary in validation_evidence))
+        self.assertTrue(any("OpenSpec completed but not archived" in summary for summary in openspec_evidence))
+
+    def test_sync_project_records_openspec_completion_archive_gap_from_openspec_snapshot(self):
+        openspec = WorkItem(title="OpenSpec add-closeout", source="openspec", source_ref="add-closeout")
+        openspec.source_identities = ["openspec:add-closeout"]
+        openspec.project_path = "repo"
+        openspec = self.repository.save_work_item(openspec)
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=CloseoutGapOpenSpec(),
+            playbook=FakePlaybook(),
+        )
+
+        service.sync_project("repo")
+
+        summaries = [item.summary for item in self.repository.list_evidence(openspec.id)]
+        self.assertTrue(any("OpenSpec completed but not archived" in summary for summary in summaries))
+
+    def test_closeout_gap_evidence_is_idempotent_and_falls_back_to_project_context(self):
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=CloseoutGapPlaybook(),
+        )
+
+        service.sync_project("repo")
+        service.sync_project("repo")
+
+        context = self.repository.find_work_item_by_source("playbook", "sync:repo")
+        evidence = [
+            item.summary
+            for item in self.repository.list_evidence(context.id)
+            if item.summary.startswith("closeout gap:")
+        ]
+        self.assertEqual(len(evidence), 3)
+        self.assertEqual(len(set(evidence)), 3)
+
+    def test_sync_project_records_unavailable_connector_evidence_without_aborting(self):
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=UnavailableSnapshotPlaybook(),
+        )
+
+        snapshots = service.sync_project("repo")
+
+        self.assertEqual(len(snapshots), 4)
+        context = self.repository.find_work_item_by_source("playbook", "sync:repo")
+        summaries = [item.summary for item in self.repository.list_evidence(context.id)]
+        self.assertTrue(any("playbook unavailable" in summary for summary in summaries))
+        self.assertTrue(any("closeout dry-run unavailable" in item.output_excerpt for item in self.repository.list_evidence(context.id)))
 
     def test_status_summary_marks_stale_sync_data(self):
         item = WorkItemService(self.repository).create_manual("旧同步工作项")

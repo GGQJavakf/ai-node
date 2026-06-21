@@ -45,6 +45,13 @@ class CodexImportResult:
         )
 
 
+@dataclass(frozen=True)
+class CloseoutGapRecord:
+    summary: str
+    identities: tuple[str, ...] = ()
+    excerpt: str = ""
+
+
 class WorkItemService:
     def __init__(self, repository: WorkflowRepository):
         self.repository = repository
@@ -597,6 +604,7 @@ class WorkflowSyncService:
         context.sync_summary = sync_summary
         context.last_synced_at = now_text()
         saved_context = self.repository.save_work_item(context)
+        closeout_gaps = _closeout_gap_records(snapshots, normalized_path)
         for snapshot in snapshots:
             facts_excerpt = _facts_excerpt(snapshot)
             self.repository.add_evidence(
@@ -609,6 +617,20 @@ class WorkflowSyncService:
                     success=snapshot.success,
                     source=snapshot.source,
                 )
+            )
+        for gap in closeout_gaps:
+            target = _closeout_gap_target(self.repository, gap, saved_context)
+            _add_unique_evidence(
+                self.repository,
+                Evidence(
+                    work_item_id=target.id,
+                    evidence_type=EvidenceType.SNAPSHOT.value,
+                    summary=f"closeout gap: {gap.summary}",
+                    command=_closeout_gap_command(snapshots),
+                    output_excerpt=gap.excerpt,
+                    success=True,
+                    source="closeout",
+                ),
             )
         for item in self.repository.list_work_items(include_closed=False):
             if item.id == saved_context.id:
@@ -1089,3 +1111,268 @@ def _facts_excerpt(snapshot: SourceSnapshot) -> str:
         return json.dumps(snapshot.facts, ensure_ascii=False, sort_keys=True)[:1000]
     except (TypeError, ValueError):
         return str(snapshot.facts)[:1000]
+
+
+def _closeout_gap_records(snapshots: list[SourceSnapshot], project_path: str) -> list[CloseoutGapRecord]:
+    records: list[CloseoutGapRecord] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for snapshot in snapshots:
+        if not snapshot.success:
+            continue
+        for candidate in _closeout_gap_candidates(snapshot.facts):
+            record = _classify_closeout_gap(candidate, project_path)
+            if not record:
+                continue
+            key = (record.summary, record.identities)
+            if key in seen:
+                continue
+            records.append(record)
+            seen.add(key)
+    return records
+
+
+def _closeout_gap_candidates(value) -> list:
+    if isinstance(value, dict):
+        candidates = []
+        gaps = value.get("gaps")
+        if isinstance(gaps, list):
+            candidates.extend(item for item in gaps if isinstance(item, (dict, str)))
+        changes = value.get("changes")
+        if isinstance(changes, list):
+            candidates.extend(item for item in changes if isinstance(item, (dict, str)))
+        if not candidates:
+            candidates.append(value)
+        return candidates
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, (dict, str))]
+    return []
+
+
+def _classify_closeout_gap(candidate, project_path: str) -> CloseoutGapRecord | None:
+    text = _json_text(candidate)
+    identities = tuple(_closeout_gap_identities(candidate, text, project_path))
+    excerpt = _closeout_gap_excerpt(candidate)
+    if _is_mr_merged_redmine_open(candidate, text):
+        return CloseoutGapRecord("MR merged but Redmine not closed", identities, excerpt)
+    if _is_redmine_resolved_validation_missing(candidate, text):
+        return CloseoutGapRecord("Redmine resolved but validation evidence missing", identities, excerpt)
+    if _is_openspec_complete_not_archived(candidate, text):
+        return CloseoutGapRecord("OpenSpec completed but not archived", identities, excerpt)
+    return None
+
+
+def _is_mr_merged_redmine_open(candidate, text: str) -> bool:
+    mr_state = _first_text(candidate, ("mr", "merge_request"), ("state", "status", "merged"))
+    redmine_state = _first_text(candidate, ("redmine", "issue"), ("status", "state", "closed", "resolved"))
+    structured = (
+        ("merged" in mr_state or _nested_bool(candidate, ("mr", "merge_request"), ("merged",)))
+        and _redmine_not_closed(redmine_state)
+    )
+    text_match = (
+        _has_any(text, "mr", "merge request", "!")
+        and _has_any(text, "merged", "已合并")
+        and _has_any(text, "redmine", "issue")
+        and _has_any(text, "not closed", "still open", "open", "unresolved", "未关闭")
+    )
+    return structured or text_match
+
+
+def _is_redmine_resolved_validation_missing(candidate, text: str) -> bool:
+    redmine_state = _first_text(candidate, ("redmine", "issue"), ("status", "state", "resolution"))
+    validation_missing = _nested_bool(candidate, ("validation", "local_validation"), ("missing", "required"))
+    structured = _redmine_resolved(redmine_state) and validation_missing
+    text_match = (
+        _has_any(text, "redmine", "issue")
+        and _has_any(text, "resolved", "closed", "已解决", "已关闭")
+        and _has_any(text, "validation", "validate", "test", "review", "evidence", "验证")
+        and _has_any(text, "missing", "required", "缺少", "需要", "未")
+    )
+    return structured or text_match
+
+
+def _is_openspec_complete_not_archived(candidate, text: str) -> bool:
+    openspec = _nested_dict(candidate, ("openspec", "change"))
+    if not openspec and isinstance(candidate, dict) and (
+        candidate.get("name") or candidate.get("change") or candidate.get("changeName")
+    ):
+        openspec = candidate
+    archived = _first_text(openspec, (), ("archived", "is_archived", "status", "state")) if openspec else ""
+    task_done = _nested_bool(openspec, (), ("tasks_complete", "complete", "completed", "done")) if openspec else False
+    if isinstance(openspec, dict):
+        tasks = openspec.get("tasks")
+        if isinstance(tasks, dict):
+            total = _int_or_none(tasks.get("total"))
+            complete = _int_or_none(tasks.get("complete") or tasks.get("completed") or tasks.get("done"))
+            task_done = task_done or (total is not None and total > 0 and complete == total)
+    structured = bool(openspec) and task_done and not _truthy_text(archived)
+    text_match = (
+        _has_any(text, "openspec", "change")
+        and _has_any(text, "complete", "completed", "done", "tasks complete", "artifacts complete", "已完成")
+        and _has_any(text, "not archived", "archive missing", "unarchived", "未归档")
+    )
+    return structured or text_match
+
+
+def _closeout_gap_identities(candidate, text: str, project_path: str) -> list[str]:
+    identities: list[str] = []
+    for issue_id in _redmine_ids_from_candidate(candidate, text):
+        identities.append(f"redmine:{issue_id}")
+    for mr_id in _mr_ids_from_candidate(candidate, text):
+        identities.append(f"gitlab-mr:{project_path}:{mr_id}")
+    for change in _openspec_ids_from_candidate(candidate, text):
+        identities.append(f"openspec:{change}")
+    return list(dict.fromkeys(identities))
+
+
+def _redmine_ids_from_candidate(candidate, text: str) -> list[str]:
+    ids: list[str] = []
+    for data in _nested_dicts(candidate, ("redmine", "issue")):
+        for key in ("id", "issue_id", "number"):
+            value = data.get(key)
+            if value:
+                ids.append(str(value))
+    ids.extend(re.findall(r"(?:redmine|issue|#)\s*([0-9]{4,})", text, flags=re.IGNORECASE))
+    return list(dict.fromkeys(ids))
+
+
+def _mr_ids_from_candidate(candidate, text: str) -> list[str]:
+    ids: list[str] = []
+    for data in _nested_dicts(candidate, ("mr", "merge_request")):
+        for key in ("iid", "id", "number"):
+            value = data.get(key)
+            if value:
+                ids.append(str(value))
+    ids.extend(_gitlab_mr_ids(text))
+    return list(dict.fromkeys(ids))
+
+
+def _openspec_ids_from_candidate(candidate, text: str) -> list[str]:
+    ids: list[str] = []
+    for data in _nested_dicts(candidate, ("openspec", "change")):
+        for key in ("change", "name", "changeName", "id"):
+            value = data.get(key)
+            if value:
+                ids.append(str(value))
+    if isinstance(candidate, dict):
+        for key in ("change", "name", "changeName", "id"):
+            value = candidate.get(key)
+            if value and _has_any(text, "openspec", "archive", "tasks"):
+                ids.append(str(value))
+    ids.extend(_openspec_change_ids(text))
+    return list(dict.fromkeys(ids))
+
+
+def _closeout_gap_target(repository: WorkflowRepository, gap: CloseoutGapRecord, fallback: WorkItem) -> WorkItem:
+    matches: dict[str, WorkItem] = {}
+    for identity in gap.identities:
+        for item in repository.find_work_items_by_identity(identity):
+            if item.status != WorkItemStatus.ARCHIVED.value:
+                matches[item.id] = item
+        source, _, source_ref = identity.partition(":")
+        if source in {WorkItemSource.REDMINE.value, WorkItemSource.OPENSPEC.value} and source_ref:
+            item = repository.find_work_item_by_source(source, source_ref)
+            if item and item.status != WorkItemStatus.ARCHIVED.value:
+                matches[item.id] = item
+    if len(matches) == 1:
+        return next(iter(matches.values()))
+    return fallback
+
+
+def _add_unique_evidence(repository: WorkflowRepository, evidence: Evidence) -> Evidence | None:
+    normalized = _normalize_evidence_summary(evidence.summary)
+    for existing in repository.list_evidence(evidence.work_item_id):
+        if (
+            _normalize_evidence_summary(existing.summary) == normalized
+            and existing.source == evidence.source
+            and existing.command == evidence.command
+        ):
+            return None
+    return repository.add_evidence(evidence)
+
+
+def _closeout_gap_command(snapshots: list[SourceSnapshot]) -> str:
+    commands = [snapshot.command for snapshot in snapshots if snapshot.command]
+    return " | ".join(dict.fromkeys(commands))[:500]
+
+
+def _closeout_gap_excerpt(candidate) -> str:
+    return _json_text(candidate)[:1000]
+
+
+def _json_text(value) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True).lower()
+    except (TypeError, ValueError):
+        return str(value).lower()
+
+
+def _nested_dicts(value, keys: tuple[str, ...]) -> list[dict]:
+    results: list[dict] = []
+    if isinstance(value, dict):
+        for key in keys:
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                results.append(nested)
+        for nested in value.values():
+            if isinstance(nested, (dict, list)):
+                results.extend(_nested_dicts(nested, keys))
+    elif isinstance(value, list):
+        for item in value:
+            results.extend(_nested_dicts(item, keys))
+    return results
+
+
+def _nested_dict(value, keys: tuple[str, ...]):
+    if not isinstance(value, dict):
+        return None
+    if not keys:
+        return value
+    for key in keys:
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            return nested
+    return None
+
+
+def _first_text(value, parent_keys: tuple[str, ...], field_keys: tuple[str, ...]) -> str:
+    candidates = _nested_dicts(value, parent_keys) if parent_keys else ([value] if isinstance(value, dict) else [])
+    for data in candidates:
+        for key in field_keys:
+            if key in data:
+                return str(data.get(key)).lower()
+    return ""
+
+
+def _nested_bool(value, parent_keys: tuple[str, ...], field_keys: tuple[str, ...]) -> bool:
+    candidates = _nested_dicts(value, parent_keys) if parent_keys else ([value] if isinstance(value, dict) else [])
+    for data in candidates:
+        for key in field_keys:
+            if key in data and _truthy_text(str(data.get(key)).lower()):
+                return True
+    return False
+
+
+def _truthy_text(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    return normalized in {"true", "yes", "1", "done", "complete", "completed", "closed", "archived", "merged", "已完成", "已关闭", "已归档"}
+
+
+def _redmine_not_closed(value: str) -> bool:
+    normalized = str(value).lower()
+    return not normalized or any(term in normalized for term in ["open", "unresolved", "active", "new", "未关闭", "未解决"])
+
+
+def _redmine_resolved(value: str) -> bool:
+    normalized = str(value).lower()
+    return any(term in normalized for term in ["resolved", "closed", "done", "已解决", "已关闭"])
+
+
+def _has_any(text: str, *terms: str) -> bool:
+    return any(term.lower() in text for term in terms)
+
+
+def _int_or_none(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
