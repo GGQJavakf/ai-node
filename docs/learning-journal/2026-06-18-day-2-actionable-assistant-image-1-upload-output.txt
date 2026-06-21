@@ -6,8 +6,8 @@
   "status": "completed",
   "retryable": false,
   "data": {
-    "media_id": "0kFK7R1IvXhbHuHNWaZ96WdFf6cBUR4Hdr9J5ReYrs33vkv8zx2HlWLQI0Dn82oS",
-    "wechat_url": "http://mmbiz.qpic.cn/sz_mmbiz_png/ianVXxyH87TF3YHL4r9088rgicBFESZm6FfDrUgN64WTeBialh4s2kQj9T5JLfodV6bMeRMkF4vEzFpCO9bRmQeBJLXRBdXM7nm5yPa4iahljJg/0?wx_fmt=png",
+    "media_id": "0kFK7R1IvXhbHuHNWaZ96Q9pYenl4H1Wv3DhOTrHQKZMqVI_-RzFJ9CIS20uzh-Y",
+    "wechat_url": "http://mmbiz.qpic.cn/mmbiz_png/ianVXxyH87TGdjUcv6LZuFMfYL5yK1qUUrAGvlHJricagVqgjNEr2KGgMLWTib6ThiavAuqNsReCWWcibDhMDpZpCeSMPxYWgPtLntibRDy16Fgibo/0?wx_fmt=png",
     "width": 0,
     "height": 0
   }

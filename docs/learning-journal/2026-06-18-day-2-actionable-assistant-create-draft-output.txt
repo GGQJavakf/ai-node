@@ -6,6 +6,6 @@
   "status": "completed",
   "retryable": false,
   "data": {
-    "media_id": "0kFK7R1IvXhbHuHNWaZ96WmSJkA53g-qMzgl4_b4Y_dIFMlV8IVR1mpin7qAExyX"
+    "media_id": "0kFK7R1IvXhbHuHNWaZ96b6I1cFjaEYPlk9mWzk7Z2O1lY1RRxNgZEAOaWu67k92"
   }
 }

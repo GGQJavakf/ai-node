@@ -1,12 +1,15 @@
 import os
 import tempfile
 import unittest
+from io import StringIO
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import _path  # noqa: F401
 from ai_todo_assistant.application.agent.tool_executor import ToolExecutor
 from ai_todo_assistant.infrastructure.persistence import SQLiteTodoRepository, TodoManager
 from ai_todo_assistant.presentation.cli import TodoCLI
+from rich.console import Console
 
 
 class TestPersonalAssistantCli(unittest.TestCase):
@@ -62,6 +65,49 @@ class TestPersonalAssistantCli(unittest.TestCase):
         self.assertIn("已完成", toggle_response)
         self.assertIn("已删除", delete_response)
         self.assertEqual(self.repository.get_all(), [])
+
+    def test_list_priority_filters_todo_items(self):
+        self.repository.add("高优先级交付", priority="high")
+        self.repository.add("低优先级整理", priority="low")
+
+        table = self.cli._handle_slash_command("/list high")
+        console = Console(file=StringIO(), width=120, record=True)
+        console.print(table)
+        output = console.export_text()
+
+        self.assertIn("高优先级待办事项", output)
+        self.assertIn("高优先级交付", output)
+        self.assertNotIn("低优先级整理", output)
+
+    def test_clear_completed_requires_confirmation(self):
+        done = self.repository.add("已完成任务")
+        self.repository.toggle_completed(done.id)
+        self.repository.add("未完成任务")
+
+        with patch("ai_todo_assistant.presentation.cli.Prompt.ask", return_value="n"):
+            cancelled = self.cli._handle_slash_command("/clear")
+        self.assertIn("已取消", cancelled)
+        self.assertEqual(len(self.repository.get_all()), 2)
+
+        with patch("ai_todo_assistant.presentation.cli.Prompt.ask", return_value="y"):
+            cleared = self.cli._handle_slash_command("/clear")
+        self.assertIn("已清除 1 条", cleared)
+        self.assertEqual([todo.title for todo in self.repository.get_all()], ["未完成任务"])
+
+    def test_visual_status_color_helpers(self):
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        overdue = self.repository.add("过期任务", end_time=yesterday)
+        upcoming = self.repository.add("即将到期任务", end_time=tomorrow)
+        completed = self.repository.add("已完成任务")
+        self.repository.toggle_completed(completed.id)
+        completed = self.repository.get_by_id(completed.id)
+
+        self.assertEqual(self.cli._get_task_status_color(overdue), "red")
+        self.assertEqual(self.cli._get_task_status_color(upcoming), "orange")
+        self.assertEqual(self.cli._get_due_time_color(upcoming), "orange")
+        self.assertEqual(self.cli._get_task_status_color(completed), "grey50")
+        self.assertEqual(self.cli._get_due_time_color(completed), "grey50")
 
 
 class TestPersistentAssistantPreferences(unittest.TestCase):

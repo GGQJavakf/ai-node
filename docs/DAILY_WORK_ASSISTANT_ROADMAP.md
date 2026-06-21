@@ -16,6 +16,19 @@
 
 这说明当前工具已经不只是 TodoList。你的真实每日工作负载已经主要沉淀在 `WorkItem` 和 `Evidence` 中，并且大部分由 Codex 每日任务快照驱动。
 
+## 功能开发闭环
+
+后续每个功能默认采用 OpenSpec 驱动开发，并在测试完成后执行统一收尾：
+
+1. OpenSpec 提案先行：明确 proposal、design、spec 和 tasks 后再动代码。
+2. 开发实现：按 tasks 小步完成，完成一项勾选一项。
+3. 测试验证：至少运行相关单测；影响面较大时运行完整 `python -m unittest discover -s tests`。
+4. OpenSpec 归档：功能完成后运行 `openspec archive <change> -y`，同步主 specs，确保 `openspec list` 不再残留已完成未归档变更。
+5. 代码审核：提交前检查 diff、规范符合度、边界风险、敏感信息和测试覆盖；发现问题先修复再提交。
+6. GitHub 提交：确认不包含 `data/`、临时输出、认证文件和本地数据库后，再提交并推送到 `origin/main`。
+
+这个闭环是默认交付标准。除非明确说明“只写文档”或“只做分析”，否则功能开发完成不能停在测试通过，还必须完成 OpenSpec 归档、代码审核和 GitHub 推送。
+
 ## 日常命令面
 
 日常命令应继续保持简单：

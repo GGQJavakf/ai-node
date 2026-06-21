@@ -84,6 +84,9 @@ class CommandCompleter(Completer):
             '/list completed': '查看已完成的待办',
             '/list overdue': '查看过期的待办',
             '/list upcoming': '查看即将到期的待办',
+            '/list high': '查看高优先级待办',
+            '/list medium': '查看中优先级待办',
+            '/list low': '查看低优先级待办',
             '/today': '查看今日个人助理简报',
             '/plan day': '生成今日计划',
             '/add': '添加新的待办事项',
@@ -214,6 +217,8 @@ class TodoCLI:
             return "grey50"
         elif todo.is_overdue():
             return "red"
+        elif self._is_upcoming(todo):
+            return "orange"
         else:
             return "default"
 
@@ -229,18 +234,9 @@ class TodoCLI:
 
     def _is_upcoming(self, todo, days=2):
         """检查任务是否即将到期"""
-        from datetime import timedelta
-        if not todo.end_time:
-            return False
-        
-        now = datetime.now()
-        try:
-            fmt = "%Y-%m-%d %H:%M:%S" if len(todo.end_time) > 16 else "%Y-%m-%d %H:%M" if ":" in todo.end_time else "%Y-%m-%d"
-            end_dt = datetime.strptime(todo.end_time, fmt)
-            deadline = now + timedelta(days=days)
-            return now < end_dt <= deadline
-        except ValueError:
-            return False
+        if hasattr(todo, "is_upcoming"):
+            return todo.is_upcoming(days=days)
+        return False
 
     def _get_priority_marker(self, priority):
         """获取优先级标记"""
@@ -346,6 +342,10 @@ class TodoCLI:
         elif subcmd == "upcoming":
             todos = self.manager.get_upcoming()
             title = "🟠 即将到期的待办事项"
+        elif subcmd in {"high", "medium", "low"}:
+            todos = self.manager.get_by_priority(subcmd)
+            priority_name = {"high": "高", "medium": "中", "low": "低"}[subcmd]
+            title = f"{self._get_priority_marker(subcmd)} {priority_name}优先级待办事项"
         else:
             todos = self.manager.get_all()
             title = "📋 统一任务视图"
@@ -450,7 +450,7 @@ class TodoCLI:
         return table
 
     def _work_items_for_list(self, subcmd="", source_filter=""):
-        if subcmd in {"today", "week", "month", "overdue", "upcoming"}:
+        if subcmd in {"today", "week", "month", "overdue", "upcoming", "high", "medium", "low"}:
             return []
         try:
             items = self._workflow_repo().list_work_items(include_closed=(subcmd == "completed"))
@@ -655,6 +655,18 @@ class TodoCLI:
 
     def _handle_clear_command(self):
         """处理 /clear 命令"""
+        completed_count = len(self.manager.get_by_status(True))
+        if completed_count == 0:
+            return "ℹ️ 没有已完成的待办事项可清除"
+
+        answer = Prompt.ask(
+            f"确认永久清除 {completed_count} 条已完成待办？",
+            choices=["y", "n"],
+            default="n",
+        )
+        if answer.lower() != "y":
+            return "已取消清除操作"
+
         count = self.manager.clear_completed()
         if count > 0:
             return f"🗑️ 已清除 {count} 条已完成的待办事项"
@@ -993,7 +1005,7 @@ class TodoCLI:
             return "\n".join([
                 "📖 Todo 管理",
                 "─" * 80,
-                "  /list [today|week|month|pending|completed|overdue|upcoming]",
+                "  /list [today|week|month|pending|completed|overdue|upcoming|high|medium|low]",
                 "  /add [high|medium|low] <标题>",
                 "  /today",
                 "  /plan day",

@@ -64,6 +64,15 @@ class TestTodo(unittest.TestCase):
         # 已完成的不算过期
         todo = Todo("任务", due_date=yesterday, completed=True)
         self.assertFalse(todo.is_overdue())
+
+    def test_is_upcoming(self):
+        """测试即将到期检查"""
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        later = (datetime.now() + timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
+
+        self.assertTrue(Todo("明天任务", due_date=tomorrow).is_upcoming())
+        self.assertFalse(Todo("远期任务", due_date=later).is_upcoming())
+        self.assertFalse(Todo("已完成任务", due_date=tomorrow, completed=True).is_upcoming())
     
     def test_to_dict(self):
         """测试序列化"""

@@ -49,16 +49,20 @@ const blocks = [];
 let paragraph = [];
 let ordered = [];
 
+function renderSubtitle(text) {
+  blocks.push(`  <section style="margin:16px 0 8px;padding:0 0 0 10px;border-left:4px solid #576b95;">\n    <p style="margin:0;font-size:17px;line-height:1.35;font-weight:700;color:#1f2937;">${inlineMarkdown(text)}</p>\n  </section>`);
+}
+
 function flushParagraph() {
   if (!paragraph.length) return;
-  blocks.push(`  <p style="margin:0 0 9px;font-size:16px;line-height:1.72;color:#2b2f36;">${paragraph.join("<br />")}</p>`);
+  blocks.push(`  <p style="margin:0 0 6px;font-size:16px;line-height:1.5;color:#2b2f36;">${paragraph.join("<br />")}</p>`);
   paragraph = [];
 }
 
 function flushOrdered() {
   if (!ordered.length) return;
-  const items = ordered.map((item) => `<li style="margin:0 0 6px;font-size:16px;line-height:1.72;color:#2b2f36;">${item}</li>`).join("");
-  blocks.push(`  <section style="margin:10px 0 12px;padding:12px 14px;background:#fbfbfc;border:1px solid #e6e8ef;border-radius:6px;"><ol style="margin:0;padding-left:1.25em;color:#2b2f36;font-size:16px;line-height:1.72;">${items}</ol></section>`);
+  const items = ordered.map((item) => `<li style="margin:0 0 4px;font-size:16px;line-height:1.5;color:#2b2f36;">${item}</li>`).join("");
+  blocks.push(`  <section style="margin:8px 0 10px;padding:10px 12px;background:#fbfbfc;border:1px solid #e6e8ef;border-radius:6px;"><ol style="margin:0;padding-left:1.25em;color:#2b2f36;font-size:16px;line-height:1.5;">${items}</ol></section>`);
   ordered = [];
 }
 
@@ -80,6 +84,30 @@ for (const rawLine of body.split(/\r?\n/)) {
     if (alt) {
       blocks.push(`  <p style="margin:0 0 12px;text-align:center;color:#888;font-size:13px;line-height:1.5;">${alt}</p>`);
     }
+    continue;
+  }
+
+  const firstStage = line.match(/^于是我先铸(.+?)。$/);
+  if (firstStage) {
+    flushParagraph();
+    flushOrdered();
+    renderSubtitle(`第一关：铸${firstStage[1]}`);
+    continue;
+  }
+
+  const stageHeading = line.match(/^第([一二三四五六七八九十]+)关[，,：:\s]*(?:在|是)?(.+?)。?$/);
+  if (stageHeading) {
+    flushParagraph();
+    flushOrdered();
+    renderSubtitle(`第${stageHeading[1]}关：${stageHeading[2].replace(/^，|^,/, "").trim()}`);
+    continue;
+  }
+
+  const namedObstacle = line.match(/^这时还有一个心魔，名叫“(.+?)”。$/);
+  if (namedObstacle) {
+    flushParagraph();
+    flushOrdered();
+    renderSubtitle(`心魔：${namedObstacle[1]}`);
     continue;
   }
 
@@ -120,7 +148,7 @@ const html = `<!doctype html>
   </style>
 </head>
 <body>
-<section class="article-wrap" style="max-width:760px;margin:0 auto;padding:18px 16px;background:#ffffff;font-size:16px;line-height:1.72;color:#2b2f36;letter-spacing:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif;box-sizing:border-box;">
+<section class="article-wrap" style="max-width:760px;margin:0 auto;padding:18px 16px;background:#ffffff;font-size:16px;line-height:1.5;color:#2b2f36;letter-spacing:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',Arial,sans-serif;box-sizing:border-box;">
 ${digestBlock}
 ${blocks.join("\n")}
 </section>

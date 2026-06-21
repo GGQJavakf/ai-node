@@ -117,6 +117,19 @@ class Todo:
         except ValueError:
             return False
 
+    def is_upcoming(self, days: int = 2) -> bool:
+        """检查是否在指定天数内到期且未完成。"""
+        if not self.end_time or self.completed:
+            return False
+
+        try:
+            fmt = "%Y-%m-%d %H:%M:%S" if len(self.end_time) > 16 else "%Y-%m-%d %H:%M" if ":" in self.end_time else "%Y-%m-%d"
+            due = datetime.strptime(self.end_time, fmt)
+            diff = due - datetime.now()
+            return timedelta(0) < diff <= timedelta(days=days)
+        except ValueError:
+            return False
+
     def is_urgent(self) -> bool:
         """检查是否在 24 小时内到期且未完成。"""
         if not self.end_time or self.completed:

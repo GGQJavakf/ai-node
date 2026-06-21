@@ -3,7 +3,7 @@
 - [x] 1.1 Add `priority` field to Todo class (default: "medium")
 - [x] 1.2 Update `from_dict()` method for backward compatibility
 - [x] 1.3 Add `is_overdue()` method to Todo class
-- [ ] 1.4 Add `is_upcoming()` method to Todo class
+- [x] 1.4 Add `is_upcoming()` method to Todo class
 
 ## 2. Todo Manager Enhancement
 
@@ -34,10 +34,10 @@
 - [x] 4.3 Implement `/list month` command handler
 - [x] 4.4 Implement `/list overdue` command handler
 - [x] 4.5 Implement `/list upcoming` command handler
-- [ ] 4.6 Implement `/list high/medium/low` command handlers
+- [x] 4.6 Implement `/list high/medium/low` command handlers
 - [x] 4.7 Implement `/search <keyword>` command handler
 - [x] 4.8 Implement `/stats` command handler
-- [ ] 4.9 Implement `/clear` command handler with confirmation
+- [x] 4.9 Implement `/clear` command handler with confirmation
 - [x] 4.10 Implement color output for task status and priority
 - [x] 4.11 Update `/add` command to support priority prefix
 - [x] 4.12 Update `/update` command to support priority field
@@ -50,7 +50,7 @@
 
 - [x] 5.1 Test time-based filtering commands
 - [x] 5.2 Test priority management commands
-- [ ] 5.3 Test color output display
+- [x] 5.3 Test color output display
 - [x] 5.4 Test search functionality
 - [x] 5.5 Test statistics display
 - [x] 5.6 Test clear completed functionality
