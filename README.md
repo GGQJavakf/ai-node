@@ -36,17 +36,29 @@ python -m pip install -e .
 
 ## 配置 AI 后端
 
-AI 配置文件位于：
+默认配置模板位于：
 
 ```text
-config/settings.json
+config/settings.example.json
 ```
 
-也可以使用环境变量覆盖配置文件。建议不要把真实 API Key 写入要提交或分发的配置文件。
+本地运行配置位于：
+
+```text
+config/settings.local.json
+```
+
+首次配置时复制模板：
+
+```powershell
+Copy-Item config/settings.example.json config/settings.local.json
+```
+
+`config/settings.local.json` 已加入 `.gitignore`，用于本机运行和测试，不提交。也可以使用环境变量覆盖本地配置。旧的 `config/settings.json` 仍作为兼容入口，但不建议继续把真实 API Key 写在可提交文件中。
 
 ### 方式一：OpenAI 兼容 API（默认）
 
-`config/settings.json` 示例：
+`config/settings.local.json` 示例：
 
 ```json
 {
@@ -84,7 +96,7 @@ $env:TODO_SQLITE_PATH="data/todos.db"
 codex login
 ```
 
-`config/settings.json` 示例：
+`config/settings.local.json` 示例：
 
 ```json
 {
@@ -143,6 +155,7 @@ Codex 模式不会读取或保存新的 Codex token，而是复用本机 `codex 
 | `todo_data_file` | `todos.json` | 旧版 JSON 数据文件路径 |
 | `workflow_data_file` | `data/workflow.json` | JSON 后端下的工作流数据文件路径 |
 | `codex_task_report_dir` | `data/codex-task-reports` | Codex 每日任务报告目录 |
+| `sync_watch_interval_seconds` | `1800` | `/sync watch` 未指定间隔时的本地前台触发间隔 |
 | `auto_migrate_json` | `true` | SQLite 空库首次启动时是否从 JSON 自动迁移 |
 
 ## 启动应用
@@ -183,6 +196,8 @@ python -m ai_todo_assistant.presentation.gui
 | --- | --- |
 | `/list` | 统一任务视图，合并 TodoList 和同步工作项 |
 | `/sync [路径]` | 统一同步入口，只读同步 Codex 报告和 Git/OpenSpec/Playbook 项目上下文 |
+| `/sync watch [秒] [路径]` | 本地前台定时触发 `/sync`，每轮汇报同步结果和下一步建议 |
+| `/sync watch --resume [秒] [路径]` | 本地前台定时同步后，推进可继续的 Codex 暂停会话 |
 | `/next` | 推荐下一步工作 |
 | `/review` | 生成工作日复盘草稿 |
 | `/help` | 查看帮助 |
@@ -205,6 +220,7 @@ python -m ai_todo_assistant.presentation.gui
 | `/list month` | 查看本月任务 |
 | `/list pending` | 查看未完成任务 |
 | `/list completed` | 查看已完成任务 |
+| `/list all` | 查看所有任务 |
 | `/list overdue` | 查看已过期任务 |
 | `/list upcoming` | 查看即将到期任务 |
 | `/add [high|medium|low] <标题>` | 新增任务 |
@@ -228,6 +244,9 @@ python -m ai_todo_assistant.presentation.gui
 | `/work evidence add <work-id> <摘要>` | 为工作项追加证据 |
 | `/work evidence summary <work-id>` | 汇总工作项证据 |
 | `/codex tasks` | 读取 Codex 每日 JSON/Markdown 任务报告并同步未完成工作项 |
+| `/codex resume [--dry-run] [thread-id]` | 从最新 Codex report 推进可继续的暂停会话 |
+| `/sync watch [秒] [路径]` | 保持 CLI 运行并定时触发同步，每轮输出汇报；按 `Ctrl+C` 停止 |
+| `/sync watch --resume [秒] [路径]` | 保持 CLI 运行，定时同步后再推进可继续的 Codex 会话 |
 | `/continue` | 兼容命令，等同 `/next` |
 | `/start day` | 生成工作日启动计划 |
 | `/review day` | 兼容命令，等同 `/review` |
@@ -260,6 +279,9 @@ data/todos.db
 - Codex 任务分析通过文件交接完成：Codex 自动化写入 `data/codex-task-reports/YYYY-MM-DD.json` 和同名 `.md`，`ai-node` 只读取这些稳定文件。
 - Evidence 是追加式记录，用于日报、closeout 草稿、MR/Redmine 草稿和个人复盘；默认不会把完整日志塞进摘要。
 - WorkItem 去重只基于稳定 identity 自动合并，例如 `redmine:<id>`、`openspec:<change>`、`gitlab-mr:<project>:<id>` 和 `codex-thread:<id>`；仅标题相似或跨项目 MR id 不会自动合并，会在同步摘要中计入 `skipped`。
+- `/codex resume --dry-run` 只预览最新 Codex report 中明确可继续的线程，不发送消息也不写 Evidence。
+- `/codex resume` 只会推进 `unfinished` 中有 `thread_id`、有 `resume_prompt` 或 `next_action`、且显式 `resume_eligible=true` 或状态为 `continueable/paused/ready/needs_action/needs_resume` 的线程；`blocked`、`completed`、缺少 thread id、缺少 prompt、或需要用户输入的线程会跳过。
+- 真正发送 Codex thread message 通过可注入 resume client 完成；未配置时命令会 fail-closed，报告 `resume client unavailable`，并把失败尝试写入本地 Evidence 方便后续追踪。
 - 自动合并会保留 source refs、source identities、evidence 和 merge audit；误合并可通过 `/work rollback <work-id> <audit-id>` 按审计记录回滚，或通过 `/work split <work-id> <source> <source-ref> [title]` 本地拆分，不会写回外部系统。
 
 Codex 每日任务报告 schema 详见：

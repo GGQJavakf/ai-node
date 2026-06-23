@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import logging
 import traceback
 import urllib.request
@@ -19,17 +18,12 @@ if not os.path.exists(LOG_DIR):
 
 def _get_log_level():
     """获取初始日志级别，默认 ERROR"""
-    level = logging.ERROR
-    config_path = os.path.join(PROJECT_ROOT, "config", "settings.json")
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                level_name = config.get("log_level", "ERROR").upper()
-                level = getattr(logging, level_name, logging.ERROR)
-        except:
-            pass
-    return level
+    try:
+        config = load_settings(PROJECT_ROOT)
+        level_name = str(config.get("log_level", "ERROR")).upper()
+        return getattr(logging, level_name, logging.ERROR)
+    except Exception:
+        return logging.ERROR
 
 LOG_FILE = os.path.join(LOG_DIR, "ai_agent.log")
 logging.basicConfig(
@@ -48,7 +42,7 @@ class AITodoAgent:
     
     def __init__(self, manager):
         self.manager = manager
-        # 统一配置优先级：默认值 < config/settings.json < 环境变量。
+        # 统一配置优先级：默认值 < 本地运行配置 < 环境变量。
         config = load_settings(PROJECT_ROOT)
         self.config = config
         self.api_key = config["api_key"]
@@ -101,7 +95,7 @@ class AITodoAgent:
                 return "❌ AI 管家未配置。请先安装 Codex CLI，并运行 `codex login` 完成登录。"
             return "❌ AI 管家未配置。您可以通过以下任一方式配置：\n\n" \
                    "1. 修改配置文件 [推荐]: \n" \
-                   "   在项目主目录下找到 `config/settings.json` 并填入您的 API Key。\n\n" \
+                   "   在项目主目录下复制 `config/settings.example.json` 为 `config/settings.local.json`，并填入您的 API Key。\n\n" \
                    "2. 设置系统环境变量: \n" \
                    "   $env:AI_API_KEY='您的API_KEY' (PowerShell)"
                    

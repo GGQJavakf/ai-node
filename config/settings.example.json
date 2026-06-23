@@ -1,0 +1,18 @@
+{
+  "auth_mode": "openai_api",
+  "api_key": "REPLACE_WITH_YOUR_API_KEY",
+  "api_base": "https://api.openai.com/v1/chat/completions",
+  "model": "gpt-4o-mini",
+  "request_timeout": 45,
+  "api_retry_limit": 2,
+  "api_retry_backoff": 1.0,
+  "validation_retry_limit": 3,
+  "session_memory_limit": 20,
+  "storage_backend": "sqlite",
+  "sqlite_path": "data/todos.db",
+  "workflow_data_file": "data/workflow.json",
+  "codex_task_report_dir": "data/codex-task-reports",
+  "sync_watch_interval_seconds": 1800,
+  "auto_migrate_json": true,
+  "log_level": "ERROR"
+}

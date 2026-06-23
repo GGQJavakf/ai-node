@@ -44,11 +44,15 @@ from ai_todo_assistant.infrastructure.persistence import build_todo_repository, 
 from ai_todo_assistant.application.agent import AgentCore
 from ai_todo_assistant.application.workflow import (
     CodexTaskReportService,
+    CodexResumeService,
     ContinueService,
     DailyReviewService,
     EvidenceService,
+    SyncWatchRunner,
     WorkItemService,
     WorkflowSyncService,
+    format_codex_resume_result,
+    format_sync_watch_report,
 )
 from ai_todo_assistant.domain.workflow import WorkItemStatus
 from ai_todo_assistant.infrastructure.config import load_settings
@@ -82,6 +86,7 @@ class CommandCompleter(Completer):
             '/list month': '查看本月的待办',
             '/list pending': '查看未完成的待办',
             '/list completed': '查看已完成的待办',
+            '/list all': '查看所有任务',
             '/list overdue': '查看过期的待办',
             '/list upcoming': '查看即将到期的待办',
             '/list high': '查看高优先级待办',
@@ -115,12 +120,15 @@ class CommandCompleter(Completer):
             '/sync': '同步 Codex 报告和当前项目上下文',
             '/sync --dry-run': '预览同步结果但不写入',
             '/sync status': '查看同步健康状态',
+            '/sync watch': '本地前台定时触发同步并汇报每轮结果',
+            '/sync watch --resume': '本地前台定时同步后推进可继续 Codex 会话',
             '/next': '推荐下一步工作',
             '/review': '生成工作日复盘草稿',
             '/continue': '兼容命令：推荐下一步工作',
             '/start day': '生成工作日启动计划',
             '/review day': '兼容命令：生成工作日复盘草稿',
             '/codex tasks': '查看 Codex 未完成任务日报',
+            '/codex resume': '推进可继续的 Codex 暂停会话',
             '/help': '显示帮助信息',
             '/help todo': '查看 Todo 管理命令',
             '/help work': '查看工作流和证据命令',
@@ -208,7 +216,7 @@ class TodoCLI:
     def _load_config(self):
         """加载配置"""
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-        # 统一配置优先级：默认值 < config/settings.json < 环境变量。
+        # 统一配置优先级：默认值 < 本地运行配置 < 环境变量。
         return load_settings(project_root)
 
     def _get_task_status_color(self, todo):
@@ -290,7 +298,7 @@ class TodoCLI:
         elif cmd == "/forget":
             return self._handle_forget_command(subcmd)
         elif cmd == "/codex":
-            return self._handle_codex_command(subcmd)
+            return self._handle_codex_command(subcmd, args)
         elif cmd == "/work":
             return self._handle_work_command(subcmd, args)
         elif cmd == "/sync":
@@ -336,6 +344,9 @@ class TodoCLI:
         elif subcmd == "completed":
             todos = self.manager.get_by_status(True)
             title = "✅ 已完成任务"
+        elif subcmd == "all":
+            todos = self.manager.get_all()
+            title = "📋 所有任务"
         elif subcmd == "overdue":
             todos = self.manager.get_overdue()
             title = "🔴 已过期的待办事项"
@@ -357,39 +368,51 @@ class TodoCLI:
             return f"{title}\n\n  暂无任务"
 
         # 使用 Rich Table 显示
-        table = Table(title=title)
+        rows = []
+        for index, todo in enumerate(todos):
+            rows.append(
+                {
+                    "category": _todo_list_category(todo),
+                    "order": index,
+                    "id": todo.id[:8],
+                    "priority": self._get_priority_marker(todo.priority),
+                    "title": Text(todo.title, style=self._get_task_status_color(todo)),
+                    "status": Text("完成" if todo.completed else "未完成", style="grey50" if todo.completed else "green"),
+                    "next": Text(todo.end_time if todo.end_time else "-", style=self._get_due_time_color(todo)),
+                }
+            )
+        for index, item in enumerate(work_items):
+            status_style = "yellow" if item.status == "blocked" else "grey50" if item.status == "done" else "cyan"
+            rows.append(
+                {
+                    "category": _work_item_list_category(item),
+                    "order": len(todos) + index,
+                    "id": item.id[:8],
+                    "priority": self._get_priority_marker(item.priority),
+                    "title": Text(item.title, style="grey50" if item.status == "done" else "default"),
+                    "status": Text(_work_item_status_label(item.status), style=status_style),
+                    "next": item.next_action or item.sync_summary or "-",
+                }
+            )
+
+        rows.sort(key=lambda row: (_list_category_rank(row["category"]), row["order"]))
+
+        table = Table(title=title, show_lines=True)
         table.add_column("ID", style="dim", width=8)
-        table.add_column("来源", width=8)
+        table.add_column("分类", width=10)
         table.add_column("优先级", width=6)
         table.add_column("标题")
         table.add_column("状态", width=8)
         table.add_column("截止/下一步")
 
-        for todo in todos:
-            status_text = Text("✓ 完成", style="grey50") if todo.completed else Text("○ 未完成", style="green")
-            priority_marker = self._get_priority_marker(todo.priority)
-            
-            due_time = todo.end_time if todo.end_time else "-"
-            due_style = self._get_due_time_color(todo)
-            
+        for row in rows:
             table.add_row(
-                todo.id[:8],
-                "todo",
-                priority_marker,
-                Text(todo.title, style=self._get_task_status_color(todo)),
-                status_text,
-                Text(due_time, style=due_style)
-            )
-        for item in work_items:
-            status_style = "yellow" if item.status == "blocked" else "grey50" if item.status == "done" else "cyan"
-            priority_marker = self._get_priority_marker(item.priority)
-            table.add_row(
-                item.id[:8],
-                item.source,
-                priority_marker,
-                Text(item.title, style="grey50" if item.status == "done" else "default"),
-                Text(item.status, style=status_style),
-                item.next_action or item.sync_summary or "-",
+                row["id"],
+                row["category"],
+                row["priority"],
+                row["title"],
+                row["status"],
+                row["next"],
             )
 
         return table
@@ -401,7 +424,7 @@ class TodoCLI:
         work_items = []
         if source_filter != "todo":
             try:
-                work_items = self._workflow_repo().list_work_items(include_closed=True)
+                work_items = self._workflow_repo().list_work_items(include_closed=False)
             except Exception:
                 work_items = []
             if source_filter:
@@ -426,25 +449,19 @@ class TodoCLI:
         if not rows:
             return "📋 每日工作分诊\n\n  暂无任务"
 
-        table = Table(title="📋 每日工作分诊")
-        table.add_column("分组", width=22)
-        table.add_column("ID", style="dim", width=8)
-        table.add_column("来源", width=7)
-        table.add_column("优先级", width=4)
-        table.add_column("标题", no_wrap=True)
-        table.add_column("状态", width=7)
-        table.add_column("原因", width=38, no_wrap=True)
-        table.add_column("截止/下一步", width=14)
+        table = Table(title="📋 每日工作分诊", expand=True)
+        table.add_column("分组", width=10, no_wrap=True)
+        table.add_column("来源/状态", width=16, no_wrap=True)
+        table.add_column("标题", ratio=3, min_width=22, overflow="fold")
+        table.add_column("原因", width=22, no_wrap=True, overflow="ellipsis")
+        table.add_column("下一步/截止", ratio=2, min_width=28, overflow="fold")
 
         for row in rows:
             table.add_row(
-                row["group"],
-                row["id"],
-                row["source"],
-                row["priority"],
+                _daily_triage_group_label(row["group"]),
+                _daily_triage_meta(row),
                 row["title"],
-                row["status"],
-                row["reason"],
+                _daily_triage_reason_label(row["reason"]),
                 row["next"],
             )
         return table
@@ -453,13 +470,15 @@ class TodoCLI:
         if subcmd in {"today", "week", "month", "overdue", "upcoming", "high", "medium", "low"}:
             return []
         try:
-            items = self._workflow_repo().list_work_items(include_closed=(subcmd == "completed"))
+            items = self._workflow_repo().list_work_items(include_closed=(subcmd in {"all", "completed"}))
         except Exception:
             return []
         if source_filter and source_filter != "todo":
             items = [item for item in items if item.source == source_filter]
         elif source_filter == "todo":
             items = []
+        if subcmd == "all":
+            return _dedupe_work_items(items)
         if subcmd == "completed":
             return _dedupe_work_items([item for item in items if item.status == "done"])
         return _dedupe_work_items([item for item in items if item.status not in {"done", "archived"}])
@@ -697,9 +716,11 @@ class TodoCLI:
             return f"已忘记偏好：{key}"
         return f"未找到偏好：{key}"
 
-    def _handle_codex_command(self, subcmd):
+    def _handle_codex_command(self, subcmd, args=""):
+        if subcmd == "resume":
+            return self._handle_codex_resume_command(args)
         if subcmd not in {"tasks", "unfinished"}:
-            return "用法: /codex tasks"
+            return "用法: /codex [tasks|resume]"
 
         report, imported, report_dir = self._import_latest_codex_report()
         if not report:
@@ -746,6 +767,24 @@ class TodoCLI:
                     output += f"     完成证据: {signal_text}\n"
         output += "─" * 80
         return output
+
+    def _handle_codex_resume_command(self, args=""):
+        options = _parse_codex_resume_options(args)
+        if options["invalid"]:
+            return "用法: /codex resume [--dry-run] [thread-id]"
+        report, report_dir = self._latest_codex_report()
+        if not report:
+            return f"Codex resume\n\n  暂无快照文件: {report_dir}"
+        service = CodexResumeService(
+            self._workflow_repo(),
+            client=getattr(self, "codex_resume_client", None),
+        )
+        result = service.resume(
+            report,
+            dry_run=options["dry_run"],
+            thread_id=options["thread_id"],
+        )
+        return format_codex_resume_result(result)
 
     def _import_latest_codex_report(self):
         report, report_dir = self._latest_codex_report()
@@ -846,6 +885,10 @@ class TodoCLI:
 
     def _handle_sync_command(self, subcmd, args):
         options = _parse_sync_options(subcmd, args)
+        if options["watch"]:
+            if options["dry_run"] or options["status"]:
+                return "用法: /sync watch [interval-seconds] [path]，不能与 --dry-run 或 status 组合"
+            return self._handle_sync_watch_command(options)
         if options["status"]:
             return self._sync_status()
         path = options["path"] or os.getcwd()
@@ -864,6 +907,9 @@ class TodoCLI:
             lines.append(f"  [SKIP] project: dry-run 不会同步项目上下文 {path}")
             lines.append("─" * 80)
             return "\n".join(lines)
+        return self._run_sync_once(path)
+
+    def _run_sync_once(self, path):
         report, imported, report_dir = self._import_latest_codex_report()
         snapshots = []
         path_error = ""
@@ -892,6 +938,34 @@ class TodoCLI:
                 lines.append(f"     {snapshot.error}")
         lines.append("─" * 80)
         return "\n".join(lines)
+
+    def _handle_sync_watch_command(self, options, max_runs=None, sleep=None):
+        interval = options["interval_seconds"] or int(
+            self.config.get("sync_watch_interval_seconds", 1800)
+        )
+        path = options["path"] or os.getcwd()
+        caller_supplied_max_runs = max_runs is not None
+        if options.get("once"):
+            max_runs = 1
+        print_each_report = not caller_supplied_max_runs
+        runner = SyncWatchRunner(
+            sync_once=self._run_sync_once,
+            recommend_next=self._handle_continue_command,
+            sleep=sleep,
+        )
+        last_report = ""
+        try:
+            for result in runner.run(interval, path, max_runs=max_runs):
+                last_report = format_sync_watch_report(result)
+                if options.get("resume"):
+                    last_report = "\n\n".join([last_report, self._handle_codex_resume_command("")])
+                if print_each_report:
+                    self.console.print(last_report)
+        except KeyboardInterrupt:
+            return "已停止 sync watch"
+        if print_each_report and last_report:
+            return f"sync watch 已完成 {max_runs} 轮" if max_runs else "已停止 sync watch"
+        return last_report or "sync watch 未触发"
 
     def _sync_status(self):
         report, report_dir = self._latest_codex_report()
@@ -1005,7 +1079,7 @@ class TodoCLI:
             return "\n".join([
                 "📖 Todo 管理",
                 "─" * 80,
-                "  /list [today|week|month|pending|completed|overdue|upcoming|high|medium|low]",
+                "  /list [all|today|week|month|pending|completed|overdue|upcoming|high|medium|low]",
                 "  /add [high|medium|low] <标题>",
                 "  /today",
                 "  /plan day",
@@ -1023,6 +1097,8 @@ class TodoCLI:
                 "  /sync [path]",
                 "  /sync --dry-run [path]",
                 "  /sync status",
+                "  /sync watch [interval-seconds] [path]  本地前台定时触发并汇报",
+                "  /sync watch --resume [interval-seconds] [path]",
                 "  /work status",
                 "  /work conflicts",
                 "  /work add <标题>",
@@ -1034,6 +1110,7 @@ class TodoCLI:
                 "  /work evidence summary <work-id>",
                 "  /work evidence timeline <work-id>",
                 "  /codex tasks",
+                "  /codex resume [--dry-run] [thread-id]",
                 "  /next",
                 "  /review",
                 "",
@@ -1234,7 +1311,7 @@ def _daily_triage_work_item_rows(items):
     grouped = {name: [] for name in _DAILY_TRIAGE_GROUPS}
     for item in items:
         group = _daily_triage_group(item)
-        if not group:
+        if not group or group not in grouped:
             continue
         grouped[group].append(item)
 
@@ -1257,11 +1334,131 @@ def _daily_triage_work_item_rows(items):
                     "priority": _priority_marker(item.priority),
                     "title": Text(item.title, style="grey50" if item.status == "done" else "default"),
                     "status": Text(item.status, style=status_style),
-                    "reason": Text(reason_text),
+                    "reason": reason_text,
                     "next": item.next_action or item.sync_summary or "-",
                 }
             )
     return rows
+
+
+def _daily_triage_group_label(group):
+    return {
+        "blocked": "受阻",
+        "active needs action": "待处理",
+        "waiting closeout": "待闭环",
+        "stale sync": "需同步",
+        "recently completed": "近期完成",
+        "todo reminders": "提醒",
+    }.get(group, group)
+
+
+def _daily_triage_reason_label(reason):
+    reason_text = reason.plain if isinstance(reason, Text) else str(reason)
+    stale = " [stale]" in reason_text
+    reason_text = reason_text.replace(" [stale]", "")
+    label = {
+        "blocked by Redmine": "Redmine 阻塞",
+        "blocked by MR": "MR 阻塞",
+        "blocked by OpenSpec": "OpenSpec 阻塞",
+        "MR merged but closeout missing": "MR 已合并待闭环",
+        "Redmine closeout missing": "Redmine 待闭环",
+        "OpenSpec closeout missing": "OpenSpec 待归档",
+        "needs validation": "待验证",
+        "Codex thread still active": "Codex 运行中",
+        "merge conflict needs manual resolution": "合并冲突待处理",
+        "sync stale": "同步已过期",
+        "recently completed": "最近已完成",
+        "blocked": "已阻塞",
+        "needs action": "需要处理",
+        "todo reminder": "本地提醒",
+    }.get(reason_text, reason_text)
+    return f"{label} / 同步" if stale else label
+
+
+def _daily_triage_meta(row):
+    status_value = row["status"].plain if isinstance(row["status"], Text) else str(row["status"])
+    status_label = {
+        WorkItemStatus.ACTIVE.value: "活动",
+        WorkItemStatus.BLOCKED.value: "受阻",
+        WorkItemStatus.DONE.value: "完成",
+        "○ 未完成": "未完成",
+        "✓ 完成": "完成",
+    }.get(status_value, status_value)
+    parts = [str(row["source"])]
+    if row["priority"]:
+        parts.append(_daily_triage_priority_label(row["priority"]))
+    parts.append(status_label)
+    return " ".join(parts)
+
+
+def _daily_triage_priority_label(priority):
+    return {
+        "🔴": "高",
+        "🟡": "中",
+        "🟢": "低",
+    }.get(str(priority), str(priority))
+
+
+def _work_item_status_label(status):
+    return {
+        WorkItemStatus.ACTIVE.value: "活动",
+        WorkItemStatus.BLOCKED.value: "受阻",
+        WorkItemStatus.DONE.value: "完成",
+        WorkItemStatus.ARCHIVED.value: "归档",
+    }.get(status, status)
+
+
+def _todo_list_category(todo):
+    return "Todo"
+
+
+def _work_item_list_category(item):
+    title_text = " ".join(
+        str(part)
+        for part in [item.title, item.source_ref]
+        if part
+    ).lower()
+    full_text = " ".join(
+        str(part)
+        for part in [
+            item.source,
+            item.source_ref,
+            item.title,
+            item.next_action,
+            item.sync_summary,
+            *getattr(item, "source_identities", []),
+        ]
+        if part
+    ).lower()
+    if _mentions(full_text, "redmine"):
+        return "Redmine"
+    if _mentions(title_text, "公众号", "wechat", "md2wechat"):
+        return "公众号"
+    if _mentions(title_text, "openspec", "spec "):
+        return "OpenSpec"
+    if item.source == "playbook" or _mentions(title_text, "playbook"):
+        return "Playbook"
+    if _mentions(title_text, "ai-node"):
+        return "ai-node"
+    return {
+        "manual": "手动",
+        "codex": "Codex",
+        "todo": "Todo",
+    }.get(item.source, item.source or "其他")
+
+
+def _list_category_rank(category):
+    return {
+        "Redmine": 10,
+        "Playbook": 20,
+        "OpenSpec": 30,
+        "公众号": 40,
+        "ai-node": 50,
+        "Codex": 60,
+        "手动": 70,
+        "Todo": 80,
+        "其他": 90,
+    }.get(category, 85)
 
 
 _DAILY_TRIAGE_GROUPS = [
@@ -1269,7 +1466,6 @@ _DAILY_TRIAGE_GROUPS = [
     "active needs action",
     "waiting closeout",
     "stale sync",
-    "recently completed",
     "todo reminders",
 ]
 
@@ -1414,6 +1610,10 @@ def _parse_sync_options(subcmd, args):
     tokens = [part for part in [subcmd, *args.split()] if part]
     dry_run = False
     status = False
+    watch = False
+    once = False
+    resume = False
+    interval_seconds = None
     path_parts = []
     index = 0
     while index < len(tokens):
@@ -1422,14 +1622,45 @@ def _parse_sync_options(subcmd, args):
             dry_run = True
         elif token == "status":
             status = True
+        elif token == "watch":
+            watch = True
+        elif token == "--once":
+            once = True
+        elif token == "--resume":
+            resume = True
+        elif watch and interval_seconds is None:
+            try:
+                interval_seconds = int(token)
+            except ValueError:
+                path_parts.append(token)
         else:
             path_parts.append(token)
         index += 1
     return {
         "dry_run": dry_run,
         "status": status,
+        "watch": watch,
+        "once": once,
+        "resume": resume,
+        "interval_seconds": interval_seconds,
         "path": " ".join(path_parts).strip(),
     }
+
+
+def _parse_codex_resume_options(args):
+    dry_run = False
+    thread_id = ""
+    invalid = False
+    for token in args.split():
+        if token in {"--dry-run", "-n"}:
+            dry_run = True
+        elif token.startswith("-"):
+            invalid = True
+        elif not thread_id:
+            thread_id = token
+        else:
+            invalid = True
+    return {"dry_run": dry_run, "thread_id": thread_id, "invalid": invalid}
 
 
 if __name__ == "__main__":

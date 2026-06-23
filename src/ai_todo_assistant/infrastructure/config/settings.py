@@ -30,21 +30,30 @@ DEFAULT_SETTINGS = {
     "todo_data_file": "todos.json",
     "workflow_data_file": "data/workflow.json",
     "codex_task_report_dir": "data/codex-task-reports",
+    "sync_watch_interval_seconds": 1800,
     "auto_migrate_json": True,
 }
+
+LOCAL_SETTINGS_FILE = "settings.local.json"
+LEGACY_SETTINGS_FILE = "settings.json"
 
 
 def load_settings(project_root: str | None = None) -> dict:
     """
     加载 AI 配置。
 
-    优先级固定为：默认值 < config/settings.json < 环境变量。
+    优先级固定为：默认值 < 本地运行配置 < 环境变量。
+    本地运行配置优先读取 config/settings.local.json；如果不存在，
+    再兼容读取旧的 config/settings.json。
     这样 CLI、旧版 Agent 和后续 API 入口都能获得一致行为。
     """
     root = project_root or os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
     )
-    config_path = os.path.join(root, "config", "settings.json")
+    config_dir = os.path.join(root, "config")
+    local_config_path = os.path.join(config_dir, LOCAL_SETTINGS_FILE)
+    legacy_config_path = os.path.join(config_dir, LEGACY_SETTINGS_FILE)
+    config_path = local_config_path if os.path.exists(local_config_path) else legacy_config_path
     config = DEFAULT_SETTINGS.copy()
 
     if os.path.exists(config_path):
@@ -106,6 +115,10 @@ def load_settings(project_root: str | None = None) -> dict:
     config["codex_task_report_dir"] = os.getenv(
         "AI_CODEX_TASK_REPORT_DIR", config["codex_task_report_dir"]
     )
+    config["sync_watch_interval_seconds"] = _as_positive_int(
+        os.getenv("AI_SYNC_WATCH_INTERVAL_SECONDS", config["sync_watch_interval_seconds"]),
+        DEFAULT_SETTINGS["sync_watch_interval_seconds"],
+    )
     config["auto_migrate_json"] = _as_bool(
         os.getenv("TODO_AUTO_MIGRATE_JSON", config["auto_migrate_json"])
     )
@@ -119,5 +132,13 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _as_positive_int(value, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 

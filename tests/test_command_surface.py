@@ -60,7 +60,7 @@ class TestAssistantCommandSurface(unittest.TestCase):
     def test_help_groups_advanced_commands_and_keeps_compatibility_aliases(self):
         work_help = self.cli._handle_slash_command("/help work")
 
-        for text in ["/work status", "/work evidence add", "/codex tasks", "/next", "/review"]:
+        for text in ["/work status", "/work evidence add", "/codex tasks", "/sync watch", "/next", "/review"]:
             self.assertIn(text, work_help)
         self.assertIn("/continue", work_help)
         self.assertIn("/review day", work_help)
@@ -72,6 +72,7 @@ class TestAssistantCommandSurface(unittest.TestCase):
         system_help = self.cli._handle_slash_command("/help system")
 
         self.assertIn("/add [high|medium|low] <标题>", todo_help)
+        self.assertIn("/list [all|today|week|month|pending|completed|overdue|upcoming|high|medium|low]", todo_help)
         self.assertIn("/update <ID> [title|end_time|priority] <值>", todo_help)
         self.assertNotIn("/work evidence", todo_help)
         self.assertIn("/preferences", prefs_help)
@@ -84,7 +85,9 @@ class TestAssistantCommandSurface(unittest.TestCase):
 
         for command in [
             "/list",
+            "/list all",
             "/sync",
+            "/sync watch",
             "/next",
             "/review",
             "/continue",

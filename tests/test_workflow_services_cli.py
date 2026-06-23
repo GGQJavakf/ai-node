@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from ai_todo_assistant.domain.workflow import SourceSnapshot, WorkItem, WorkItem
 from ai_todo_assistant.infrastructure.persistence.json_todo_repository import TodoManager
 from ai_todo_assistant.infrastructure.persistence import SQLiteWorkflowRepository
 from ai_todo_assistant.presentation.cli import TodoCLI
+from rich.console import Console
 
 
 class TestWorkflowServicesAndCli(unittest.TestCase):
@@ -35,6 +37,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
             "sqlite_path": self.workflow_path,
         }
         self.cli.manager = TodoManager(os.path.join(self.temp_dir.name, "todos.json"))
+        self.cli.console = Console(file=io.StringIO(), force_terminal=False)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -103,6 +106,77 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertIn("MR !14 merged", response)
         self.assertEqual(items[0].status, WorkItemStatus.DONE.value)
         self.assertIn("MR !14 merged", self.repository.list_evidence(items[0].id)[0].summary)
+
+    def test_codex_resume_dry_run_lists_candidate_without_writing(self):
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-ready",
+                            "title": "继续自动推进",
+                            "resume_eligible": True,
+                            "resume_prompt": "继续执行到测试通过",
+                        }
+                    ],
+                },
+                handle,
+            )
+
+        response = self.cli._handle_slash_command("/codex resume --dry-run")
+
+        self.assertIn("Codex resume [DRY-RUN]", response)
+        self.assertIn("thread-ready", response)
+        self.assertEqual(self.repository.list_work_items(include_closed=True), [])
+
+    def test_codex_resume_reports_unavailable_default_client_and_records_evidence(self):
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-ready",
+                            "title": "继续自动推进",
+                            "status": "continueable",
+                            "next_action": "继续执行到测试通过",
+                        }
+                    ],
+                },
+                handle,
+            )
+
+        response = self.cli._handle_slash_command("/codex resume")
+        item = self.repository.find_work_item_by_source("codex", "thread-ready")
+
+        self.assertIn("[FAIL]", response)
+        self.assertIn("resume client unavailable", response)
+        self.assertIsNotNone(item)
+        self.assertEqual(len(self.repository.list_evidence(item.id)), 1)
+
+    def test_codex_resume_target_evaluates_only_requested_thread(self):
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                        {"thread_id": "thread-2", "status": "continueable", "next_action": "继续 2"},
+                    ],
+                },
+                handle,
+            )
+
+        response = self.cli._handle_slash_command("/codex resume --dry-run thread-2")
+
+        self.assertIn("thread-2", response)
+        self.assertNotIn("thread-1", response)
+
+    def test_codex_resume_rejects_invalid_arguments(self):
+        response = self.cli._handle_slash_command("/codex resume --unknown thread-1 extra")
+
+        self.assertIn("用法: /codex resume", response)
 
     def test_codex_completion_sync_is_idempotent_and_appends_new_signals(self):
         service = WorkItemService(self.repository)
@@ -201,6 +275,32 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertIn("todo", rendered)
         self.assertIn("manual", rendered)
 
+    def test_list_pending_uses_chinese_status_row_separators_and_categories(self):
+        self.cli.manager.add("传统 Todo")
+        WorkItemService(self.repository).create_manual("修复 OpenSpec 归档查找失败", next_action="补充验证")
+        playbook = WorkItem(title="修复 Playbook 状态不同步", source="codex", source_ref="thread-playbook")
+        self.repository.save_work_item(playbook)
+        blocked = WorkItem(title="等待 Redmine 确认", source="redmine", source_ref="232608")
+        blocked.status = WorkItemStatus.BLOCKED.value
+        self.repository.save_work_item(blocked)
+
+        rendered = _render_table(self.cli._handle_slash_command("/list pending"))
+
+        self.assertIn("分类", rendered)
+        self.assertIn("Todo", rendered)
+        self.assertIn("Redmine", rendered)
+        self.assertIn("Playbook", rendered)
+        self.assertIn("OpenSpec", rendered)
+        self.assertIn("未完成", rendered)
+        self.assertIn("活动", rendered)
+        self.assertIn("受阻", rendered)
+        self.assertIn("├", rendered)
+        self.assertNotIn("active", rendered)
+        self.assertNotIn("blocked", rendered)
+        self.assertLess(rendered.index("Redmine"), rendered.index("Playbook"))
+        self.assertLess(rendered.index("Playbook"), rendered.index("OpenSpec"))
+        self.assertLess(rendered.index("OpenSpec"), rendered.index("Todo"))
+
     def test_list_default_groups_daily_triage_with_reasons_and_stale_markers(self):
         today = datetime.now().strftime("%Y-%m-%d 09:00:00")
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d 09:00:00")
@@ -228,7 +328,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
             source="codex",
             source_ref="thread-closeout",
             priority="medium",
-            next_action="MR merged but closeout missing",
+            next_action="MR merged but closeout missing; register facts and finish local closeout before archiving",
             last_synced_at=today,
         )
         self.repository.save_work_item(closeout)
@@ -252,20 +352,26 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
 
         rendered = _render_table(self.cli._handle_slash_command("/list"))
 
-        self.assertIn("blocked", rendered)
-        self.assertIn("active needs action", rendered)
-        self.assertIn("waiting closeout", rendered)
-        self.assertIn("stale sync", rendered)
-        self.assertIn("recently completed", rendered)
-        self.assertIn("todo reminders", rendered)
-        self.assertIn("blocked by Redmine", rendered)
-        self.assertIn("needs validation", rendered)
-        self.assertIn("MR merged but closeout missing", rendered)
-        self.assertIn("Codex thread still active", rendered)
-        self.assertIn("[stale]", rendered)
-        self.assertLess(rendered.index("blocked by Redmine"), rendered.index("todo reminder"))
-        completed_line = next(line for line in rendered.splitlines() if "recently completed" in line)
-        self.assertNotIn("[stale]", completed_line)
+        self.assertIn("受阻", rendered)
+        self.assertIn("待处理", rendered)
+        self.assertIn("待闭环", rendered)
+        self.assertIn("需同步", rendered)
+        self.assertIn("提醒", rendered)
+        self.assertIn("Redmine 阻塞", rendered)
+        self.assertIn("待验证", rendered)
+        self.assertIn("MR 已合并待闭环", rendered)
+        self.assertIn("Codex 运行中", rendered)
+        self.assertIn("需同步", rendered)
+        self.assertIn("register facts", rendered)
+        self.assertIn("closeout before", rendered)
+        self.assertIn("archiving", rendered)
+        self.assertNotIn("recently completed closeout", rendered)
+        self.assertNotIn("最近已完成", rendered)
+        self.assertLess(rendered.index("Redmine 阻塞"), rendered.index("本地提醒"))
+
+        all_rendered = _render_table(self.cli._handle_slash_command("/list all"))
+        self.assertIn("recently completed closeout", all_rendered)
+        self.assertIn("完成", all_rendered)
 
     def test_list_default_source_todo_filter_suppresses_work_items(self):
         self.cli.manager.add("只看 Todo")
@@ -274,7 +380,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         rendered = _render_table(self.cli._handle_slash_command("/list --source todo"))
 
         self.assertIn("只看 Todo", rendered)
-        self.assertIn("todo reminders", rendered)
+        self.assertIn("提醒", rendered)
         self.assertNotIn("不应出现", rendered)
 
     def test_continue_start_and_review_use_work_items_and_evidence(self):
@@ -393,6 +499,47 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
             WorkItemStatus.DONE.value,
         )
 
+    def test_cli_sync_watch_reports_sync_result_and_next_action(self):
+        with open(os.path.join(self.report_dir, "2026-06-19.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-19T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-watch",
+                            "title": "Codex watch 任务",
+                            "next_action": "继续验证 watch 输出",
+                        }
+                    ],
+                    "blocked": [],
+                    "completed": [],
+                },
+                handle,
+            )
+
+        class FakeSyncService:
+            def __init__(self, repository):
+                self.repository = repository
+
+            def sync_project(self, project_path):
+                return [SourceSnapshot(source="git", project_path=project_path, summary="branch=main")]
+
+        options = {
+            "watch": True,
+            "once": False,
+            "interval_seconds": 1,
+            "path": "D:/repo",
+        }
+
+        with patch("ai_todo_assistant.presentation.cli.WorkflowSyncService", FakeSyncService):
+            response = self.cli._handle_sync_watch_command(options, max_runs=1, sleep=lambda seconds: None)
+
+        self.assertIn("Sync watch trigger #1", response)
+        self.assertIn("codex: 已导入/刷新 1 项", response)
+        self.assertIn("[OK] git: branch=main", response)
+        self.assertIn("Next recommended action", response)
+        self.assertIn("继续验证 watch 输出", response)
+
     def test_cli_sync_summarizes_codex_status_changes_and_list_completed_shows_done_work(self):
         self.repository.save_work_item(WorkItem(title="会完成", source="codex", source_ref="thread-complete"))
         blocked = WorkItem(title="会恢复", source="codex", source_ref="thread-reactivate")
@@ -445,7 +592,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertIn("reactivated=1", response)
         self.assertIn("unchanged=1", response)
         self.assertIn("会完成", rendered)
-        self.assertIn("codex", rendered)
+        self.assertIn("Codex", rendered)
 
     def test_cli_sync_uses_human_readable_codex_summary(self):
         self.repository.save_work_item(WorkItem(title="会完成", source="codex", source_ref="thread-complete"))
@@ -669,7 +816,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         rendered = _render_table(self.cli._handle_slash_command("/list completed --source codex"))
 
         self.assertIn("Codex 闭环任务", rendered)
-        self.assertIn("codex", rendered)
+        self.assertIn("Codex", rendered)
         self.assertNotIn("手动完成任务", rendered)
 
     def test_cli_work_split_recreates_source_ref_work_item(self):
