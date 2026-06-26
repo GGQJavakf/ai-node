@@ -155,6 +155,9 @@ Codex 模式不会读取或保存新的 Codex token，而是复用本机 `codex 
 | `todo_data_file` | `todos.json` | 旧版 JSON 数据文件路径 |
 | `workflow_data_file` | `data/workflow.json` | JSON 后端下的工作流数据文件路径 |
 | `codex_task_report_dir` | `data/codex-task-reports` | Codex 每日任务报告目录 |
+| `codex_resume_enabled` | `true` | `/r all` 是否通过本机 Codex CLI 推进会话 |
+| `codex_resume_timeout` | `240` | 单次 Codex resume 调用超时时间（秒） |
+| `codex_resume_exclusions_file` | `data/codex-resume-exclusions.json` | 不自动推进的 Codex 线程排除列表 |
 | `sync_watch_interval_seconds` | `1800` | `/sync watch` 未指定间隔时的本地前台触发间隔 |
 | `auto_migrate_json` | `true` | SQLite 空库首次启动时是否从 JSON 自动迁移 |
 
@@ -208,6 +211,7 @@ python -m ai_todo_assistant.presentation.gui
 | --- | --- |
 | `/help todo` | 查看 Todo 管理命令 |
 | `/help work` | 查看工作流、证据和兼容命令 |
+| `/help codex` | 查看 Codex 自动推进指南 |
 | `/help prefs` | 查看长期偏好命令 |
 | `/help system` | 查看历史、退出和颜色说明 |
 
@@ -244,7 +248,12 @@ python -m ai_todo_assistant.presentation.gui
 | `/work evidence add <work-id> <摘要>` | 为工作项追加证据 |
 | `/work evidence summary <work-id>` | 汇总工作项证据 |
 | `/codex tasks` | 读取 Codex 每日 JSON/Markdown 任务报告并同步未完成工作项 |
-| `/codex resume [--dry-run] [thread-id]` | 从最新 Codex report 推进可继续的暂停会话 |
+| `/r` | 用序号表预览可推进/跳过的 Codex 暂停会话 |
+| `/r <序号>` | 手动推进指定序号 |
+| `/r all` | 批量推进所有可继续会话 |
+| `/r skip <序号> [reason]` | 排除某个序号，后续批量/定时自动推进会持续跳过 |
+| `/r unskip <序号>` | 解除某个序号的自动推进排除 |
+| `/r skips` | 查看当前自动推进排除列表 |
 | `/sync watch [秒] [路径]` | 保持 CLI 运行并定时触发同步，每轮输出汇报；按 `Ctrl+C` 停止 |
 | `/sync watch --resume [秒] [路径]` | 保持 CLI 运行，定时同步后再推进可继续的 Codex 会话 |
 | `/continue` | 兼容命令，等同 `/next` |
@@ -279,9 +288,10 @@ data/todos.db
 - Codex 任务分析通过文件交接完成：Codex 自动化写入 `data/codex-task-reports/YYYY-MM-DD.json` 和同名 `.md`，`ai-node` 只读取这些稳定文件。
 - Evidence 是追加式记录，用于日报、closeout 草稿、MR/Redmine 草稿和个人复盘；默认不会把完整日志塞进摘要。
 - WorkItem 去重只基于稳定 identity 自动合并，例如 `redmine:<id>`、`openspec:<change>`、`gitlab-mr:<project>:<id>` 和 `codex-thread:<id>`；仅标题相似或跨项目 MR id 不会自动合并，会在同步摘要中计入 `skipped`。
-- `/codex resume --dry-run` 只预览最新 Codex report 中明确可继续的线程，不发送消息也不写 Evidence。
-- `/codex resume` 只会推进 `unfinished` 中有 `thread_id`、有 `resume_prompt` 或 `next_action`、且显式 `resume_eligible=true` 或状态为 `continueable/paused/ready/needs_action/needs_resume` 的线程；`blocked`、`completed`、缺少 thread id、缺少 prompt、或需要用户输入的线程会跳过。
-- 真正发送 Codex thread message 通过可注入 resume client 完成；未配置时命令会 fail-closed，报告 `resume client unavailable`，并把失败尝试写入本地 Evidence 方便后续追踪。
+- `/r` 用短表预览最新 Codex report 中的可推进/跳过线程，不发送消息也不写 Evidence；表里的 `#` 序号可直接用于 `/r <序号>`、`/r skip <序号>` 和 `/r unskip <序号>`。
+- `/r all` 只会推进 `unfinished` 中有 `thread_id`、有 `resume_prompt` 或 `next_action`、且显式 `resume_eligible=true` 或状态为 `continueable/paused/ready/needs_action/needs_resume` 的线程；兼容旧报告时，普通 `status=unfinished` 且有明确 `next_action`、没有人工确认/用户输入/权限审批等信号的条目会归一化为可推进。`blocked`、`completed`、缺少 thread id、缺少 prompt、或需要用户输入的线程会跳过。
+- 批量 `/r all` 和 `/sync watch --resume` 会自动跳过需要用户输入的线程；例如 5 个 Codex 线程中 3 个可继续、2 个需要输入时，只推进 3 个可继续项。可用 `/r skip <序号> [reason]` 持久排除某个线程的自动推进，直到 `/r unskip <序号>` 解除；显式 `/r <序号>` 属于手动动作，不受自动推进排除限制。
+- 真正发送 Codex thread message 默认通过本机非交互命令 `codex exec resume --json <thread-id> -` 完成，prompt 通过 stdin 传入，避免完整上下文出现在进程参数里；可用 `AI_CODEX_RESUME_ENABLED=false` 禁用，或用 `AI_CODEX_RESUME_TIMEOUT` 调整超时。命令失败、超时或 Codex CLI 不存在时会 fail-closed，并把首次失败尝试写入本地 Evidence；后续批量/定时自动推进遇到同一 prompt 会跳过，避免 watch 按间隔重复堆 Evidence，显式 `/r <序号>` 仍可手动重试。
 - 自动合并会保留 source refs、source identities、evidence 和 merge audit；误合并可通过 `/work rollback <work-id> <audit-id>` 按审计记录回滚，或通过 `/work split <work-id> <source> <source-ref> [title]` 本地拆分，不会写回外部系统。
 
 Codex 每日任务报告 schema 详见：

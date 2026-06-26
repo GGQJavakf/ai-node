@@ -62,7 +62,7 @@ class CodexTaskReportService:
         if not isinstance(payload, dict):
             raise ValueError("Codex task report must be a JSON object.")
 
-        unfinished = _as_list(payload.get("unfinished"))
+        unfinished = [_normalize_unfinished_entry(item) for item in _as_list(payload.get("unfinished"))]
         blocked = _as_list(payload.get("blocked"))
         completed = _as_list(payload.get("completed"))
         total = payload.get("total_unfinished", len(unfinished) + len(blocked))
@@ -91,6 +91,83 @@ def _as_list(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _normalize_unfinished_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(entry)
+    if _has_resume_marker(normalized):
+        return normalized
+    prompt = str(
+        normalized.get("resume_prompt")
+        or normalized.get("next_action")
+        or normalized.get("next")
+        or ""
+    ).strip()
+    if not prompt:
+        return normalized
+    statuses = [
+        str(normalized.get(field) or "").strip().lower()
+        for field in ("classification", "status", "state")
+    ]
+    statuses = [status for status in statuses if status]
+    if statuses != ["unfinished"]:
+        return normalized
+    if any(_needs_user_or_blocked_status(status) for status in statuses):
+        return normalized
+    if _looks_like_manual_action(prompt):
+        return normalized
+    normalized["resume_eligible"] = True
+    normalized["status"] = "continueable"
+    normalized.setdefault("resume_prompt", prompt)
+    return normalized
+
+
+def _has_resume_marker(entry: dict[str, Any]) -> bool:
+    marker = entry.get("resume_eligible")
+    if marker is True:
+        return True
+    if isinstance(marker, str) and marker.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    statuses = {
+        str(entry.get(field) or "").strip().lower()
+        for field in ("classification", "status", "state")
+    }
+    return bool(statuses & {"continueable", "continuable", "paused", "ready", "needs_action", "needs_resume"})
+
+
+def _needs_user_or_blocked_status(status: str) -> bool:
+    return status in {
+        "blocked",
+        "complete",
+        "completed",
+        "done",
+        "needs_user",
+        "needs_human",
+        "waiting_user",
+        "user_input_required",
+    }
+
+
+def _looks_like_manual_action(prompt: str) -> bool:
+    text = prompt.lower()
+    manual_markers = [
+        "人工确认",
+        "人工将",
+        "人工处理",
+        "等待人工",
+        "等待用户",
+        "需要用户",
+        "用户输入",
+        "人为确认",
+        "权限",
+        "审批",
+        "释放占用",
+        "manual",
+        "human",
+        "user input",
+        "waiting user",
+    ]
+    return any(marker in text for marker in manual_markers)
 
 
 def _mtime_iso(path: str) -> str:

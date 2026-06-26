@@ -1,8 +1,10 @@
+import io
 import os
 import tempfile
 import unittest
 
 import _path  # noqa: F401
+from rich.console import Console
 from ai_todo_assistant.infrastructure.persistence import SQLiteWorkflowRepository
 from ai_todo_assistant.infrastructure.persistence.json_todo_repository import TodoManager
 from ai_todo_assistant.presentation.cli import CommandCompleter, TodoCLI
@@ -56,11 +58,12 @@ class TestAssistantCommandSurface(unittest.TestCase):
             self.assertLess(help_text.index(line), category_index)
         for legacy_or_detail in ["[bold]", "[/bold]", "today|week", "/continue", "/review day"]:
             self.assertNotIn(legacy_or_detail, help_text[:category_index])
+        self.assertIn("/help codex", help_text)
 
     def test_help_groups_advanced_commands_and_keeps_compatibility_aliases(self):
         work_help = self.cli._handle_slash_command("/help work")
 
-        for text in ["/work status", "/work evidence add", "/codex tasks", "/sync watch", "/next", "/review"]:
+        for text in ["/work status", "/work evidence add", "/codex tasks", "/r", "/sync watch", "/next", "/review"]:
             self.assertIn(text, work_help)
         self.assertIn("/continue", work_help)
         self.assertIn("/review day", work_help)
@@ -68,6 +71,7 @@ class TestAssistantCommandSurface(unittest.TestCase):
 
     def test_categorized_help_topics_show_focused_commands(self):
         todo_help = self.cli._handle_slash_command("/help todo")
+        codex_help = self.cli._handle_slash_command("/help codex")
         prefs_help = self.cli._handle_slash_command("/help prefs")
         system_help = self.cli._handle_slash_command("/help system")
 
@@ -75,6 +79,12 @@ class TestAssistantCommandSurface(unittest.TestCase):
         self.assertIn("/list [all|today|week|month|pending|completed|overdue|upcoming|high|medium|low]", todo_help)
         self.assertIn("/update <ID> [title|end_time|priority] <值>", todo_help)
         self.assertNotIn("/work evidence", todo_help)
+        self.assertIn("/r", codex_help)
+        self.assertIn("/r <序号>", codex_help)
+        self.assertIn("/r skip <序号>", codex_help)
+        self.assertNotIn("/codex resume", codex_help)
+        self.assertIn("/sync watch --resume", codex_help)
+        self.assertIn("prompt_sha256", codex_help)
         self.assertIn("/preferences", prefs_help)
         self.assertIn("/remember <偏好名> <偏好内容>", prefs_help)
         self.assertIn("/history", system_help)
@@ -88,12 +98,18 @@ class TestAssistantCommandSurface(unittest.TestCase):
             "/list all",
             "/sync",
             "/sync watch",
+            "/r",
+            "/r all",
+            "/r skip",
+            "/r unskip",
+            "/resume",
             "/next",
             "/review",
             "/continue",
             "/review day",
             "/help todo",
             "/help work",
+            "/help codex",
             "/help prefs",
             "/help system",
         ]:
@@ -115,9 +131,19 @@ class TestAssistantCommandSurface(unittest.TestCase):
             self.assertGreater(startup_text.index(line), primary_index)
             self.assertLess(startup_text.index(line), category_index)
         self.assertIn("/help work", startup_text)
+        self.assertIn("/help codex", startup_text)
         self.assertNotIn("[bold]", startup_text)
         self.assertNotIn("/continue", startup_text[:category_index])
         self.assertNotIn("/review day", startup_text[:category_index])
+
+    def test_codex_resume_report_prints_as_plain_text(self):
+        output = io.StringIO()
+        self.cli.console = Console(file=output, force_terminal=False, width=120)
+
+        self.cli._display_response("Codex resume [DRY-RUN]\n  | 状态 | thread      |\n  | SKIP | thread-user |")
+
+        rendered = output.getvalue()
+        self.assertIn("Codex resume [DRY-RUN]\n  | 状态 | thread      |\n  | SKIP | thread-user |", rendered)
 
 
 if __name__ == "__main__":

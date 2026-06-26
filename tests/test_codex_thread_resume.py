@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import _path  # noqa: F401
 from ai_todo_assistant.application.workflow.codex_resume import (
+    CodexResumeExclusion,
+    CodexResumeExclusionService,
     CodexResumeService,
     CodexThreadResumeOutcome,
     format_codex_resume_result,
@@ -32,6 +34,31 @@ class RaisingResumeClient:
     def resume_thread(self, thread_id, prompt):
         self.calls.append((thread_id, prompt))
         raise RuntimeError(self.message)
+
+
+class FakeExclusionStore:
+    def __init__(self, exclusions=None, error=None):
+        self.exclusions = list(exclusions or [])
+        self.error = error
+        self.excluded = []
+        self.included = []
+
+    def list_exclusions(self):
+        if self.error:
+            raise RuntimeError(self.error)
+        return self.exclusions
+
+    def exclude(self, thread_id, reason=""):
+        exclusion = CodexResumeExclusion(thread_id=thread_id, reason=reason)
+        self.exclusions.append(exclusion)
+        self.excluded.append((thread_id, reason))
+        return exclusion
+
+    def include(self, thread_id):
+        self.included.append(thread_id)
+        before = len(self.exclusions)
+        self.exclusions = [exclusion for exclusion in self.exclusions if exclusion.thread_id != thread_id]
+        return len(self.exclusions) != before
 
 
 class TestCodexThreadResume(unittest.TestCase):
@@ -138,6 +165,136 @@ class TestCodexThreadResume(unittest.TestCase):
         self.assertEqual(client.calls, [("thread-2", "继续 2")])
         self.assertEqual([candidate.thread_id for candidate in result.candidates], ["thread-2"])
 
+    def test_bulk_resume_attempts_three_continueable_and_skips_two_needing_user(self):
+        client = FakeResumeClient()
+        report = _report(
+            unfinished=[
+                {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                {"thread_id": "thread-2", "status": "paused", "next_action": "继续 2"},
+                {"thread_id": "thread-3", "resume_eligible": True, "resume_prompt": "继续 3"},
+                {"thread_id": "thread-user-1", "status": "needs_user", "next_action": "等待输入 1"},
+                {"thread_id": "thread-user-2", "classification": "user_input_required", "next_action": "等待输入 2"},
+            ]
+        )
+
+        result = CodexResumeService(self.repository, client).resume(report)
+
+        self.assertEqual(
+            client.calls,
+            [("thread-1", "继续 1"), ("thread-2", "继续 2"), ("thread-3", "继续 3")],
+        )
+        self.assertEqual([attempt.thread_id for attempt in result.attempts], ["thread-1", "thread-2", "thread-3"])
+        self.assertEqual([skip.thread_id for skip in result.skipped], ["thread-user-1", "thread-user-2"])
+        self.assertTrue(all(skip.reason == "需要用户输入" for skip in result.skipped))
+
+    def test_manual_action_prompt_is_skipped_even_when_marked_continueable(self):
+        client = FakeResumeClient()
+        report = _report(
+            unfinished=[
+                {
+                    "thread_id": "thread-human",
+                    "status": "continueable",
+                    "next_action": "等待用户确认后继续",
+                },
+                {
+                    "thread_id": "thread-explicit-human",
+                    "resume_eligible": True,
+                    "resume_prompt": "需要权限审批后继续",
+                },
+            ]
+        )
+
+        result = CodexResumeService(self.repository, client).resume(report)
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(result.attempts, [])
+        self.assertEqual([skip.thread_id for skip in result.skipped], ["thread-human", "thread-explicit-human"])
+        self.assertTrue(all(skip.reason == "需要用户输入" for skip in result.skipped))
+
+    def test_manual_exclusion_skips_bulk_resume_until_included(self):
+        client = FakeResumeClient()
+        report = _report(
+            unfinished=[
+                {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                {"thread_id": "thread-2", "status": "continueable", "next_action": "继续 2"},
+                {"thread_id": "thread-3", "status": "continueable", "next_action": "继续 3"},
+            ]
+        )
+        exclusions = FakeExclusionStore([CodexResumeExclusion(thread_id="thread-2", reason="等待人工确认")])
+
+        result = CodexResumeService(self.repository, client, exclusion_store=exclusions).resume(report)
+
+        self.assertEqual(client.calls, [("thread-1", "继续 1"), ("thread-3", "继续 3")])
+        self.assertEqual([attempt.thread_id for attempt in result.attempts], ["thread-1", "thread-3"])
+        self.assertEqual(len(result.skipped), 1)
+        self.assertEqual(result.skipped[0].thread_id, "thread-2")
+        self.assertIn("manual exclusion", result.skipped[0].reason)
+
+    def test_unreadable_manual_exclusions_fail_closed(self):
+        client = FakeResumeClient()
+        report = _report(
+            unfinished=[{"thread_id": "thread-1", "status": "continueable", "next_action": "继续"}]
+        )
+
+        result = CodexResumeService(
+            self.repository,
+            client,
+            exclusion_store=FakeExclusionStore(error="invalid json"),
+        ).resume(report)
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(result.attempts, [])
+        self.assertIn("manual exclusion policy unavailable", result.skipped[0].reason)
+
+    def test_targeted_resume_bypasses_manual_exclusion_by_default(self):
+        client = FakeResumeClient()
+        report = _report(
+            unfinished=[
+                {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                {"thread_id": "thread-2", "status": "continueable", "next_action": "继续 2"},
+            ]
+        )
+        exclusions = FakeExclusionStore([CodexResumeExclusion(thread_id="thread-1", reason="自动推进排除")])
+
+        result = CodexResumeService(self.repository, client, exclusion_store=exclusions).resume(
+            report,
+            dry_run=True,
+            thread_id="thread-1",
+        )
+
+        self.assertEqual([candidate.thread_id for candidate in result.candidates], ["thread-1"])
+        self.assertEqual(result.skipped, [])
+
+    def test_targeted_resume_bypasses_unreadable_exclusion_store_by_default(self):
+        client = FakeResumeClient()
+        report = _report(
+            unfinished=[{"thread_id": "thread-1", "status": "continueable", "next_action": "继续"}]
+        )
+
+        result = CodexResumeService(
+            self.repository,
+            client,
+            exclusion_store=FakeExclusionStore(error="invalid json"),
+        ).resume(report, dry_run=True, thread_id="thread-1")
+
+        self.assertEqual([candidate.thread_id for candidate in result.candidates], ["thread-1"])
+        self.assertEqual(result.skipped, [])
+
+    def test_exclusion_service_routes_management_through_application_layer(self):
+        store = FakeExclusionStore()
+        service = CodexResumeExclusionService(store)
+
+        excluded = service.exclude("thread-1", "等待人工确认")
+        listed = service.list_exclusions()
+        included = service.include("thread-1")
+
+        self.assertEqual(excluded.thread_id, "thread-1")
+        self.assertEqual(excluded.reason, "等待人工确认")
+        self.assertEqual([item.thread_id for item in listed], ["thread-1"])
+        self.assertTrue(included)
+        self.assertEqual(store.excluded, [("thread-1", "等待人工确认")])
+        self.assertEqual(store.included, ["thread-1"])
+
     def test_formatter_reports_candidates_attempts_and_skips(self):
         client = FakeResumeClient()
         report = _report(
@@ -152,8 +309,17 @@ class TestCodexThreadResume(unittest.TestCase):
 
         self.assertIn("Codex resume [DRY-RUN]", format_codex_resume_result(dry_run))
         self.assertIn("thread-ready", format_codex_resume_result(dry_run))
-        self.assertIn("跳过", format_codex_resume_result(dry_run))
-        self.assertIn("[OK]", format_codex_resume_result(executed))
+        dry_run_text = format_codex_resume_result(dry_run)
+        self.assertIn("跳过", dry_run_text)
+        self.assertIn("| 状态", dry_run_text)
+        self.assertIn("| READY", dry_run_text)
+        self.assertIn("| SKIP", dry_run_text)
+        self.assertIn("需要用户输入", dry_run_text)
+        self.assertIn("| 1", dry_run_text)
+        self.assertNotIn("prompt:", dry_run_text)
+        executed_text = format_codex_resume_result(executed)
+        self.assertIn("| OK", executed_text)
+        self.assertNotIn("| READY", executed_text)
 
     def test_selection_handles_edge_inputs_and_missing_target(self):
         client = FakeResumeClient()
@@ -246,6 +412,95 @@ class TestCodexThreadResume(unittest.TestCase):
         self.assertIn("bridge timeout", result.attempts[0].message)
         self.assertFalse(evidence[0].success)
         self.assertIn("bridge timeout", evidence[0].output_excerpt)
+
+    def test_bulk_resume_skips_candidate_already_successfully_resumed_for_same_prompt(self):
+        client = FakeResumeClient(success=True, message="queued")
+        report = _report(
+            unfinished=[
+                {"thread_id": "thread-repeat", "status": "continueable", "next_action": "继续同一个 prompt"},
+            ]
+        )
+        service = CodexResumeService(self.repository, client)
+
+        first = service.resume(report)
+        second = service.resume(report)
+
+        self.assertEqual(client.calls, [("thread-repeat", "继续同一个 prompt")])
+        self.assertEqual([attempt.thread_id for attempt in first.attempts], ["thread-repeat"])
+        self.assertEqual(second.attempts, [])
+        self.assertEqual(second.skipped[0].thread_id, "thread-repeat")
+        self.assertEqual(second.skipped[0].reason, "already resumed successfully for same prompt")
+
+    def test_bulk_resume_skips_candidate_already_failed_for_same_prompt(self):
+        client = FakeResumeClient(success=False, message="codex resume disabled")
+        report = _report(
+            unfinished=[
+                {"thread_id": "thread-repeat-fail", "status": "continueable", "next_action": "继续同一个 prompt"},
+            ]
+        )
+        service = CodexResumeService(self.repository, client)
+
+        first = service.resume(report)
+        second = service.resume(report)
+        item = self.repository.find_work_item_by_source("codex", "thread-repeat-fail")
+        evidence = self.repository.list_evidence(item.id)
+
+        self.assertEqual(client.calls, [("thread-repeat-fail", "继续同一个 prompt")])
+        self.assertEqual([attempt.thread_id for attempt in first.attempts], ["thread-repeat-fail"])
+        self.assertEqual(second.attempts, [])
+        self.assertEqual(second.skipped[0].thread_id, "thread-repeat-fail")
+        self.assertEqual(second.skipped[0].reason, "already failed for same prompt")
+        self.assertEqual(len(evidence), 1)
+
+    def test_bulk_resume_does_not_skip_different_long_prompt_with_same_excerpt_prefix(self):
+        client = FakeResumeClient(success=True, message="queued")
+        prefix = "继续" * 300
+        first_report = _report(
+            unfinished=[
+                {"thread_id": "thread-repeat", "status": "continueable", "next_action": f"{prefix}A"},
+            ]
+        )
+        second_report = _report(
+            unfinished=[
+                {"thread_id": "thread-repeat", "status": "continueable", "next_action": f"{prefix}B"},
+            ]
+        )
+        service = CodexResumeService(self.repository, client)
+
+        service.resume(first_report)
+        second = service.resume(second_report)
+
+        self.assertEqual(
+            client.calls,
+            [
+                ("thread-repeat", f"{prefix}A"),
+                ("thread-repeat", f"{prefix}B"),
+            ],
+        )
+        self.assertEqual([attempt.thread_id for attempt in second.attempts], ["thread-repeat"])
+        self.assertEqual(second.skipped, [])
+
+    def test_targeted_resume_does_not_skip_previous_successful_prompt(self):
+        client = FakeResumeClient(success=True, message="queued")
+        report = _report(
+            unfinished=[
+                {"thread_id": "thread-repeat", "status": "continueable", "next_action": "继续同一个 prompt"},
+            ]
+        )
+        service = CodexResumeService(self.repository, client)
+
+        service.resume(report)
+        targeted = service.resume(report, thread_id="thread-repeat")
+
+        self.assertEqual(
+            client.calls,
+            [
+                ("thread-repeat", "继续同一个 prompt"),
+                ("thread-repeat", "继续同一个 prompt"),
+            ],
+        )
+        self.assertEqual([attempt.thread_id for attempt in targeted.attempts], ["thread-repeat"])
+        self.assertEqual(targeted.skipped, [])
 
 
 def _report(unfinished=None, blocked=None, completed=None):

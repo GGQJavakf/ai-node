@@ -7,7 +7,8 @@
 ## What Changes
 
 - Add a Codex thread resume workflow that reads the latest Codex task report and selects only entries marked as safe to continue.
-- Add `/codex resume` with `--dry-run`, optional thread id targeting, and clear unavailable-client reporting.
+- Add short `/r` and `/resume` commands for listing, indexed targeting, bulk resume, and manual skip/unskip.
+- Add persistent manual exclusions so selected Codex threads are skipped by bulk and watch auto-resume until explicitly included again.
 - Record every attempted resume as local Evidence against the matching Codex WorkItem.
 - Allow `/sync watch --resume` to run the existing sync trigger and then resume safe candidates each cycle.
 - Keep the actual Codex thread sender behind an injectable client so local tests and future Codex app bridges can use the same service without coupling to Codex internal storage.
@@ -22,6 +23,6 @@
 
 ## Impact
 
-- Users can preview and trigger continuation for safe Codex paused threads from `ai-node`.
+- Users can preview and trigger continuation for safe Codex paused threads from `ai-node` with short indexed commands.
 - Existing `/sync`, `/sync watch`, `/codex tasks`, `/list`, `/next`, and `/review` behavior remains compatible.
 - Deployments without a configured Codex thread client fail closed with a local report instead of attempting unsafe work.

@@ -12,6 +12,9 @@
   "sqlite_path": "data/todos.db",
   "workflow_data_file": "data/workflow.json",
   "codex_task_report_dir": "data/codex-task-reports",
+  "codex_resume_enabled": true,
+  "codex_resume_timeout": 240,
+  "codex_resume_exclusions_file": "data/codex-resume-exclusions.json",
   "sync_watch_interval_seconds": 1800,
   "auto_migrate_json": true,
   "log_level": "ERROR"

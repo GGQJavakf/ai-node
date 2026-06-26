@@ -13,7 +13,7 @@ This change adds explicit Codex thread resume support on top of the existing rep
 ### In Scope
 
 - Select resume candidates from the latest Codex task report.
-- Add `/codex resume` with dry-run, targeted thread id, and unavailable-client reporting.
+- Add `/r`/`/resume` with preview, indexed targeting, bulk resume, and unavailable-client reporting.
 - Record non-dry-run resume attempts as local Evidence on Codex WorkItems.
 - Allow `/sync watch --resume` to run sync and then resume only safe candidates.
 
@@ -26,9 +26,9 @@ This change adds explicit Codex thread resume support on top of the existing rep
 
 ## 4. Implementation Scope
 
-- 涉及模块：`src/ai_todo_assistant/application/workflow/` for a resume service and client protocol; `src/ai_todo_assistant/presentation/cli.py` for `/codex resume` and `/sync watch --resume`; `src/ai_todo_assistant/application/workflow/sync_watch.py` if the trigger report needs an optional resume section; README/help/completion text.
+- 涉及模块：`src/ai_todo_assistant/application/workflow/` for a resume service and client protocol; `src/ai_todo_assistant/presentation/cli.py` for `/r`/`/resume` and `/sync watch --resume`; `src/ai_todo_assistant/application/workflow/sync_watch.py` if the trigger report needs an optional resume section; README/help/completion text.
 - 数据模型：不需要迁移；复用 existing `WorkItem` and `Evidence` storage, creating a Codex WorkItem only when an attempted resume needs a local evidence target.
-- 接口 / 响应：new `/codex resume [--dry-run] [thread-id]`; extended `/sync watch --resume`; existing `/sync`, `/sync watch`, `/codex tasks`, `/list`, `/next`, and `/review` remain compatible.
+- 接口 / 响应：new `/r`, `/r <序号>`, `/r all`, `/r skip`, `/r unskip`; extended `/sync watch --resume`; existing `/sync`, `/sync watch`, `/codex tasks`, `/list`, `/next`, and `/review` remain compatible.
 - 认证 / 鉴权 / JWT / filter / audit：N/A for web auth; local audit is Evidence recording. Actual message sending must stay behind an injected/configured Codex resume client.
 - 迁移 / 兼容 / 回滚：additive local service and CLI paths only; rollback is removing the new command path and service. Existing WorkItems/Evidence remain readable.
 

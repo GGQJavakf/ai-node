@@ -5,10 +5,11 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import _path  # noqa: F401
 from ai_todo_assistant.application.workflow import (
+    CodexThreadResumeOutcome,
     ContinueService,
     DailyReviewService,
     EvidenceService,
@@ -19,6 +20,17 @@ from ai_todo_assistant.infrastructure.persistence.json_todo_repository import To
 from ai_todo_assistant.infrastructure.persistence import SQLiteWorkflowRepository
 from ai_todo_assistant.presentation.cli import TodoCLI
 from rich.console import Console
+
+
+class FakeCodexResumeClient:
+    def __init__(self, success=True, message="queued"):
+        self.success = success
+        self.message = message
+        self.calls = []
+
+    def resume_thread(self, thread_id, prompt):
+        self.calls.append((thread_id, prompt))
+        return CodexThreadResumeOutcome(success=self.success, message=self.message)
 
 
 class TestWorkflowServicesAndCli(unittest.TestCase):
@@ -33,8 +45,10 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.cli.config = {
             "project_root": self.temp_dir.name,
             "codex_task_report_dir": self.report_dir,
+            "codex_resume_exclusions_file": os.path.join(self.temp_dir.name, "resume-exclusions.json"),
             "storage_backend": "sqlite",
             "sqlite_path": self.workflow_path,
+            "codex_resume_enabled": False,
         }
         self.cli.manager = TodoManager(os.path.join(self.temp_dir.name, "todos.json"))
         self.cli.console = Console(file=io.StringIO(), force_terminal=False)
@@ -107,7 +121,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertEqual(items[0].status, WorkItemStatus.DONE.value)
         self.assertIn("MR !14 merged", self.repository.list_evidence(items[0].id)[0].summary)
 
-    def test_codex_resume_dry_run_lists_candidate_without_writing(self):
+    def test_resume_shortcut_lists_candidate_without_writing(self):
         with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
             json.dump(
                 {
@@ -124,13 +138,14 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
                 handle,
             )
 
-        response = self.cli._handle_slash_command("/codex resume --dry-run")
+        response = self.cli._handle_slash_command("/r")
 
         self.assertIn("Codex resume [DRY-RUN]", response)
-        self.assertIn("thread-ready", response)
+        self.assertIn("| 1", response)
+        self.assertIn("| READY", response)
         self.assertEqual(self.repository.list_work_items(include_closed=True), [])
 
-    def test_codex_resume_reports_unavailable_default_client_and_records_evidence(self):
+    def test_resume_shortcut_all_reports_disabled_default_client_and_records_evidence(self):
         with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
             json.dump(
                 {
@@ -147,15 +162,44 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
                 handle,
             )
 
-        response = self.cli._handle_slash_command("/codex resume")
+        response = self.cli._handle_slash_command("/r all")
         item = self.repository.find_work_item_by_source("codex", "thread-ready")
 
-        self.assertIn("[FAIL]", response)
-        self.assertIn("resume client unavailable", response)
+        self.assertIn("| FAIL", response)
+        self.assertIn("codex resume disabled", response)
         self.assertIsNotNone(item)
         self.assertEqual(len(self.repository.list_evidence(item.id)), 1)
 
-    def test_codex_resume_target_evaluates_only_requested_thread(self):
+    @patch("ai_todo_assistant.infrastructure.connectors.codex_resume_client.subprocess.run")
+    @patch("ai_todo_assistant.infrastructure.connectors.codex_resume_client.shutil.which", return_value="codex")
+    def test_resume_shortcut_all_default_client_calls_codex_cli_when_enabled(self, _which, run):
+        self.cli.config["codex_resume_enabled"] = True
+        run.return_value = Mock(returncode=0, stdout="queued", stderr="")
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-ready",
+                            "title": "继续自动推进",
+                            "status": "continueable",
+                            "next_action": "继续执行到测试通过",
+                        }
+                    ],
+                },
+                handle,
+            )
+
+        response = self.cli._handle_slash_command("/r all")
+
+        self.assertIn("| OK", response)
+        self.assertIn("queued", response)
+        args = run.call_args.args[0]
+        self.assertEqual(args, ["codex", "exec", "resume", "--json", "thread-ready", "-"])
+        self.assertEqual(run.call_args.kwargs["input"], "继续执行到测试通过")
+
+    def test_resume_shortcut_target_evaluates_only_requested_index(self):
         with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
             json.dump(
                 {
@@ -168,15 +212,149 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
                 handle,
             )
 
-        response = self.cli._handle_slash_command("/codex resume --dry-run thread-2")
+        response = self.cli._handle_slash_command("/r 2")
 
         self.assertIn("thread-2", response)
         self.assertNotIn("thread-1", response)
 
-    def test_codex_resume_rejects_invalid_arguments(self):
-        response = self.cli._handle_slash_command("/codex resume --unknown thread-1 extra")
+    def test_resume_shortcut_rejects_invalid_arguments(self):
+        response = self.cli._handle_slash_command("/r 1 extra")
 
-        self.assertIn("用法: /codex resume", response)
+        self.assertIn("用法: /r", response)
+
+    def test_resume_shortcut_reports_missing_report_without_side_effects(self):
+        response = self.cli._handle_slash_command("/r")
+
+        self.assertIn("暂无快照文件", response)
+        self.assertEqual(self.repository.list_work_items(include_closed=True), [])
+
+    def test_resume_shortcut_reports_index_out_of_range(self):
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                    ],
+                },
+                handle,
+            )
+
+        too_large = self.cli._handle_slash_command("/r 999")
+        zero = self.cli._handle_slash_command("/r 0")
+
+        self.assertIn("序号超出范围: 999", too_large)
+        self.assertIn("序号超出范围: 0", zero)
+
+    def test_resume_shortcut_exclusion_commands_persist_and_skip_bulk_resume(self):
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                        {"thread_id": "thread-2", "status": "continueable", "next_action": "继续 2"},
+                    ],
+                },
+                handle,
+            )
+
+        excluded = self.cli._handle_slash_command("/r skip 1 等待用户确认")
+        listed = self.cli._handle_slash_command("/r skips")
+        preview = self.cli._handle_slash_command("/r")
+        included = self.cli._handle_slash_command("/r unskip 2")
+        preview_after_include = self.cli._handle_slash_command("/r")
+
+        self.assertIn("已排除自动推进: thread-1", excluded)
+        self.assertIn("等待用户确认", listed)
+        self.assertIn("| SKIP", preview)
+        self.assertIn("thread-1", preview)
+        self.assertIn("manual exclusion", preview)
+        self.assertIn("| READY", preview)
+        self.assertIn("thread-2", preview)
+        self.assertIn("已解除自动推进排除: thread-1", included)
+        self.assertIn("| READY", preview_after_include)
+        self.assertIn("thread-1", preview_after_include)
+
+    def test_resume_shortcut_targeted_index_bypasses_auto_exclusion(self):
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                        {"thread_id": "thread-2", "status": "continueable", "next_action": "继续 2"},
+                    ],
+                },
+                handle,
+            )
+
+        self.cli._handle_slash_command("/r skip 1 只排除自动推进")
+        preview = self.cli._handle_slash_command("/r 2")
+
+        self.assertIn("| FAIL", preview)
+        self.assertIn("thread-1", preview)
+        self.assertNotIn("manual exclusion", preview)
+
+    def test_resume_shortcut_lists_excludes_and_targets_by_index(self):
+        self.cli.codex_resume_client = FakeCodexResumeClient(success=True, message="queued")
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                        {"thread_id": "thread-2", "status": "continueable", "next_action": "继续 2"},
+                    ],
+                },
+                handle,
+            )
+
+        preview = self.cli._handle_slash_command("/r")
+        excluded = self.cli._handle_slash_command("/r skip 2 等待确认")
+        after_exclude = self.cli._handle_slash_command("/resume")
+        targeted = self.cli._handle_slash_command("/r 1")
+
+        self.assertIn("| 1", preview)
+        self.assertIn("| 2", preview)
+        self.assertIn("已排除自动推进: thread-2", excluded)
+        self.assertIn("| SKIP", after_exclude)
+        self.assertIn("thread-2", after_exclude)
+        self.assertIn("| OK", targeted)
+        self.assertEqual(self.cli.codex_resume_client.calls[-1], ("thread-1", "继续 1"))
+
+    def test_resume_shortcut_all_runs_bulk_resume(self):
+        self.cli.codex_resume_client = FakeCodexResumeClient(success=True, message="queued")
+        with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-23T08:30:00+08:00",
+                    "unfinished": [
+                        {"thread_id": "thread-1", "status": "continueable", "next_action": "继续 1"},
+                    ],
+                },
+                handle,
+            )
+
+        response = self.cli._handle_slash_command("/r all")
+
+        self.assertIn("| OK", response)
+        self.assertEqual(self.cli.codex_resume_client.calls, [("thread-1", "继续 1")])
+
+    def test_resume_shortcut_exclusion_commands_report_unreadable_file(self):
+        exclusions_path = self.cli.config["codex_resume_exclusions_file"]
+        with open(exclusions_path, "w", encoding="utf-8") as handle:
+            handle.write("{not valid json")
+
+        response = self.cli._handle_slash_command("/r skips")
+
+        self.assertIn("Codex 自动推进排除列表不可用", response)
+        self.assertIn("自动推进会 fail-closed", response)
+
+    def test_codex_resume_legacy_entrypoint_is_not_supported(self):
+        response = self.cli._handle_slash_command("/codex resume")
+
+        self.assertIn("用法: /codex tasks", response)
 
     def test_codex_completion_sync_is_idempotent_and_appends_new_signals(self):
         service = WorkItemService(self.repository)

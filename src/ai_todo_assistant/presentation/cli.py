@@ -40,10 +40,16 @@ from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt
 
-from ai_todo_assistant.infrastructure.persistence import build_todo_repository, build_workflow_repository
+from ai_todo_assistant.infrastructure.connectors import CodexCliResumeClient
+from ai_todo_assistant.infrastructure.persistence import (
+    JsonCodexResumeExclusionStore,
+    build_todo_repository,
+    build_workflow_repository,
+)
 from ai_todo_assistant.application.agent import AgentCore
 from ai_todo_assistant.application.workflow import (
     CodexTaskReportService,
+    CodexResumeExclusionService,
     CodexResumeService,
     ContinueService,
     DailyReviewService,
@@ -51,6 +57,7 @@ from ai_todo_assistant.application.workflow import (
     SyncWatchRunner,
     WorkItemService,
     WorkflowSyncService,
+    codex_resume_display_rows,
     format_codex_resume_result,
     format_sync_watch_report,
 )
@@ -122,16 +129,21 @@ class CommandCompleter(Completer):
             '/sync status': '查看同步健康状态',
             '/sync watch': '本地前台定时触发同步并汇报每轮结果',
             '/sync watch --resume': '本地前台定时同步后推进可继续 Codex 会话',
+            '/r': '查看 Codex 可推进任务序号表',
+            '/r all': '批量推进可继续 Codex 会话',
+            '/r skip': '按序号排除 Codex 自动推进',
+            '/r unskip': '按序号解除 Codex 自动推进排除',
+            '/resume': '查看 Codex 可推进任务序号表',
             '/next': '推荐下一步工作',
             '/review': '生成工作日复盘草稿',
             '/continue': '兼容命令：推荐下一步工作',
             '/start day': '生成工作日启动计划',
             '/review day': '兼容命令：生成工作日复盘草稿',
             '/codex tasks': '查看 Codex 未完成任务日报',
-            '/codex resume': '推进可继续的 Codex 暂停会话',
             '/help': '显示帮助信息',
             '/help todo': '查看 Todo 管理命令',
             '/help work': '查看工作流和证据命令',
+            '/help codex': '查看 Codex 自动推进指南',
             '/help prefs': '查看长期偏好命令',
             '/help system': '查看历史、退出和颜色说明',
             '/exit': '退出应用',
@@ -299,6 +311,8 @@ class TodoCLI:
             return self._handle_forget_command(subcmd)
         elif cmd == "/codex":
             return self._handle_codex_command(subcmd, args)
+        elif cmd in {"/r", "/resume"}:
+            return self._handle_resume_shortcut(subcmd, args)
         elif cmd == "/work":
             return self._handle_work_command(subcmd, args)
         elif cmd == "/sync":
@@ -717,10 +731,8 @@ class TodoCLI:
         return f"未找到偏好：{key}"
 
     def _handle_codex_command(self, subcmd, args=""):
-        if subcmd == "resume":
-            return self._handle_codex_resume_command(args)
         if subcmd not in {"tasks", "unfinished"}:
-            return "用法: /codex [tasks|resume]"
+            return "用法: /codex tasks"
 
         report, imported, report_dir = self._import_latest_codex_report()
         if not report:
@@ -771,13 +783,37 @@ class TodoCLI:
     def _handle_codex_resume_command(self, args=""):
         options = _parse_codex_resume_options(args)
         if options["invalid"]:
-            return "用法: /codex resume [--dry-run] [thread-id]"
+            return _codex_resume_usage()
+        store = self._codex_resume_exclusion_store()
+        exclusion_service = CodexResumeExclusionService(store)
         report, report_dir = self._latest_codex_report()
+        if options["action"] in {"exclude", "include", "resume"} and _is_index_text(options["thread_id"]):
+            if not report:
+                return f"Codex resume\n\n  暂无快照文件: {report_dir}"
+            resolved, error = self._resolve_codex_resume_index(report, store, options["thread_id"])
+            if error:
+                return error
+            options["thread_id"] = resolved
+        try:
+            if options["action"] == "exclude":
+                exclusion = exclusion_service.exclude(options["thread_id"], options["reason"])
+                suffix = f"：{exclusion.reason}" if exclusion.reason else ""
+                return f"已排除自动推进: {exclusion.thread_id}{suffix}"
+            if options["action"] == "include":
+                removed = exclusion_service.include(options["thread_id"])
+                if removed:
+                    return f"已解除自动推进排除: {options['thread_id']}"
+                return f"未找到自动推进排除: {options['thread_id']}"
+            if options["action"] == "list":
+                return _format_codex_resume_exclusions(exclusion_service.list_exclusions())
+        except (OSError, ValueError) as exc:
+            return _format_codex_resume_exclusion_error(exc)
         if not report:
             return f"Codex resume\n\n  暂无快照文件: {report_dir}"
         service = CodexResumeService(
             self._workflow_repo(),
-            client=getattr(self, "codex_resume_client", None),
+            client=getattr(self, "codex_resume_client", None) or CodexCliResumeClient(self.config),
+            exclusion_store=store,
         )
         result = service.resume(
             report,
@@ -785,6 +821,44 @@ class TodoCLI:
             thread_id=options["thread_id"],
         )
         return format_codex_resume_result(result)
+
+    def _handle_resume_shortcut(self, subcmd="", args=""):
+        raw = " ".join(part for part in [subcmd, args] if part).strip()
+        if not raw or raw in {"ls", "list"}:
+            return self._handle_codex_resume_command("ls")
+        tokens = raw.split()
+        action = tokens[0]
+        tail = " ".join(tokens[1:]).strip()
+        if action == "all":
+            return self._handle_codex_resume_command("")
+        if action == "skip":
+            if not tail:
+                return _resume_shortcut_usage()
+            return self._handle_codex_resume_command(f"exclude {tail}")
+        if action == "unskip":
+            if not tail:
+                return _resume_shortcut_usage()
+            return self._handle_codex_resume_command(f"include {tail}")
+        if action == "skips":
+            return self._handle_codex_resume_command("exclusions")
+        if len(tokens) == 1:
+            return self._handle_codex_resume_command(action)
+        return _resume_shortcut_usage()
+
+    def _resolve_codex_resume_index(self, report, store, index_text: str) -> tuple[str, str]:
+        index = int(index_text)
+        result = CodexResumeService(
+            self._workflow_repo(),
+            client=getattr(self, "codex_resume_client", None) or CodexCliResumeClient(self.config),
+            exclusion_store=store,
+        ).resume(report, dry_run=True)
+        rows = codex_resume_display_rows(result)
+        if index < 1 or index > len(rows):
+            return "", f"Codex resume\n\n  序号超出范围: {index_text}，当前可选范围 1-{len(rows)}"
+        row = rows[index - 1]
+        if not row.thread_id:
+            return "", f"Codex resume\n\n  序号 {index_text} 没有关联 thread id，不能执行该操作"
+        return row.thread_id, ""
 
     def _import_latest_codex_report(self):
         report, report_dir = self._latest_codex_report()
@@ -810,6 +884,18 @@ class TodoCLI:
             repo = build_workflow_repository(getattr(self, "config", None) or self._load_config())
             self.workflow_repository = repo
         return repo
+
+    def _codex_resume_exclusion_store(self):
+        store = getattr(self, "codex_resume_exclusion_store", None)
+        if store is not None:
+            return store
+        config = getattr(self, "config", None) or self._load_config()
+        path = config.get("codex_resume_exclusions_file", "data/codex-resume-exclusions.json")
+        if not os.path.isabs(path):
+            path = os.path.join(config.get("project_root", os.getcwd()), path)
+        store = JsonCodexResumeExclusionStore(path)
+        self.codex_resume_exclusion_store = store
+        return store
 
     def _handle_work_command(self, subcmd, args):
         repo = self._workflow_repo()
@@ -1070,6 +1156,7 @@ class TodoCLI:
                 "分类帮助:",
                 "  /help todo    Todo 管理命令",
                 "  /help work    工作流、证据和兼容命令",
+                "  /help codex   Codex 自动推进指南",
                 "  /help prefs   长期偏好命令",
                 "  /help system  历史、退出和颜色说明",
                 "─" * 80,
@@ -1110,7 +1197,11 @@ class TodoCLI:
                 "  /work evidence summary <work-id>",
                 "  /work evidence timeline <work-id>",
                 "  /codex tasks",
-                "  /codex resume [--dry-run] [thread-id]",
+                "  /r",
+                "  /r <序号>",
+                "  /r all",
+                "  /r skip <序号> [reason]",
+                "  /r unskip <序号>",
                 "  /next",
                 "  /review",
                 "",
@@ -1118,6 +1209,32 @@ class TodoCLI:
                 "  /continue    等同 /next",
                 "  /review day  等同 /review",
                 "  /start day",
+            ])
+        if topic == "codex":
+            return "\n".join([
+                "📖 Codex 自动推进",
+                "─" * 80,
+                "  /codex tasks",
+                "      读取最新 Codex 任务报告并同步 WorkItem",
+                "  /r",
+                "      查看可推进/跳过任务序号表；不发送消息，不写 Evidence",
+                "  /r <序号>",
+                "      手动推进指定序号；不受自动排除限制",
+                "  /r all",
+                "      批量推进全部可继续线程，跳过 blocked/completed/needs_user",
+                "  /r skip <序号> [reason]",
+                "      排除指定序号，后续批量和定时自动推进会持续跳过",
+                "  /r unskip <序号>",
+                "      解除指定序号的排除",
+                "  /r skips",
+                "      查看排除列表",
+                "  /sync watch --resume [interval-seconds] [path]",
+                "      前台定时同步后自动推进可继续线程",
+                "",
+                "安全边界:",
+                "  - 只推进明确 resumeable 的 unfinished 线程",
+                "  - 需要用户输入、阻塞、完成、缺少 prompt 的线程会跳过",
+                "  - 重复 prompt 会按 prompt_sha256 幂等跳过",
             ])
         if topic in ("prefs", "preference", "preferences"):
             return "\n".join([
@@ -1146,7 +1263,7 @@ class TodoCLI:
                 "  🟢 绿色: 低优先级 / 正常",
                 "  灰色: 已完成",
             ])
-        return "用法: /help [todo|work|prefs|system]"
+        return "用法: /help [todo|work|codex|prefs|system]"
 
     def _startup_panel_text(self):
         return """
@@ -1162,6 +1279,7 @@ TodoAgent CLI
 分类帮助
 /help todo    Todo 管理命令
 /help work    工作流、证据和兼容命令
+/help codex   Codex 自动推进指南
 /help prefs   长期偏好命令
 /help system  历史、退出和颜色说明
 
@@ -1221,6 +1339,9 @@ TodoAgent CLI
         if response:
             if not isinstance(response, str):
                 self.console.print(response)
+                return True
+            if _is_plain_report_response(response):
+                self.console.print(response, markup=False)
                 return True
 
             # 尝试作为 Markdown 渲染
@@ -1648,10 +1769,45 @@ def _parse_sync_options(subcmd, args):
 
 
 def _parse_codex_resume_options(args):
+    tokens = args.split()
+    if tokens and tokens[0] in {"exclude", "block"}:
+        if len(tokens) < 2:
+            return {"action": "exclude", "dry_run": False, "thread_id": "", "reason": "", "invalid": True}
+        return {
+            "action": "exclude",
+            "dry_run": False,
+            "thread_id": tokens[1],
+            "reason": " ".join(tokens[2:]).strip(),
+            "invalid": False,
+        }
+    if tokens and tokens[0] in {"include", "unblock"}:
+        return {
+            "action": "include",
+            "dry_run": False,
+            "thread_id": tokens[1] if len(tokens) == 2 else "",
+            "reason": "",
+            "invalid": len(tokens) != 2,
+        }
+    if tokens and tokens[0] in {"exclusions", "excluded", "list"}:
+        return {
+            "action": "list",
+            "dry_run": False,
+            "thread_id": "",
+            "reason": "",
+            "invalid": len(tokens) != 1,
+        }
+    if tokens and tokens[0] in {"ls", "preview", "dry-run"}:
+        return {
+            "action": "resume",
+            "dry_run": True,
+            "thread_id": tokens[1] if len(tokens) == 2 else "",
+            "reason": "",
+            "invalid": len(tokens) > 2,
+        }
     dry_run = False
     thread_id = ""
     invalid = False
-    for token in args.split():
+    for token in tokens:
         if token in {"--dry-run", "-n"}:
             dry_run = True
         elif token.startswith("-"):
@@ -1660,7 +1816,59 @@ def _parse_codex_resume_options(args):
             thread_id = token
         else:
             invalid = True
-    return {"dry_run": dry_run, "thread_id": thread_id, "invalid": invalid}
+    return {"action": "resume", "dry_run": dry_run, "thread_id": thread_id, "reason": "", "invalid": invalid}
+
+
+def _codex_resume_usage():
+    return _resume_shortcut_usage()
+
+
+def _resume_shortcut_usage():
+    return "\n".join([
+        "用法: /r",
+        "  /r <序号>",
+        "  /r all",
+        "  /r skip <序号> [reason]",
+        "  /r unskip <序号>",
+        "  /r skips",
+    ])
+
+
+def _is_index_text(value: str) -> bool:
+    return value.isdigit()
+
+
+def _is_plain_report_response(response: str) -> bool:
+    prefixes = (
+        "Codex resume",
+        "Codex 自动推进排除列表",
+        "Codex 自动推进排除列表不可用",
+    )
+    return response.startswith(prefixes)
+
+
+def _format_codex_resume_exclusions(exclusions):
+    lines = ["Codex 自动推进排除列表", "─" * 80]
+    if not exclusions:
+        lines.append("  暂无排除项")
+    else:
+        for exclusion in exclusions:
+            suffix = f" | {exclusion.reason}" if exclusion.reason else ""
+            created = f" | {exclusion.created_at}" if exclusion.created_at else ""
+            lines.append(f"  {exclusion.thread_id}{suffix}{created}")
+    lines.append("─" * 80)
+    return "\n".join(lines)
+
+
+def _format_codex_resume_exclusion_error(exc):
+    message = str(exc) or exc.__class__.__name__
+    return "\n".join([
+        "Codex 自动推进排除列表不可用",
+        "─" * 80,
+        f"  {message}",
+        "  自动推进会 fail-closed；请修复或删除排除列表文件后重试。",
+        "─" * 80,
+    ])
 
 
 if __name__ == "__main__":

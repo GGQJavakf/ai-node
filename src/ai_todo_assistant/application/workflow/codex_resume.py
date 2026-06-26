@@ -1,21 +1,26 @@
 """Resume safe Codex threads from the latest report snapshot."""
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from ai_todo_assistant.application.ports.codex_resume_client import CodexThreadResumeClient, CodexThreadResumeOutcome
 from ai_todo_assistant.application.ports.workflow_repository import WorkflowRepository
 from ai_todo_assistant.domain.workflow import Evidence, EvidenceType, WorkItem, WorkItemSource, now_text
 
 
 @dataclass(frozen=True)
-class CodexThreadResumeOutcome:
-    success: bool
-    message: str = ""
+class CodexResumeExclusion:
+    thread_id: str
+    reason: str = ""
+    created_at: str = ""
 
 
-class CodexThreadResumeClient(Protocol):
-    def resume_thread(self, thread_id: str, prompt: str) -> CodexThreadResumeOutcome: ...
+class CodexResumeExclusionStore(Protocol):
+    def list_exclusions(self) -> list[CodexResumeExclusion]: ...
+    def exclude(self, thread_id: str, reason: str = "") -> CodexResumeExclusion: ...
+    def include(self, thread_id: str) -> bool: ...
 
 
 class UnavailableCodexThreadResumeClient:
@@ -24,6 +29,22 @@ class UnavailableCodexThreadResumeClient:
             success=False,
             message="resume client unavailable",
         )
+
+
+class CodexResumeExclusionService:
+    """Manages manual exclusions through an application-level use case."""
+
+    def __init__(self, store: CodexResumeExclusionStore):
+        self.store = store
+
+    def list_exclusions(self) -> list[CodexResumeExclusion]:
+        return self.store.list_exclusions()
+
+    def exclude(self, thread_id: str, reason: str = "") -> CodexResumeExclusion:
+        return self.store.exclude(thread_id, reason)
+
+    def include(self, thread_id: str) -> bool:
+        return self.store.include(thread_id)
 
 
 @dataclass(frozen=True)
@@ -61,6 +82,15 @@ class CodexResumeResult:
     report_path: str = ""
 
 
+@dataclass(frozen=True)
+class CodexResumeDisplayRow:
+    index: int
+    status: str
+    thread_id: str
+    title: str
+    note: str
+
+
 class CodexResumeService:
     """Selects safe Codex report entries and resumes them through a client."""
 
@@ -68,12 +98,30 @@ class CodexResumeService:
         self,
         repository: WorkflowRepository,
         client: CodexThreadResumeClient | None = None,
+        exclusion_store: CodexResumeExclusionStore | None = None,
     ):
         self.repository = repository
         self.client = client or UnavailableCodexThreadResumeClient()
+        self.exclusion_store = exclusion_store
 
-    def resume(self, report, dry_run: bool = False, thread_id: str = "") -> CodexResumeResult:
-        candidates, skipped = self._select_candidates(report, thread_id=thread_id)
+    def resume(
+        self,
+        report,
+        dry_run: bool = False,
+        thread_id: str = "",
+        respect_exclusions: bool | None = None,
+        skip_repeated: bool | None = None,
+    ) -> CodexResumeResult:
+        is_targeted = bool(str(thread_id or "").strip())
+        if respect_exclusions is None:
+            respect_exclusions = not is_targeted
+        if skip_repeated is None:
+            skip_repeated = not is_targeted
+        candidates, skipped = self._select_candidates(
+            report,
+            thread_id=thread_id,
+            respect_exclusions=respect_exclusions,
+        )
         if dry_run:
             return CodexResumeResult(
                 dry_run=True,
@@ -85,6 +133,24 @@ class CodexResumeService:
         attempts: list[CodexResumeAttempt] = []
         for candidate in candidates:
             item = self._ensure_work_item(candidate)
+            if skip_repeated and self._has_successful_resume_evidence(item.id, candidate):
+                skipped.append(
+                    CodexResumeSkip(
+                        thread_id=candidate.thread_id,
+                        title=candidate.title,
+                        reason="already resumed successfully for same prompt",
+                    )
+                )
+                continue
+            if skip_repeated and self._has_failed_resume_evidence(item.id, candidate):
+                skipped.append(
+                    CodexResumeSkip(
+                        thread_id=candidate.thread_id,
+                        title=candidate.title,
+                        reason="already failed for same prompt",
+                    )
+                )
+                continue
             try:
                 outcome = self.client.resume_thread(candidate.thread_id, candidate.prompt)
             except Exception as exc:
@@ -121,22 +187,45 @@ class CodexResumeService:
             report_path=str(getattr(report, "path", "") or ""),
         )
 
-    def _select_candidates(self, report, thread_id: str = "") -> tuple[list[CodexResumeCandidate], list[CodexResumeSkip]]:
+    def _select_candidates(
+        self,
+        report,
+        thread_id: str = "",
+        respect_exclusions: bool = True,
+    ) -> tuple[list[CodexResumeCandidate], list[CodexResumeSkip]]:
         target = str(thread_id or "").strip()
         candidates: list[CodexResumeCandidate] = []
         skipped: list[CodexResumeSkip] = []
         denied = _blocked_or_completed_entries(report)
+        exclusions, exclusion_error = self._manual_exclusions() if respect_exclusions else ({}, "")
+        if exclusion_error:
+            return [], [
+                CodexResumeSkip(
+                    thread_id="",
+                    title="Codex resume exclusions",
+                    reason=f"manual exclusion policy unavailable: {exclusion_error}",
+                )
+            ]
 
         for entry in list(getattr(report, "unfinished", []) or []):
             if not isinstance(entry, dict):
                 continue
-            candidate, skip = _candidate_from_unfinished(entry)
-            entry_thread_id = candidate.thread_id if candidate else skip.thread_id
+            entry_thread_id = _thread_id(entry)
             if target and entry_thread_id != target:
                 continue
             if entry_thread_id and entry_thread_id in denied:
                 skipped.append(denied[entry_thread_id])
                 continue
+            if entry_thread_id and entry_thread_id in exclusions:
+                skipped.append(
+                    CodexResumeSkip(
+                        thread_id=entry_thread_id,
+                        title=_title(entry, entry_thread_id),
+                        reason=_manual_exclusion_reason(exclusions[entry_thread_id]),
+                    )
+                )
+                continue
+            candidate, skip = _candidate_from_unfinished(entry)
             if candidate:
                 candidates.append(candidate)
             elif skip:
@@ -168,6 +257,19 @@ class CodexResumeService:
             skipped.append(CodexResumeSkip(thread_id=target, title=target, reason="thread not found in latest report"))
         return candidates, skipped
 
+    def _manual_exclusions(self) -> tuple[dict[str, CodexResumeExclusion], str]:
+        if not self.exclusion_store:
+            return {}, ""
+        try:
+            exclusions = {
+                exclusion.thread_id: exclusion
+                for exclusion in self.exclusion_store.list_exclusions()
+                if exclusion.thread_id
+            }
+        except Exception as exc:
+            return {}, str(exc) or exc.__class__.__name__
+        return exclusions, ""
+
     def _ensure_work_item(self, candidate: CodexResumeCandidate) -> WorkItem:
         item = self.repository.find_work_item_by_source(WorkItemSource.CODEX.value, candidate.thread_id)
         if not item:
@@ -185,38 +287,138 @@ class CodexResumeService:
         item.last_synced_at = now_text()
         return self.repository.save_work_item(item)
 
+    def _has_successful_resume_evidence(self, work_item_id: str, candidate: CodexResumeCandidate) -> bool:
+        return self._has_resume_evidence(work_item_id, candidate, success=True)
+
+    def _has_failed_resume_evidence(self, work_item_id: str, candidate: CodexResumeCandidate) -> bool:
+        return self._has_resume_evidence(work_item_id, candidate, success=False)
+
+    def _has_resume_evidence(self, work_item_id: str, candidate: CodexResumeCandidate, success: bool) -> bool:
+        marker = _resume_prompt_hash_marker(candidate.prompt)
+        command = f"codex resume {candidate.thread_id}"
+        for evidence in self.repository.list_evidence(work_item_id):
+            if evidence.source != WorkItemSource.CODEX.value:
+                continue
+            if evidence.evidence_type != EvidenceType.COMMAND.value:
+                continue
+            if evidence.command != command or evidence.success is not success:
+                continue
+            if marker in evidence.output_excerpt:
+                return True
+        return False
+
 
 def format_codex_resume_result(result: CodexResumeResult) -> str:
     title = "Codex resume [DRY-RUN]" if result.dry_run else "Codex resume"
     lines = [title, "─" * 80]
     if result.report_path:
         lines.append(f"  report: {result.report_path}")
+    rows = codex_resume_display_rows(result)
     if result.dry_run:
         if result.candidates:
             lines.append(f"  可推进: {len(result.candidates)} 项")
-            for candidate in result.candidates:
-                lines.append(f"  [DRY-RUN] {candidate.thread_id} | {candidate.title}")
-                lines.append(f"     prompt: {_excerpt(candidate.prompt)}")
         else:
             lines.append("  可推进: 0 项")
+        if result.skipped:
+            lines.append(f"  跳过: {len(result.skipped)} 项")
     else:
         if result.attempts:
             lines.append(f"  已尝试: {len(result.attempts)} 项")
-            for attempt in result.attempts:
-                status = "OK" if attempt.success else "FAIL"
-                message = f" | {attempt.message}" if attempt.message else ""
-                lines.append(f"  [{status}] {attempt.thread_id} | {attempt.title}{message}")
         else:
             lines.append("  已尝试: 0 项")
 
-    if result.skipped:
+    if rows:
+        lines.extend(
+            _format_text_table(
+                ["#", "状态", "title", "说明"],
+                [[str(row.index), row.status, row.title, row.note] for row in rows[:20]],
+            )
+        )
+        if len(rows) > 20:
+            lines.append(f"  ... 还有 {len(rows) - 20} 项未显示")
+        lines.append("  提示: /r <序号> 手动推进；/r skip <序号> 排除自动推进")
+
+    if result.skipped and not result.dry_run:
         lines.append("")
         lines.append(f"  跳过: {len(result.skipped)} 项")
-        for skip in result.skipped[:10]:
-            thread = skip.thread_id or "-"
-            lines.append(f"  [SKIP] {thread} | {skip.title}: {skip.reason}")
     lines.append("─" * 80)
     return "\n".join(lines)
+
+
+def codex_resume_display_rows(result: CodexResumeResult) -> list[CodexResumeDisplayRow]:
+    rows: list[CodexResumeDisplayRow] = []
+    if result.dry_run:
+        for candidate in result.candidates:
+            rows.append(
+                CodexResumeDisplayRow(
+                    index=len(rows) + 1,
+                    status="READY",
+                    thread_id=candidate.thread_id,
+                    title=candidate.title,
+                    note="可推进",
+                )
+            )
+    for attempt in result.attempts:
+        rows.append(
+            CodexResumeDisplayRow(
+                index=len(rows) + 1,
+                status="OK" if attempt.success else "FAIL",
+                thread_id=attempt.thread_id,
+                title=attempt.title,
+                note=attempt.message,
+            )
+        )
+    for skip in result.skipped:
+        rows.append(
+            CodexResumeDisplayRow(
+                index=len(rows) + 1,
+                status="SKIP",
+                thread_id=skip.thread_id or "",
+                title=skip.title,
+                note=skip.reason,
+            )
+        )
+    return rows
+
+
+def _format_text_table(headers: list[str], rows: list[list[str]], max_width: int = 118) -> list[str]:
+    widths = _table_widths(headers, rows, max_width)
+    border = "  +" + "+".join("-" * (width + 2) for width in widths) + "+"
+    lines = [border, _format_table_row(headers, widths), border]
+    for row in rows:
+        lines.append(_format_table_row([_excerpt(cell, width) for cell, width in zip(row, widths)], widths))
+    lines.append(border)
+    return lines
+
+
+def _table_widths(headers: list[str], rows: list[list[str]], max_width: int) -> list[int]:
+    floor_by_header = {"#": 3, "状态": 6, "thread": 12, "title": 12, "prompt": 16, "reason": 16, "说明": 16, "message": 16}
+    cap_by_header = {"#": 4, "状态": 8, "thread": 32, "title": 46, "prompt": 42, "reason": 42, "说明": 44, "message": 42}
+    floors = [floor_by_header.get(header, 8) for header in headers]
+    widths = [
+        max(
+            floors[index],
+            min(
+                max(len(str(row[index] if index < len(row) else "")) for row in [headers, *rows]),
+                cap_by_header.get(headers[index], 24),
+            ),
+        )
+        for index in range(len(headers))
+    ]
+    total = sum(widths) + len(widths) * 3 + 3
+    while total > max_width and any(width > floor for width, floor in zip(widths, floors)):
+        index = max(range(len(widths)), key=lambda item: widths[item] - floors[item])
+        widths[index] -= 1
+        total = sum(widths) + len(widths) * 3 + 3
+    return widths
+
+
+def _format_table_row(values: list[str], widths: list[int]) -> str:
+    cells = []
+    for value, width in zip(values, widths):
+        text = _excerpt(value, width)
+        cells.append(f" {text.ljust(width)} ")
+    return "  |" + "|".join(cells) + "|"
 
 
 def _candidate_from_unfinished(entry: dict) -> tuple[CodexResumeCandidate | None, CodexResumeSkip | None]:
@@ -234,6 +436,8 @@ def _candidate_from_unfinished(entry: dict) -> tuple[CodexResumeCandidate | None
         return None, CodexResumeSkip(thread_id=thread_id, title=title, reason=f"status {blocked_status} is not resumeable")
     if not prompt:
         return None, CodexResumeSkip(thread_id=thread_id, title=title, reason="缺少 continuation prompt")
+    if _looks_like_manual_action_prompt(prompt):
+        return None, CodexResumeSkip(thread_id=thread_id, title=title, reason="需要用户输入")
     if not _is_resumeable(entry, statuses):
         return None, CodexResumeSkip(thread_id=thread_id, title=title, reason="not marked resumeable")
     return CodexResumeCandidate(thread_id=thread_id, title=title, prompt=prompt, status=status, entry=entry), None
@@ -302,11 +506,48 @@ def _is_blocked_or_done(status: str) -> bool:
     return status in {"blocked", "complete", "completed", "done"}
 
 
+def _looks_like_manual_action_prompt(prompt: str) -> bool:
+    text = str(prompt or "").lower()
+    manual_markers = [
+        "人工确认",
+        "人工将",
+        "人工处理",
+        "等待人工",
+        "等待用户",
+        "需要用户",
+        "用户输入",
+        "人为确认",
+        "权限",
+        "审批",
+        "释放占用",
+        "manual",
+        "human",
+        "user input",
+        "waiting user",
+    ]
+    return any(marker in text for marker in manual_markers)
+
+
+def _manual_exclusion_reason(exclusion: CodexResumeExclusion) -> str:
+    if exclusion.reason:
+        return f"manual exclusion: {exclusion.reason}"
+    return "manual exclusion"
+
+
 def _join_excerpt(prompt: str, message: str) -> str:
-    parts = [f"prompt: {_excerpt(prompt)}"]
+    parts = [_resume_prompt_hash_marker(prompt), _resume_prompt_marker(prompt)]
     if message:
         parts.append(f"result: {message}")
     return "\n".join(parts)
+
+
+def _resume_prompt_hash_marker(prompt: str) -> str:
+    digest = hashlib.sha256(str(prompt or "").encode("utf-8")).hexdigest()
+    return f"prompt_sha256: {digest}"
+
+
+def _resume_prompt_marker(prompt: str) -> str:
+    return f"prompt: {_excerpt(prompt)}"
 
 
 def _excerpt(value: str, limit: int = 500) -> str:

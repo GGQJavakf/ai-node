@@ -54,6 +54,22 @@ class TestSettingsLoading(unittest.TestCase):
 
             self.assertEqual(settings["model"], "env-model")
 
+    def test_codex_resume_environment_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                "os.environ",
+                {
+                    "AI_CODEX_RESUME_ENABLED": "false",
+                    "AI_CODEX_RESUME_TIMEOUT": "12",
+                    "AI_CODEX_RESUME_EXCLUSIONS_FILE": "tmp/exclusions.json",
+                },
+            ):
+                settings = load_settings(project_root=tmp)
+
+            self.assertFalse(settings["codex_resume_enabled"])
+            self.assertEqual(settings["codex_resume_timeout"], 12)
+            self.assertEqual(settings["codex_resume_exclusions_file"], "tmp/exclusions.json")
+
 
 if __name__ == "__main__":
     unittest.main()

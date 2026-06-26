@@ -23,6 +23,9 @@ DEFAULT_SETTINGS = {
     "codex_retry_limit": 1,
     "codex_ignore_user_config": True,
     "codex_ignore_rules": True,
+    "codex_resume_enabled": True,
+    "codex_resume_timeout": 240,
+    "codex_resume_exclusions_file": "data/codex-resume-exclusions.json",
     "validation_retry_limit": 3,
     "session_memory_limit": 20,
     "storage_backend": "sqlite",
@@ -101,6 +104,16 @@ def load_settings(project_root: str | None = None) -> dict:
     )
     config["codex_ignore_rules"] = _as_bool(
         os.getenv("AI_CODEX_IGNORE_RULES", config["codex_ignore_rules"])
+    )
+    config["codex_resume_enabled"] = _as_bool(
+        os.getenv("AI_CODEX_RESUME_ENABLED", config["codex_resume_enabled"])
+    )
+    config["codex_resume_timeout"] = _as_positive_int(
+        os.getenv("AI_CODEX_RESUME_TIMEOUT", config["codex_resume_timeout"]),
+        DEFAULT_SETTINGS["codex_resume_timeout"],
+    )
+    config["codex_resume_exclusions_file"] = os.getenv(
+        "AI_CODEX_RESUME_EXCLUSIONS_FILE", config["codex_resume_exclusions_file"]
     )
     config["validation_retry_limit"] = int(
         os.getenv("AI_VALIDATION_RETRY_LIMIT", config["validation_retry_limit"])
