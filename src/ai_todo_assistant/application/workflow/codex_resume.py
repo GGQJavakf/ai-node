@@ -89,6 +89,8 @@ class CodexResumeDisplayRow:
     thread_id: str
     title: str
     note: str
+    progress: str = ""
+    next_action: str = ""
 
 
 class CodexResumeService:
@@ -315,24 +317,35 @@ def format_codex_resume_result(result: CodexResumeResult) -> str:
         lines.append(f"  report: {result.report_path}")
     rows = codex_resume_display_rows(result)
     if result.dry_run:
+        lines.append(f"  进度: 可推进 {len(result.candidates)} 项；暂不推进 {len(result.skipped)} 项；总计 {len(rows)} 项")
         if result.candidates:
-            lines.append(f"  可推进: {len(result.candidates)} 项")
+            lines.append(f"  建议: /r all 批量推进 {len(result.candidates)} 项，或 /r <序号> 单独推进")
         else:
-            lines.append("  可推进: 0 项")
-        if result.skipped:
-            lines.append(f"  跳过: {len(result.skipped)} 项")
+            lines.append("  建议: 当前没有可自动推进项，先处理暂不推进任务的原因")
     else:
+        lines.append(f"  进度: 已尝试 {len(result.attempts)} 项；暂不推进 {len(result.skipped)} 项；总计 {len(rows)} 项")
         if result.attempts:
-            lines.append(f"  已尝试: {len(result.attempts)} 项")
+            failed = len([attempt for attempt in result.attempts if not attempt.success])
+            lines.append(f"  结果: 成功 {len(result.attempts) - failed} 项；失败 {failed} 项")
         else:
-            lines.append("  已尝试: 0 项")
+            lines.append("  结果: 未发送任何继续请求")
 
     if rows:
-        lines.extend(
-            _format_text_table(
-                ["#", "状态", "title", "说明"],
-                [[str(row.index), row.status, row.title, row.note] for row in rows[:20]],
-            )
+        visible_rows = rows[:20]
+        _append_resume_section(
+            lines,
+            "可推进任务",
+            [row for row in visible_rows if row.status == "READY"],
+        )
+        _append_resume_section(
+            lines,
+            "已尝试任务",
+            [row for row in visible_rows if row.status in {"OK", "FAIL"}],
+        )
+        _append_resume_section(
+            lines,
+            "暂不推进任务",
+            [row for row in visible_rows if row.status == "SKIP"],
         )
         if len(rows) > 20:
             lines.append(f"  ... 还有 {len(rows) - 20} 项未显示")
@@ -356,6 +369,8 @@ def codex_resume_display_rows(result: CodexResumeResult) -> list[CodexResumeDisp
                     thread_id=candidate.thread_id,
                     title=candidate.title,
                     note="可推进",
+                    progress="暂停，可继续",
+                    next_action=candidate.prompt,
                 )
             )
     for attempt in result.attempts:
@@ -366,6 +381,8 @@ def codex_resume_display_rows(result: CodexResumeResult) -> list[CodexResumeDisp
                 thread_id=attempt.thread_id,
                 title=attempt.title,
                 note=attempt.message,
+                progress="已发送" if attempt.success else "发送失败",
+                next_action=attempt.message or ("等待 Codex 继续执行" if attempt.success else "检查失败原因后可手动重试"),
             )
         )
     for skip in result.skipped:
@@ -376,9 +393,24 @@ def codex_resume_display_rows(result: CodexResumeResult) -> list[CodexResumeDisp
                 thread_id=skip.thread_id or "",
                 title=skip.title,
                 note=skip.reason,
+                progress=_skip_progress(skip.reason),
+                next_action=_skip_next_action(skip.reason),
             )
         )
     return rows
+
+
+def _append_resume_section(lines: list[str], title: str, rows: list[CodexResumeDisplayRow]) -> None:
+    if not rows:
+        return
+    lines.append("")
+    lines.append(f"{title}:")
+    lines.extend(
+        _format_text_table(
+            ["#", "状态", "任务", "当前进度", "后续推进方向"],
+            [[str(row.index), row.status, row.title, row.progress, row.next_action] for row in rows],
+        )
+    )
 
 
 def _format_text_table(headers: list[str], rows: list[list[str]], max_width: int = 118) -> list[str]:
@@ -392,8 +424,32 @@ def _format_text_table(headers: list[str], rows: list[list[str]], max_width: int
 
 
 def _table_widths(headers: list[str], rows: list[list[str]], max_width: int) -> list[int]:
-    floor_by_header = {"#": 3, "状态": 6, "thread": 12, "title": 12, "prompt": 16, "reason": 16, "说明": 16, "message": 16}
-    cap_by_header = {"#": 4, "状态": 8, "thread": 32, "title": 46, "prompt": 42, "reason": 42, "说明": 44, "message": 42}
+    floor_by_header = {
+        "#": 3,
+        "状态": 6,
+        "thread": 12,
+        "title": 12,
+        "任务": 18,
+        "当前进度": 12,
+        "后续推进方向": 24,
+        "prompt": 16,
+        "reason": 16,
+        "说明": 16,
+        "message": 16,
+    }
+    cap_by_header = {
+        "#": 4,
+        "状态": 8,
+        "thread": 32,
+        "title": 46,
+        "任务": 44,
+        "当前进度": 24,
+        "后续推进方向": 50,
+        "prompt": 42,
+        "reason": 42,
+        "说明": 44,
+        "message": 42,
+    }
     floors = [floor_by_header.get(header, 8) for header in headers]
     widths = [
         max(
@@ -504,6 +560,60 @@ def _needs_user(status: str) -> bool:
 
 def _is_blocked_or_done(status: str) -> bool:
     return status in {"blocked", "complete", "completed", "done"}
+
+
+def _skip_progress(reason: str) -> str:
+    text = str(reason or "").lower()
+    if "completed bucket" in text:
+        return "已完成"
+    if "blocked bucket" in text:
+        return "阻塞中"
+    if "manual exclusion" in text:
+        return "已手动排除"
+    if "需要用户输入" in reason:
+        return "需要用户输入"
+    if "缺少 thread id" in reason:
+        return "缺少线程 ID"
+    if "缺少 continuation prompt" in reason:
+        return "缺少后续指令"
+    if "not marked resumeable" in text:
+        return "未标记可继续"
+    if "already resumed successfully" in text:
+        return "同指令已推进"
+    if "already failed" in text:
+        return "同指令曾失败"
+    if "manual exclusion policy unavailable" in text:
+        return "排除列表不可用"
+    if "not resumeable" in text:
+        return "不可自动推进"
+    return reason or "暂不推进"
+
+
+def _skip_next_action(reason: str) -> str:
+    text = str(reason or "").lower()
+    if "completed bucket" in text:
+        return "无需继续推进"
+    if "blocked bucket" in text:
+        return "等待阻塞解除或人工确认"
+    if "manual exclusion" in text:
+        return "需要恢复自动推进时执行 /r unskip <序号>"
+    if "需要用户输入" in reason:
+        return "补充用户输入后再生成可推进指令"
+    if "缺少 thread id" in reason:
+        return "更新 report，补充稳定 thread_id"
+    if "缺少 continuation prompt" in reason:
+        return "更新 report，补充 next_action/resume_prompt"
+    if "not marked resumeable" in text:
+        return "确认安全后标记 resume_eligible 或 continueable"
+    if "already resumed successfully" in text:
+        return "无需重复发送"
+    if "already failed" in text:
+        return "排查失败原因；必要时 /r <序号> 手动重试"
+    if "manual exclusion policy unavailable" in text:
+        return "修复排除列表文件后重试"
+    if "not resumeable" in text:
+        return "确认状态后再重新纳入自动推进"
+    return "查看原因后人工判断"
 
 
 def _looks_like_manual_action_prompt(prompt: str) -> bool:

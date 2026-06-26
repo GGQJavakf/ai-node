@@ -66,8 +66,8 @@ The assistant SHALL support a dry-run mode that previews Codex resume actions wi
 
 - **GIVEN** a latest report contains resumeable and skipped threads
 - **WHEN** the user runs `/r`
-- **THEN** the assistant SHALL render candidates and skip reasons in readable fixed-width text tables
-- **AND** each visible row SHALL include a stable index for the current latest report.
+- **THEN** the assistant SHALL render a progress summary with separate readable fixed-width text tables for resumeable and skipped threads
+- **AND** each visible row SHALL include a stable index, current progress, and next direction for the current latest report.
 
 ### Requirement: Codex resume sends continuation prompts through an injectable client
 

@@ -310,11 +310,12 @@ class TestCodexThreadResume(unittest.TestCase):
         self.assertIn("Codex resume [DRY-RUN]", format_codex_resume_result(dry_run))
         self.assertIn("thread-ready", format_codex_resume_result(dry_run))
         dry_run_text = format_codex_resume_result(dry_run)
-        self.assertIn("跳过", dry_run_text)
+        self.assertIn("暂不推进任务", dry_run_text)
         self.assertIn("| 状态", dry_run_text)
         self.assertIn("| READY", dry_run_text)
         self.assertIn("| SKIP", dry_run_text)
         self.assertIn("需要用户输入", dry_run_text)
+        self.assertIn("后续推进方向", dry_run_text)
         self.assertIn("| 1", dry_run_text)
         self.assertNotIn("prompt:", dry_run_text)
         executed_text = format_codex_resume_result(executed)
@@ -349,8 +350,8 @@ class TestCodexThreadResume(unittest.TestCase):
         dry_run = CodexResumeService(self.repository, FakeResumeClient()).resume(_report(), dry_run=True)
         executed = CodexResumeService(self.repository, FakeResumeClient()).resume(_report())
 
-        self.assertIn("可推进: 0 项", format_codex_resume_result(dry_run))
-        self.assertIn("已尝试: 0 项", format_codex_resume_result(executed))
+        self.assertIn("可推进 0 项", format_codex_resume_result(dry_run))
+        self.assertIn("已尝试 0 项", format_codex_resume_result(executed))
 
     def test_conflicting_status_fields_fail_closed(self):
         report = _report(

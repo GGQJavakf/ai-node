@@ -269,7 +269,7 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertIn("等待用户确认", listed)
         self.assertIn("| SKIP", preview)
         self.assertIn("thread-1", preview)
-        self.assertIn("manual exclusion", preview)
+        self.assertIn("/r unskip", preview)
         self.assertIn("| READY", preview)
         self.assertIn("thread-2", preview)
         self.assertIn("已解除自动推进排除: thread-1", included)

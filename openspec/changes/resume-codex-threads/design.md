@@ -23,7 +23,8 @@ An entry is never resume-eligible when:
 ## Command Surface
 
 - `/r` or `/resume`
-  - Lists candidates and skip reasons in fixed-width text tables with stable row indexes.
+  - Lists progress summary, resumeable tasks, and skipped tasks in fixed-width text tables with stable row indexes.
+  - Shows each task's current progress and next direction so the user can see what remains and how to proceed.
   - Does not call the resume client and writes no Evidence.
 - `/r <index>` or `/resume <index>`
   - Sends continuation prompts only for eligible candidates.
