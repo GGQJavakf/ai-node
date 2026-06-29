@@ -28,6 +28,13 @@ SYSTEM_CLI_COMMANDS = MappingProxyType({
         argv=("git", "diff", "--stat"),
         timeout_seconds=20,
     ),
+    "openspec.list": CommandSpec(
+        key="openspec.list",
+        title="OpenSpec changes",
+        description="List OpenSpec changes as JSON.",
+        argv=("openspec", "list", "--json"),
+        timeout_seconds=30,
+    ),
 })
 
 

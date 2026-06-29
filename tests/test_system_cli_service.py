@@ -33,7 +33,19 @@ class TestSystemCliService(unittest.TestCase):
         self.assertIn("git.branch", commands)
         self.assertIn("git.status", commands)
         self.assertIn("git.diff_stat", commands)
+        self.assertIn("openspec.list", commands)
         self.assertEqual(commands["git.status"].risk_level, "read_only")
+        self.assertEqual(commands["openspec.list"].risk_level, "read_only")
+
+    def test_runs_openspec_list_with_fixed_argv(self):
+        runner = FakeRunner(CommandResult(["openspec"], self.project_root, 0, stdout='{"changes":[]}\n'))
+        service = SystemCliService(config={"project_root": self.project_root}, runner=runner)
+
+        record = service.run("openspec.list", cwd=self.project_root)
+
+        self.assertTrue(record.success)
+        self.assertEqual(runner.calls, [(["openspec", "list", "--json"], self.project_root)])
+        self.assertIn('"changes":[]', record.stdout_excerpt)
 
     def test_rejects_unknown_command_without_running_process(self):
         runner = FakeRunner(CommandResult(["never"], self.project_root, 0))

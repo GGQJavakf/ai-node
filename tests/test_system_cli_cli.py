@@ -41,6 +41,7 @@ class TestSystemCliCommand(unittest.TestCase):
 
         self.assertIn("git.status", response)
         self.assertIn("git.branch", response)
+        self.assertIn("openspec.list", response)
 
     def test_system_policy_shows_allowed_roots(self):
         response = self.cli._handle_slash_command("/system policy")
