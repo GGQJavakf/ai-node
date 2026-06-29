@@ -42,6 +42,10 @@ TOOL_DESCRIPTIONS = {
     "recommend_next_work_action": "从活动 WorkItem 中推荐下一步。",
     "record_work_evidence": "为 WorkItem 追加命令、测试、备注、评审或链接证据。",
     "summarize_work_evidence": "汇总 WorkItem 的证据，用于日报、closeout 或 MR/Redmine 草稿。",
+    "run_system_cli": (
+        "执行只读系统 CLI catalog 命令，例如 git.status。只能传 command_key，不能执行任意 shell；"
+        "命令输出会先脱敏、截断并摘要。"
+    ),
     "read_codex_task_reports": "读取 Codex 每日任务 JSON/Markdown 报告，并可导入未完成/阻塞项为 WorkItem。",
     "generate_daily_workflow_review": "基于 WorkItem 与 Evidence 生成工作日复盘草稿。",
 }

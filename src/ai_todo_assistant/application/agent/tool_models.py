@@ -238,6 +238,27 @@ class SyncWorkflowArgs(ToolArgsModel):
         return value
 
 
+class RunSystemCliArgs(ToolArgsModel):
+    command_key: str = Field(min_length=1, description="只读系统 CLI catalog command key，例如 git.status")
+    cwd: str | None = Field(default=None, description="工作目录，必须在允许根目录内")
+    reason: str = Field(default="", description="调用原因，用于解释为什么读取该命令")
+
+    @field_validator("command_key")
+    @classmethod
+    def validate_command_key(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+    @field_validator("cwd")
+    @classmethod
+    def validate_optional_cwd(cls, value: str | None) -> str | None:
+        return _strip_optional_text(value)
+
+    @field_validator("reason")
+    @classmethod
+    def strip_reason(cls, value: str) -> str:
+        return value.strip()
+
+
 class ReadCodexReportsArgs(ToolArgsModel):
     import_items: bool = Field(default=True, description="是否将未完成/阻塞项导入 WorkItem")
 
@@ -261,6 +282,7 @@ TOOL_ARG_MODELS: dict[str, type[ToolArgsModel]] = {
     "recommend_next_work_action": EmptyArgs,
     "record_work_evidence": RecordEvidenceArgs,
     "summarize_work_evidence": WorkItemIdArgs,
+    "run_system_cli": RunSystemCliArgs,
     "read_codex_task_reports": ReadCodexReportsArgs,
     "generate_daily_workflow_review": EmptyArgs,
 }

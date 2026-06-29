@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 from ai_todo_assistant.application.ports import TodoRepository
+from ai_todo_assistant.application.system_cli import SystemCliService
 from ai_todo_assistant.application.workflow import (
     CodexTaskReportService,
     ContinueService,
@@ -23,10 +24,17 @@ class ToolExecutor:
     真正的数据变更仍由本地应用代码执行。
     """
 
-    def __init__(self, manager: TodoRepository, config: dict | None = None, workflow_repository=None):
+    def __init__(
+        self,
+        manager: TodoRepository,
+        config: dict | None = None,
+        workflow_repository=None,
+        system_cli_runner=None,
+    ):
         self.manager = manager
         self.config = config or {}
         self.workflow_repository = workflow_repository or build_workflow_repository(self.config)
+        self.system_cli_runner = system_cli_runner
         self._dispatch: dict[str, Any] = {
             "list_todos": self._list_todos,
             "add_todo": self._add_todo,
@@ -46,6 +54,7 @@ class ToolExecutor:
             "recommend_next_work_action": self._recommend_next_work_action,
             "record_work_evidence": self._record_work_evidence,
             "summarize_work_evidence": self._summarize_work_evidence,
+            "run_system_cli": self._run_system_cli,
             "read_codex_task_reports": self._read_codex_task_reports,
             "generate_daily_workflow_review": self._generate_daily_workflow_review,
         }
@@ -61,6 +70,11 @@ class ToolExecutor:
             return f"[参数错误] 调用 {tool_name} 失败: {e}"
         except Exception as e:
             return f"[执行错误] {tool_name} 执行异常: {e}"
+
+    def _run_system_cli(self, command_key: str, cwd: str | None = None, reason: str = "") -> str:
+        service = SystemCliService(self.config, runner=self.system_cli_runner)
+        record = service.run(command_key, cwd=cwd)
+        return service.format_for_tool(record)
 
     def _list_todos(self, filter: str = "all", time_range: str = "all", priority: str = "all") -> str:
         if time_range == "today":

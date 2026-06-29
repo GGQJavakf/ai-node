@@ -20,6 +20,7 @@ TODO CLI 交互层
 """
 import sys
 import os
+import shlex
 from datetime import datetime
 
 try:
@@ -40,6 +41,7 @@ from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt
 
+from ai_todo_assistant.application.system_cli import SystemCliService
 from ai_todo_assistant.infrastructure.connectors import CodexCliResumeClient
 from ai_todo_assistant.infrastructure.persistence import (
     JsonCodexResumeExclusionStore,
@@ -129,6 +131,9 @@ class CommandCompleter(Completer):
             '/sync status': '查看同步健康状态',
             '/sync watch': '本地前台定时触发同步并汇报每轮结果',
             '/sync watch --resume': '本地前台定时同步后推进可继续 Codex 会话',
+            '/system list': '查看只读系统 CLI 命令目录',
+            '/system run': '执行只读系统 CLI catalog 命令',
+            '/system policy': '查看系统 CLI 执行策略',
             '/r': '查看 Codex 可推进任务序号表',
             '/r all': '批量推进可继续 Codex 会话',
             '/r skip': '按序号排除 Codex 自动推进',
@@ -145,7 +150,7 @@ class CommandCompleter(Completer):
             '/help work': '查看工作流和证据命令',
             '/help codex': '查看 Codex 自动推进指南',
             '/help prefs': '查看长期偏好命令',
-            '/help system': '查看历史、退出和颜色说明',
+            '/help system': '查看系统 CLI、历史、退出和颜色说明',
             '/exit': '退出应用',
             '/quit': '退出应用',
             '/history': '查看命令历史记录'
@@ -317,6 +322,8 @@ class TodoCLI:
             return self._handle_work_command(subcmd, args)
         elif cmd == "/sync":
             return self._handle_sync_command(subcmd, args)
+        elif cmd == "/system":
+            return self._handle_system_command(subcmd, args)
         elif cmd == "/next":
             return self._handle_continue_command()
         elif cmd == "/continue":
@@ -1088,6 +1095,22 @@ class TodoCLI:
         lines.append("─" * 80)
         return "\n".join(lines)
 
+    def _system_cli_service(self):
+        return SystemCliService(self.config, runner=getattr(self, "system_cli_runner", None))
+
+    def _handle_system_command(self, subcmd="", args=""):
+        service = self._system_cli_service()
+        if subcmd in {"", "list"}:
+            return service.format_command_list()
+        if subcmd == "policy":
+            return service.format_policy()
+        if subcmd == "run":
+            command_key, cwd = _parse_system_run_args(args)
+            if not command_key:
+                return "用法: /system run <key> [--cwd <path>]"
+            return service.format_for_tool(service.run(command_key, cwd=cwd))
+        return "用法: /system [list|policy|run <key> [--cwd <path>]]"
+
     def _show_work_item(self, work_item_id):
         item = self._workflow_repo().get_work_item(work_item_id)
         if not item:
@@ -1158,7 +1181,7 @@ class TodoCLI:
                 "  /help work    工作流、证据和兼容命令",
                 "  /help codex   Codex 自动推进指南",
                 "  /help prefs   长期偏好命令",
-                "  /help system  历史、退出和颜色说明",
+                "  /help system  系统 CLI、历史、退出和颜色说明",
                 "─" * 80,
                 "💡 你也可以直接输入自然语言，让 AI 助手帮你管理待办事项",
             ])
@@ -1248,6 +1271,13 @@ class TodoCLI:
             return "\n".join([
                 "📖 系统 / 历史",
                 "─" * 80,
+                "  /system list",
+                "      查看只读系统 CLI catalog",
+                "  /system policy",
+                "      查看 read_only、shell 禁用和允许根目录策略",
+                "  /system run <key> [--cwd <path>]",
+                "      执行 catalog 中的只读命令，返回脱敏、截断后的摘要",
+                "",
                 "  /history",
                 "  /exit 或 /quit",
                 "",
@@ -1281,7 +1311,7 @@ TodoAgent CLI
 /help work    工作流、证据和兼容命令
 /help codex   Codex 自动推进指南
 /help prefs   长期偏好命令
-/help system  历史、退出和颜色说明
+/help system  系统 CLI、历史、退出和颜色说明
 
 也可以直接输入自然语言。
 """
@@ -1725,6 +1755,26 @@ def _parse_source_filter(args):
     if index + 1 >= len(tokens):
         return ""
     return tokens[index + 1].strip().lower()
+
+
+def _parse_system_run_args(args):
+    try:
+        tokens = shlex.split(args or "", posix=False)
+    except ValueError:
+        tokens = (args or "").split()
+    if not tokens:
+        return "", None
+    command_key = tokens[0]
+    cwd = None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--cwd" and index + 1 < len(tokens):
+            cwd = tokens[index + 1].strip('"')
+            index += 2
+            continue
+        index += 1
+    return command_key, cwd
 
 
 def _parse_sync_options(subcmd, args):
