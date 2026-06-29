@@ -15,8 +15,10 @@ from ai_todo_assistant.infrastructure.persistence.json_todo_repository import To
 class FakeRunner:
     def __init__(self, result):
         self.result = result
+        self.calls = []
 
     def run(self, args, cwd=""):
+        self.calls.append((args, cwd))
         return self.result
 
 
@@ -62,6 +64,24 @@ class TestSystemCliToolCall(unittest.TestCase):
 
         self.assertIn("[system_cli] git.status succeeded", result)
         self.assertIn(" M file.py", result)
+
+    def test_tool_executor_runs_openspec_validate_catalog_command(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = FakeRunner(CommandResult(["openspec"], temp_dir, 0, stdout='{"summary":{"totals":{"passed":1}}}\n'))
+            manager = TodoManager(os.path.join(temp_dir, "todos.json"))
+            executor = ToolExecutor(
+                manager,
+                config={"project_root": temp_dir},
+                system_cli_runner=runner,
+            )
+
+            result = executor.execute("run_system_cli", {"command_key": "openspec.validate"})
+
+        self.assertIn("[system_cli] openspec.validate succeeded", result)
+        self.assertEqual(
+            runner.calls,
+            [(["openspec", "validate", "--all", "--strict", "--json", "--no-interactive"], temp_dir)],
+        )
 
     def test_tool_executor_records_system_cli_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:

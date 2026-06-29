@@ -35,6 +35,21 @@ SYSTEM_CLI_COMMANDS = MappingProxyType({
         argv=("openspec", "list", "--json"),
         timeout_seconds=30,
     ),
+    "openspec.validate": CommandSpec(
+        key="openspec.validate",
+        title="OpenSpec validation",
+        description="Validate all OpenSpec changes and specs as JSON.",
+        argv=("openspec", "validate", "--all", "--strict", "--json", "--no-interactive"),
+        timeout_seconds=45,
+        stdout_limit=1200,
+    ),
+    "playbook.workspace_status": CommandSpec(
+        key="playbook.workspace_status",
+        title="Playbook workspace status",
+        description="Show Playbook workspace task status as JSON.",
+        argv=("playbook", "workspace", "task", "status", "--output", "json", "--full"),
+        timeout_seconds=60,
+    ),
 })
 
 

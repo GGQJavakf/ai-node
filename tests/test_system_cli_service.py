@@ -34,8 +34,13 @@ class TestSystemCliService(unittest.TestCase):
         self.assertIn("git.status", commands)
         self.assertIn("git.diff_stat", commands)
         self.assertIn("openspec.list", commands)
+        self.assertIn("openspec.validate", commands)
+        self.assertIn("playbook.workspace_status", commands)
         self.assertEqual(commands["git.status"].risk_level, "read_only")
         self.assertEqual(commands["openspec.list"].risk_level, "read_only")
+        self.assertEqual(commands["openspec.validate"].risk_level, "read_only")
+        self.assertEqual(commands["playbook.workspace_status"].risk_level, "read_only")
+        self.assertLessEqual(commands["openspec.validate"].stdout_limit, 1200)
 
     def test_runs_openspec_list_with_fixed_argv(self):
         runner = FakeRunner(CommandResult(["openspec"], self.project_root, 0, stdout='{"changes":[]}\n'))
@@ -46,6 +51,42 @@ class TestSystemCliService(unittest.TestCase):
         self.assertTrue(record.success)
         self.assertEqual(runner.calls, [(["openspec", "list", "--json"], self.project_root)])
         self.assertIn('"changes":[]', record.stdout_excerpt)
+
+    def test_runs_openspec_validate_with_fixed_non_interactive_argv(self):
+        runner = FakeRunner(CommandResult(["openspec"], self.project_root, 0, stdout='{"summary":{"totals":{"failed":0}}}\n'))
+        service = SystemCliService(config={"project_root": self.project_root}, runner=runner)
+
+        record = service.run("openspec.validate", cwd=self.project_root)
+
+        self.assertTrue(record.success)
+        self.assertEqual(
+            runner.calls,
+            [(["openspec", "validate", "--all", "--strict", "--json", "--no-interactive"], self.project_root)],
+        )
+        self.assertIn('"failed":0', record.stdout_excerpt)
+
+    def test_uses_command_specific_output_limit_by_default(self):
+        runner = FakeRunner(CommandResult(["openspec"], self.project_root, 0, stdout="x" * 1500))
+        service = SystemCliService(config={"project_root": self.project_root}, runner=runner)
+
+        record = service.run("openspec.validate", cwd=self.project_root)
+
+        self.assertTrue(record.output_truncated)
+        self.assertIn("[truncated", record.stdout_excerpt)
+        self.assertLess(len(record.stdout_excerpt), 1300)
+
+    def test_runs_playbook_workspace_status_with_fixed_read_only_argv(self):
+        runner = FakeRunner(CommandResult(["playbook"], self.project_root, 1, stdout='{"code":"WORKSPACE_ID_REQUIRED"}\n'))
+        service = SystemCliService(config={"project_root": self.project_root}, runner=runner)
+
+        record = service.run("playbook.workspace_status", cwd=self.project_root)
+
+        self.assertFalse(record.success)
+        self.assertEqual(
+            runner.calls,
+            [(["playbook", "workspace", "task", "status", "--output", "json", "--full"], self.project_root)],
+        )
+        self.assertIn("WORKSPACE_ID_REQUIRED", record.stdout_excerpt)
 
     def test_rejects_unknown_command_without_running_process(self):
         runner = FakeRunner(CommandResult(["never"], self.project_root, 0))

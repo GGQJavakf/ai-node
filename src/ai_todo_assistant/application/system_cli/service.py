@@ -22,8 +22,8 @@ class SystemCliService:
     def __init__(self, config: dict | None = None, runner=None):
         self.config = config or {}
         self.runner = runner
-        self.stdout_limit = int(self.config.get("system_cli_stdout_limit") or 4000)
-        self.stderr_limit = int(self.config.get("system_cli_stderr_limit") or 2000)
+        self.stdout_limit = _configured_limit(self.config.get("system_cli_stdout_limit"))
+        self.stderr_limit = _configured_limit(self.config.get("system_cli_stderr_limit"))
 
     def list_commands(self) -> dict[str, CommandSpec]:
         return list_command_specs()
@@ -123,8 +123,10 @@ class SystemCliService:
         )
 
     def _record_from_result(self, spec: CommandSpec, cwd: str, result: CommandResult) -> CommandExecutionRecord:
-        stdout_excerpt, stdout_truncated = _safe_excerpt(result.stdout, self.stdout_limit or spec.stdout_limit)
-        stderr_excerpt, stderr_truncated = _safe_excerpt(result.stderr, self.stderr_limit or spec.stderr_limit)
+        stdout_limit = self.stdout_limit if self.stdout_limit is not None else spec.stdout_limit
+        stderr_limit = self.stderr_limit if self.stderr_limit is not None else spec.stderr_limit
+        stdout_excerpt, stdout_truncated = _safe_excerpt(result.stdout, stdout_limit)
+        stderr_excerpt, stderr_truncated = _safe_excerpt(result.stderr, stderr_limit)
         return CommandExecutionRecord(
             command_key=spec.key,
             argv=list(spec.argv),
@@ -139,6 +141,12 @@ class SystemCliService:
             risk_level=spec.risk_level,
             policy_decision=POLICY_ALLOWED,
         )
+
+
+def _configured_limit(value) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 def _safe_excerpt(text: str, limit: int) -> tuple[str, bool]:
