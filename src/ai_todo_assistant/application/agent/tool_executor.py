@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from ai_todo_assistant.application.ports import TodoRepository
-from ai_todo_assistant.application.system_cli import SystemCliService
+from ai_todo_assistant.application.system_cli import SystemCliService, record_system_cli_evidence
 from ai_todo_assistant.application.workflow import (
     CodexTaskReportService,
     ContinueService,
@@ -71,10 +71,22 @@ class ToolExecutor:
         except Exception as e:
             return f"[执行错误] {tool_name} 执行异常: {e}"
 
-    def _run_system_cli(self, command_key: str, cwd: str | None = None, reason: str = "") -> str:
+    def _run_system_cli(
+        self,
+        command_key: str,
+        cwd: str | None = None,
+        reason: str = "",
+        work_item_id: str | None = None,
+        record_evidence: bool = False,
+    ) -> str:
         service = SystemCliService(self.config, runner=self.system_cli_runner)
         record = service.run(command_key, cwd=cwd)
-        return service.format_for_tool(record)
+        lines = [service.format_for_tool(record)]
+        if record_evidence and work_item_id:
+            evidence_result = record_system_cli_evidence(self.workflow_repository, work_item_id, record)
+            action = "recorded" if evidence_result.created else "reused"
+            lines.append(f"Evidence {action}: {evidence_result.evidence.id}")
+        return "\n".join(lines)
 
     def _list_todos(self, filter: str = "all", time_range: str = "all", priority: str = "all") -> str:
         if time_range == "today":

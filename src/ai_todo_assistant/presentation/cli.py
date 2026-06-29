@@ -41,7 +41,7 @@ from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt
 
-from ai_todo_assistant.application.system_cli import SystemCliService
+from ai_todo_assistant.application.system_cli import SystemCliService, record_system_cli_evidence
 from ai_todo_assistant.infrastructure.connectors import CodexCliResumeClient
 from ai_todo_assistant.infrastructure.persistence import (
     JsonCodexResumeExclusionStore,
@@ -1105,11 +1105,17 @@ class TodoCLI:
         if subcmd == "policy":
             return service.format_policy()
         if subcmd == "run":
-            command_key, cwd = _parse_system_run_args(args)
+            command_key, cwd, work_item_id = _parse_system_run_args(args)
             if not command_key:
-                return "用法: /system run <key> [--cwd <path>]"
-            return service.format_for_tool(service.run(command_key, cwd=cwd))
-        return "用法: /system [list|policy|run <key> [--cwd <path>]]"
+                return "用法: /system run <key> [--cwd <path>] [--evidence <work-id>]"
+            record = service.run(command_key, cwd=cwd)
+            lines = [service.format_for_tool(record)]
+            if work_item_id:
+                evidence_result = record_system_cli_evidence(self._workflow_repo(), work_item_id, record)
+                action = "recorded" if evidence_result.created else "reused"
+                lines.append(f"Evidence {action}: {evidence_result.evidence.id}")
+            return "\n".join(lines)
+        return "用法: /system [list|policy|run <key> [--cwd <path>] [--evidence <work-id>]]"
 
     def _show_work_item(self, work_item_id):
         item = self._workflow_repo().get_work_item(work_item_id)
@@ -1275,8 +1281,8 @@ class TodoCLI:
                 "      查看只读系统 CLI catalog",
                 "  /system policy",
                 "      查看 read_only、shell 禁用和允许根目录策略",
-                "  /system run <key> [--cwd <path>]",
-                "      执行 catalog 中的只读命令，返回脱敏、截断后的摘要",
+                "  /system run <key> [--cwd <path>] [--evidence <work-id>]",
+                "      执行 catalog 中的只读命令，返回脱敏、截断后的摘要；可挂到 WorkItem Evidence",
                 "",
                 "  /history",
                 "  /exit 或 /quit",
@@ -1763,9 +1769,10 @@ def _parse_system_run_args(args):
     except ValueError:
         tokens = (args or "").split()
     if not tokens:
-        return "", None
+        return "", None, None
     command_key = tokens[0]
     cwd = None
+    work_item_id = None
     index = 1
     while index < len(tokens):
         token = tokens[index]
@@ -1773,8 +1780,12 @@ def _parse_system_run_args(args):
             cwd = tokens[index + 1].strip('"')
             index += 2
             continue
+        if token == "--evidence" and index + 1 < len(tokens):
+            work_item_id = tokens[index + 1].strip('"')
+            index += 2
+            continue
         index += 1
-    return command_key, cwd
+    return command_key, cwd, work_item_id
 
 
 def _parse_sync_options(subcmd, args):

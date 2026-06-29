@@ -242,6 +242,8 @@ class RunSystemCliArgs(ToolArgsModel):
     command_key: str = Field(min_length=1, description="只读系统 CLI catalog command key，例如 git.status")
     cwd: str | None = Field(default=None, description="工作目录，必须在允许根目录内")
     reason: str = Field(default="", description="调用原因，用于解释为什么读取该命令")
+    work_item_id: str | None = Field(default=None, description="可选 WorkItem ID；record_evidence=true 时必填")
+    record_evidence: bool = Field(default=False, description="是否把命令摘要写入 WorkItem Evidence")
 
     @field_validator("command_key")
     @classmethod
@@ -257,6 +259,17 @@ class RunSystemCliArgs(ToolArgsModel):
     @classmethod
     def strip_reason(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("work_item_id")
+    @classmethod
+    def validate_optional_work_item_id(cls, value: str | None) -> str | None:
+        return _strip_optional_text(value)
+
+    @model_validator(mode="after")
+    def require_work_item_for_evidence(self) -> "RunSystemCliArgs":
+        if self.record_evidence and not self.work_item_id:
+            raise ValueError("record_evidence=true 时必须提供 work_item_id")
+        return self
 
 
 class ReadCodexReportsArgs(ToolArgsModel):

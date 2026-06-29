@@ -44,7 +44,7 @@ TOOL_DESCRIPTIONS = {
     "summarize_work_evidence": "汇总 WorkItem 的证据，用于日报、closeout 或 MR/Redmine 草稿。",
     "run_system_cli": (
         "执行只读系统 CLI catalog 命令，例如 git.status。只能传 command_key，不能执行任意 shell；"
-        "命令输出会先脱敏、截断并摘要。"
+        "命令输出会先脱敏、截断并摘要；需要留痕时设置 record_evidence=true 并提供 work_item_id。"
     ),
     "read_codex_task_reports": "读取 Codex 每日任务 JSON/Markdown 报告，并可导入未完成/阻塞项为 WorkItem。",
     "generate_daily_workflow_review": "基于 WorkItem 与 Evidence 生成工作日复盘草稿。",

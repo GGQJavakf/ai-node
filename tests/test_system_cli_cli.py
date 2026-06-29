@@ -6,6 +6,8 @@ import _path  # noqa: F401
 from ai_todo_assistant.infrastructure.connectors import CommandResult
 from ai_todo_assistant.infrastructure.persistence import SQLiteWorkflowRepository
 from ai_todo_assistant.infrastructure.persistence.json_todo_repository import TodoManager
+from ai_todo_assistant.application.workflow import WorkItemService
+from ai_todo_assistant.domain.workflow import EvidenceType
 from ai_todo_assistant.presentation.cli import CommandCompleter, TodoCLI
 
 
@@ -51,6 +53,32 @@ class TestSystemCliCommand(unittest.TestCase):
 
         self.assertIn("[system_cli] git.status succeeded", response)
         self.assertIn(" M docs/a.md", response)
+
+    def test_system_run_can_record_compact_evidence(self):
+        item = WorkItemService(self.cli.workflow_repository).create_manual("验证系统 CLI 证据")
+
+        response = self.cli._handle_slash_command(f"/system run git.status --evidence {item.id}")
+        evidence = self.cli.workflow_repository.list_evidence(item.id)
+
+        self.assertIn("[system_cli] git.status succeeded", response)
+        self.assertIn("Evidence recorded", response)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].evidence_type, EvidenceType.COMMAND.value)
+        self.assertEqual(evidence[0].source, "system-cli")
+        self.assertEqual(evidence[0].command, "git status --short")
+        self.assertEqual(evidence[0].output_excerpt, " M docs/a.md")
+        self.assertTrue(evidence[0].success)
+
+    def test_system_run_reuses_duplicate_evidence(self):
+        item = WorkItemService(self.cli.workflow_repository).create_manual("避免重复证据")
+
+        first = self.cli._handle_slash_command(f"/system run git.status --evidence {item.id}")
+        second = self.cli._handle_slash_command(f"/system run git.status --evidence {item.id}")
+        evidence = self.cli.workflow_repository.list_evidence(item.id)
+
+        self.assertIn("Evidence recorded", first)
+        self.assertIn("Evidence reused", second)
+        self.assertEqual(len(evidence), 1)
 
     def test_system_run_rejects_unknown_command(self):
         response = self.cli._handle_slash_command("/system run git.push")
