@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -89,6 +90,19 @@ class TestWorkflowConnectors(unittest.TestCase):
         self.assertEqual(result.stdout, "中文输出")
         self.assertEqual(run.call_args.kwargs["encoding"], "utf-8")
         self.assertEqual(run.call_args.kwargs["errors"], "replace")
+
+    def test_command_runner_resolves_path_shims_without_changing_reported_args(self):
+        completed = Mock(returncode=0, stdout="{}", stderr="")
+
+        with (
+            patch("shutil.which", return_value="C:/tools/openspec.cmd") as which,
+            patch("subprocess.run", return_value=completed) as run,
+        ):
+            result = CommandRunner().run(["openspec", "list", "--json"], cwd="repo")
+
+        self.assertEqual(result.args, ["openspec", "list", "--json"])
+        which.assert_called_once_with("openspec", path=os.environ.get("PATH", ""))
+        self.assertEqual(run.call_args.args[0], ["C:/tools/openspec.cmd", "list", "--json"])
 
 
 if __name__ == "__main__":
