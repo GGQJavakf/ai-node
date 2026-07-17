@@ -4,6 +4,8 @@
 
 **Decision fingerprint:** `agentretro-mvp-design-decision-convergence:v1:sha256:b379d027f1111d9a6c31a58860617200e2f8a4bf905dc3ba5f0d4440be3c97b5`
 
+**Revision approval:** 2026-07-17; automatic same-command projection, sensitive purge, canonical global AGENTS target, managed project mappings, deterministic local brief ranking, and bounded performance all selected as option A.
+
 ## Problem
 
 The existing `ai-todo` product manages Todo and WorkItem workflows, but it does not turn completed Codex sessions into durable, evidence-backed knowledge. Users must repeatedly restate project context, prior decisions, known failure modes, and current task state. The MVP must add this retrospective capability without replacing or behaviorally coupling it to the existing product.
@@ -48,8 +50,10 @@ flowchart LR
     Capture --> Normalize[Normalize and redact]
     Normalize --> Extract[Candidate extraction]
     Extract --> Review[Independent review]
-    Review --> Store[retro.db]
-    Store --> Vault[Obsidian projection]
+    Review --> Store[Commit accepted knowledge to retro.db]
+    Store --> Preflight[Projection preflight]
+    Preflight -->|healthy| Vault[Same-command Obsidian projection]
+    Preflight -->|blocked or failed| Pending[sync_pending]
     Store --> Brief[retro brief]
     Brief --> Codex[Later Codex task]
 ```
@@ -66,11 +70,19 @@ retro review accept <candidate-id>
 retro review edit <candidate-id>
 retro review reject <candidate-id>
 retro review merge <conflict-id>
+retro review retry --candidate <candidate-id>
+retro review retry --session <session-id>
 
 retro kb list
 retro kb show <knowledge-id>
 retro kb archive <knowledge-id>
-retro kb delete <knowledge-id>
+retro kb purge plan <knowledge-id>
+retro kb purge apply <plan-id> --confirm-operation <operation-id>  # repeat for every operation
+
+retro project map --root <git-root> --vault-project <project-name>
+retro project list
+retro project remove <mapping-id>
+retro project reclassify <session-id> --mapping <mapping-id>
 
 retro brief "<current-task>" --project <project>
 retro sync status
@@ -92,10 +104,12 @@ Human output defaults to Simplified Chinese. `--json` uses stable English field 
 
 - database path;
 - Obsidian vault root;
-- Git-root and remote-to-project mappings;
 - review thresholds;
 - `brief` token budget;
-- backup directory.
+- backup directory;
+- discovery, session-size, model-request, and brief-render limits.
+
+Project mappings are audited domain state in SQLite, not mutable JSON configuration. Configuration defaults are: inspect at most the newest 1000 candidate session files within 10 seconds, reject a source session larger than 128 MiB, use the filtered existing model timeout or 120 seconds when absent, and stop local brief rendering after 5 seconds. Every limit is configurable, and a limit failure creates no partial capture or projection state.
 
 The read-only legacy configuration adapter exposes only `auth_mode`, `api_base`, `api_key`, `model`, timeout, and retry settings to the LLM client. It must never serialize, log, copy, or persist credential values. If model configuration is unavailable, capture, existing knowledge lookup, and `brief` remain usable while model-dependent candidates stay pending.
 
@@ -108,11 +122,13 @@ SQLite at `<user-home>/.agentretro/retro.db` is the authority for review state, 
 | `sessions` | Source session identity, hash, project, event cursor, and capture status |
 | `evidence` | Source locator, content hash, kind, and minimal redacted excerpt |
 | `candidates` | Type, proposed text, extraction confidence, review verdict, and reason |
+| `review_attempts` | Candidate or session review request hash, attempt result, and failure reason |
 | `knowledge` | Accepted text, version, scope, status, validity, and acceptance actor |
 | `knowledge_evidence` | Many-to-many knowledge-to-evidence links |
 | `conflicts` | Active and proposed item pair, reason, merge proposal, and resolution state |
 | `sync_jobs` | Target files, pre/post hashes, retries, rollback, and error state |
 | `project_mappings` | Git root and remote identity to Obsidian project mapping |
+| `purge_jobs` | Sensitive-content locations, exact operation IDs, results, and incomplete cleanup state |
 | `audit_log` | Immutable lifecycle actions with actor and before/after hashes |
 
 The lifecycle is:
@@ -123,7 +139,7 @@ captured
 -> pending_review
 -> auto_accepted / accepted / edited / rejected
 -> synced / sync_pending
--> archived / deleted
+-> archived / purge_pending / purged / purge_incomplete
 ```
 
 Database schema changes use versioned migrations. Before migration, AgentRetro creates a database backup. Migration failure restores the backup and aborts startup.
@@ -133,12 +149,19 @@ Database schema changes use versioned migrations. Before migration, AgentRetro c
 - `--last` selects the newest completed session, never an active session.
 - `--session` captures one explicit session ID.
 - Session discovery uses the real local Codex home, not the existing product's isolated Codex runtime directory.
+- Discovery sorts candidate files by completion metadata or file modification time, streams JSONL line by line, and enforces the configured file-count, deadline, and source-size limits.
 - Session ID, event locator, and content hash make capture idempotent.
 - Unknown event kinds are ignored and recorded; missing required identity fields make the session unsupported rather than guessed.
 - Project routing uses Git root, normalized remote identity, and a local mapping table. Ambiguous or unknown projects remain pending and cannot auto-accept or synchronize.
 - Raw session files are not copied. Evidence contains only a source reference, content hash, and the smallest redacted excerpt necessary to support a claim.
 
 All session and vault content is treated as untrusted data. Instructions found inside captured content cannot cause command execution, file writes, or tool calls.
+
+### Project Mapping Lifecycle
+
+`retro project map` resolves the supplied Git root, normalizes its remote identity, validates the configured Obsidian vault and project target, then stores one audited mapping. Duplicate roots with incompatible remotes, duplicate remote identities with incompatible vault targets, path traversal, and symlink escape are rejected.
+
+`list` shows mapping ID, resolved root, normalized remote, and vault project without credentials. `remove` disables future routing and projection but does not delete knowledge or vault content. `reclassify` attaches an awaiting session to an existing mapping and resumes candidate review from stored evidence without recapturing the source. Remote or worktree changes that produce more than one possible mapping remain blocked until the user reclassifies them.
 
 ## Knowledge Semantics
 
@@ -183,6 +206,8 @@ Any of the following blocks automatic acceptance regardless of confidence:
 
 When knowledge conflicts, the old item remains active. The new item stays pending with a merge proposal and is excluded from `brief` until resolved.
 
+Model failure leaves candidates pending. `retro review retry` creates a new audited review attempt for one candidate or every pending candidate from one captured session. It reuses the stored redacted candidate and evidence, never repeats extraction, and uses candidate ID plus review-input hash for idempotency. A failed retry stays retryable; a successful retry proceeds through the same thresholds and deterministic gates as the original attempt.
+
 ## Redaction
 
 Redaction runs before model input and again before database or vault persistence. It covers API keys, tokens, cookies, authorization headers, passwords, private keys, and common connection credentials. Logs must not contain raw prompts, complete model responses, credential values, or complete session excerpts.
@@ -215,6 +240,12 @@ Managed summary boundaries are explicit:
 ```
 
 Text outside managed markers must remain byte-for-byte unchanged during automatic synchronization.
+
+### Automatic Projection Trigger
+
+Any committed transition that changes project-scoped projection content—automatic acceptance, manual acceptance or edit, reviewed vault adoption, conflict resolution, archive, or completed purge—creates one deterministic projection event. The command commits SQLite first, then synchronously attempts one batched projection for the affected project.
+
+Projection runs only when project mapping, vault containment, managed markers, target hashes, and rollback state pass preflight. A blocked or failed attempt leaves SQLite knowledge active, records `sync_pending` with a stable reason, and returns a warning plus `retro sync retry`; it never reports the vault as current. Repeating the same event or retry must produce identical bytes and no duplicate log entry. This trigger never authorizes deep merge outside managed boundaries.
 
 ## Managed Merge
 
@@ -251,28 +282,38 @@ Every synchronization run:
 8. restores every pre-write file if any step fails;
 9. enters `rollback_required` and stops all later synchronization if restoration fails.
 
-MVP does not automatically delete backups.
+MVP does not automatically delete ordinary migration, synchronization, or merge backups. Sensitive purge is the only exception and supersedes ordinary retention for locations that contain the purged content.
+
+### Sensitive Purge
+
+Ordinary removal remains archive-only. `retro kb purge plan` searches every AgentRetro-owned copy that provenance can identify: active and historical SQLite text/excerpts, audit detail, managed Obsidian content, AgentRetro logs and model traces, and database, synchronization, or merge backups. The immutable plan lists every location and assigns an exact operation ID.
+
+`purge apply` requires confirmation for every operation and uses the journaled write protocol for filesystem changes. It retains only a tombstone containing entity identity, timestamps, actor, operation status, and non-reversible metadata; it cannot retain source text, summaries, excerpts, or a reversible content hash. If any known location cannot be cleaned or verified, the job becomes `purge_incomplete`, later automatic projection is blocked for that item, and the command cannot report success. Copies outside AgentRetro provenance are reported as an explicit residual-risk warning rather than claimed as deleted.
 
 ## Codex Integration
 
-`retro brief "<task>"` selects, in order:
+`retro brief "<task>"` first filters to active, eligible project and explicitly promoted global knowledge, then selects in order:
 
 1. active project `RULE` items;
-2. relevant `LESSON` items;
+2. explicitly promoted global `RULE` items;
 3. current, non-expired `TASK_STATE` items;
-4. explicitly promoted global knowledge;
+4. relevant `LESSON` items;
 5. warnings about conflicts, stale state, or synchronization failure.
 
-Default output is capped at approximately 6000 tokens and contains evidence references.
+Lesson relevance is deterministic and local: normalize task and knowledge text with Unicode NFKC and case folding, tokenize CJK characters and Latin alphanumeric terms, score fixed keyword overlap, recency, and evidence quality weights, then use stable knowledge ID as the final tie-break. It does not call a model or vector database. Token usage is conservatively estimated as `ceil(UTF-8 byte length / 3)`. Items are never truncated. Omitted items are listed by ID and reason; if eligible rules alone exceed the budget, brief generation fails with a request to increase the configured budget rather than silently dropping a rule. Default output is capped at approximately 6000 estimated tokens, contains evidence references, and must render within the configured local deadline.
 
-`retro integrate codex` previews a managed-block diff for `<codex-home>/AGENTS.md`. Only `--apply` writes it. Integration must:
+`retro integrate codex` resolves exactly `<effective-codex-home>/AGENTS.md` and previews its managed-block diff. It never targets `AGENTS.override.md`. Only `--apply` writes the canonical file. Integration must:
 
 - back up the target and verify the pre-write hash;
 - add or update one uniquely marked block;
 - preserve all text outside that block byte-for-byte;
 - stop if the managed block was edited manually;
 - support `--remove`, which removes only the managed block;
-- read back and verify after apply or remove.
+- reject path traversal or symlink escape from the effective Codex home;
+- preserve the existing encoding and newline convention;
+- create a missing canonical file only after its creation appears in preview;
+- refuse apply or removal while `<effective-codex-home>/AGENTS.override.md` exists, because effective precedence is ambiguous;
+- read back and verify after apply or remove, then run a non-writing smoke that confirms the managed block is discoverable from the effective Codex home.
 
 The installed guidance asks Codex to run `retro brief` only for tasks that depend on project history, user preferences, prior decisions, or current task state. It must not scan the entire vault for every task. AgentRetro never edits native Codex memory files or memory settings.
 
@@ -282,11 +323,16 @@ The installed guidance asks Codex to run `retro brief` only for tasks that depen
 |---|---|
 | Session parse failure | Record the run; create no incomplete knowledge |
 | Model unavailable | Keep the candidate pending and retryable |
+| Review retry fails | Record the attempt and keep the candidate pending without repeating extraction |
+| Project mapping unknown or ambiguous | Keep the session awaiting classification and expose map/reclassify actions |
 | Database migration failure | Restore the database backup and abort |
 | Obsidian sync failure | Keep accepted knowledge and mark `sync_pending` |
 | External vault edit | Stop and create `external_edit_conflict` |
 | Stale merge plan | Refuse apply and require regeneration |
 | Global guidance hash mismatch | Refuse integration and preserve the file |
+| `AGENTS.override.md` exists | Report precedence conflict and refuse global integration writes |
+| Sensitive purge cannot clean a known copy | Mark `purge_incomplete`, block success, and report the remaining location |
+| Discovery, source-size, model, or brief limit reached | Stop with a stable diagnostic and create no partial state |
 
 ## Security and Privacy
 
@@ -294,7 +340,7 @@ The installed guidance asks Codex to run `retro brief` only for tasks that depen
 - Path traversal, unexpected symlink escape, and out-of-scope paths are rejected.
 - No captured text can authorize commands or writes.
 - Ordinary deletion is an archive operation.
-- Sensitive hard deletion requires explicit confirmation, removes persisted excerpts and vault content, and leaves a content-free audit tombstone.
+- Sensitive purge requires an immutable impact plan and exact per-operation confirmation, removes every verifiable AgentRetro-owned copy including affected backups, and leaves a content-free audit tombstone.
 - Automated tests use temporary Codex and Obsidian directories and never modify real user state.
 
 ## Compatibility
@@ -315,6 +361,14 @@ The installed guidance asks Codex to run `retro brief` only for tasks that depen
 - Injected multi-file write failure restores every target to its exact pre-write hash.
 - No deep merge writes before explicit apply; a changed input hash blocks apply.
 - Codex integration defaults to preview and never changes text outside its managed block.
+- Accepted projection-changing transitions attempt one same-command synchronization; preflight or write failure produces `sync_pending` without losing accepted SQLite knowledge.
+- Project mappings can be added, inspected, removed, and used to reclassify an awaiting session without recapture.
+- Review retry does not duplicate candidates or evidence and remains retryable after a model failure.
+- Identical task and knowledge inputs produce byte-identical briefs and stable omission lists.
+- Sensitive purge cannot report success while a known AgentRetro-owned copy remains.
+- Codex integration targets only the canonical effective-home `AGENTS.md` and refuses writes when an override file exists.
+- Every OpenSpec scenario has a stable ID and at least one mapped test or acceptance task.
+- Discovery, session parsing, model calls, and brief rendering enforce configured limits with diagnostic failures.
 - A temporary Codex session and temporary Obsidian vault complete capture, review, sync, and brief end to end.
 - `retro --help`, capture, review, and brief render successfully in Windows GBK and UTF-8 environments.
 - The complete existing `ai-todo` test suite passes and the existing database remains unchanged.
@@ -322,9 +376,9 @@ The installed guidance asks Codex to run `retro brief` only for tasks that depen
 ## Delivery Sequence
 
 1. Independent package, configuration, SQLite migrations, and Unicode-safe CLI.
-2. Codex parser, normalization, evidence, redaction, and project routing.
-3. Two-pass extraction and review, lifecycle, conflicts, and knowledge management.
-4. Three-file Obsidian projection, managed summaries, transaction journal, and rollback.
+2. Codex parser, normalization, evidence, redaction, bounded discovery, and managed project routing.
+3. Two-pass extraction and review, retry, lifecycle, conflicts, knowledge management, and sensitive purge.
+4. Three-file same-command Obsidian projection, managed summaries, transaction journal, retry, and rollback.
 5. Merge planning, explicit apply, and external-edit reconciliation.
-6. `retro brief`, doctor checks, and previewed Codex integration.
-7. Full regression, temporary-vault integration, failure injection, and Windows smoke verification.
+6. Deterministic `retro brief`, doctor checks, and canonical global AGENTS integration.
+7. Scenario-mapped regression, temporary-vault integration, failure injection, performance limits, and Windows smoke verification.
