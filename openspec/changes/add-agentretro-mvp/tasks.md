@@ -1,0 +1,57 @@
+## 1. Independent Product Foundation
+
+- [ ] 1.1 Add failing tests and then the minimal `agent_retro` package plus `retro` console entry point, proving `ai-todo` remains independently importable and runnable.
+- [ ] 1.2 Define AgentRetro configuration loading under `<user-home>/.agentretro/` with path containment, defaults, environment overrides, and isolated test directories.
+- [ ] 1.3 Implement the SQLite schema, repositories, versioned migrations, pre-migration backup, migration rollback, and lifecycle audit records with migration failure tests.
+- [ ] 1.4 Implement the read-only legacy model configuration adapter and tests proving credentials are never serialized, logged, or persisted.
+- [ ] 1.5 Add stable Chinese human output, stable English `--json` envelopes, and Unicode-safe Windows console rendering for AgentRetro commands.
+
+## 2. Codex Session Capture and Evidence
+
+- [ ] 2.1 Add representative completed, active, malformed, changed-hash, and unknown-event Codex session fixtures without real credentials or user data.
+- [ ] 2.2 Implement effective Codex-home discovery and explicit `--last` / `--session` selection, including active-session and unavailable-source failures.
+- [ ] 2.3 Implement the versioned Codex session adapter and normalized session/event models with fail-closed required-field validation.
+- [ ] 2.4 Implement session, event, and content-hash idempotency plus source-integrity conflict detection, with duplicate-capture tests.
+- [ ] 2.5 Implement Git-root and normalized-remote project routing plus explicit mapping persistence, including unknown and ambiguous project states.
+- [ ] 2.6 Implement pre-model and pre-persistence redaction, minimal evidence excerpts, source locators, and tests proving captured instructions cannot trigger actions.
+- [ ] 2.7 Wire `retro capture` to one database transaction so parser or evidence failure creates no partial session, candidate, or knowledge state.
+
+## 3. Knowledge Extraction, Review, and Lifecycle
+
+- [ ] 3.1 Define `RULE`, `LESSON`, and `TASK_STATE` models, type-specific evidence validators, project/global scope, versioning, status transitions, and 14-day task-state expiry.
+- [ ] 3.2 Implement a strict structured extraction request and response parser that produces evidence-bound candidates without accepting them.
+- [ ] 3.3 Implement the separate structured review request and response parser for verdict, confidence, reason, normalized text, duplicate assessment, and conflict assessment.
+- [ ] 3.4 Implement type thresholds and deterministic hard gates for secrets, evidence, project identity, duplicates, conflicts, speculation, rule authority, and lesson verification.
+- [ ] 3.5 Implement automatic acceptance with complete gate and actor audit records, and keep below-threshold or unavailable-model candidates pending.
+- [ ] 3.6 Implement `retro review` list/show/accept/edit/reject commands with evidence display, before/after hashes, and stable JSON output.
+- [ ] 3.7 Implement conflict detection, old-item-active behavior, merge suggestions, explicit merge resolution, and superseded-version history.
+- [ ] 3.8 Implement project-to-global promotion, stale task-state handling, archive, and explicitly confirmed sensitive hard deletion with a content-free tombstone.
+
+## 4. Obsidian Projection and Recovery
+
+- [ ] 4.1 Implement deterministic rendering and parsing for `规则.md`, `经验.md`, and `任务状态.md`, including stable item IDs and archived sections.
+- [ ] 4.2 Implement managed project-summary and index-link markers plus append-only log records, proving automatic sync preserves bytes outside managed regions.
+- [ ] 4.3 Implement vault-root containment, unexpected symlink rejection, marker validation, and mapped-project preflight checks.
+- [ ] 4.4 Implement sync planning, pre-write hashes, all-target backups, SQLite journals, same-directory temporary files, replacement, and post-write readback.
+- [ ] 4.5 Add multi-file failure-injection tests that prove all targets restore to exact pre-write hashes and restoration failure blocks future sync with `rollback_required`.
+- [ ] 4.6 Implement `sync_pending`, `retro sync status`, and retry behavior so accepted SQLite knowledge survives an unavailable vault.
+- [ ] 4.7 Implement external managed-content hash detection and `retro sync reconcile` choices without silent bidirectional overwrite.
+- [ ] 4.8 Implement preview-only semantic merge planning with target hashes, complete diffs, conflicts, and destructive-operation disclosure.
+- [ ] 4.9 Implement explicit merge apply through the journaled write protocol, rejecting stale plans and requiring exact confirmation for delete, rename, move, or unresolved conflict.
+
+## 5. Briefing, Diagnostics, and Codex Integration
+
+- [ ] 5.1 Implement `retro brief` selection for active rules, relevant lessons, current task state, and explicit global knowledge while excluding invalid lifecycle states.
+- [ ] 5.2 Implement the configurable 6000-token default budget, omission notice, evidence references, sync warnings, and terminal/Markdown/JSON formats.
+- [ ] 5.3 Implement `retro doctor` checks for source access, database/migrations, redacted model readiness, vault safety, backups, sync recovery, Codex integration, and console encoding.
+- [ ] 5.4 Implement preview-only `retro integrate codex` with one managed block, target hash, diff, and backup location.
+- [ ] 5.5 Implement explicit Codex integration apply and remove with readback, byte-preservation outside the block, manual-edit detection, and no native-memory modification.
+- [ ] 5.6 Verify the managed guidance triggers task-scoped `retro brief` only for work that depends on retained context and never requires an unconditional vault scan.
+
+## 6. End-to-End and Regression Verification
+
+- [ ] 6.1 Add a temporary Codex-home and temporary Obsidian-vault integration test covering capture, extraction, review, acceptance, synchronization, and briefing.
+- [ ] 6.2 Add security fixtures and repository-wide output assertions proving test secrets never reach logs, SQLite, model traces, backups, or vault files.
+- [ ] 6.3 Add Windows GBK and UTF-8 subprocess smoke tests for `retro --help`, capture, review, and brief, and isolate any legacy output compatibility patch from business behavior.
+- [ ] 6.4 Run the complete existing `ai-todo` suite and verify AgentRetro tests do not modify the existing Todo database or configuration behavior.
+- [ ] 6.5 Run `openspec validate add-agentretro-mvp --strict`, full tests, CLI smoke checks, and a final scope/security self-review before declaring implementation complete.
