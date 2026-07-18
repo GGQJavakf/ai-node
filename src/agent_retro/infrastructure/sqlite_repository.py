@@ -29,6 +29,8 @@ from agent_retro.domain.models import (
     NormalizedSession,
     ProjectMapping,
     Reclassification,
+    ManagedFileState,
+    ProjectionEvent,
     ProjectionStatus,
     PurgePlan,
     PurgeStatus,
@@ -1041,6 +1043,25 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def list_project_knowledge(self, project_id: str) -> list[Knowledge]:
+        """Return the latest project-scoped active and archived projection rows."""
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT item.* FROM knowledge AS item
+                JOIN (
+                    SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
+                ) AS latest ON latest.id = item.id AND latest.version = item.version
+                WHERE item.project_id = ? AND item.scope = 'project'
+                  AND item.status IN ('active', 'archived')
+                ORDER BY item.id""",
+                (project_id,),
+            ).fetchall()
+            return [self._knowledge_from_row(connection, row) for row in rows]
+        finally:
+            connection.close()
+
     def _knowledge_from_row(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> Knowledge:
@@ -1401,7 +1422,13 @@ class SQLiteRetroRepository(RetroRepository):
                 """INSERT INTO sync_jobs(
                     id, project_id, status, plan_json, backup_path, error,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    plan_json = excluded.plan_json,
+                    backup_path = excluded.backup_path,
+                    error = excluded.error,
+                    updated_at = excluded.updated_at""",
                 (
                     job.id,
                     job.project_id,
@@ -1442,6 +1469,17 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"status": status, "has_error": bool(error)},
                 ),
             )
+
+    def has_rollback_required_sync(self) -> bool:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM sync_jobs WHERE status = ? LIMIT 1",
+                (ProjectionStatus.ROLLBACK_REQUIRED.value,),
+            ).fetchone()
+            return row is not None
+        finally:
+            connection.close()
 
     def save_project_mapping(self, mapping: ProjectMapping, actor: str) -> None:
         with self.transaction() as connection:
@@ -1804,6 +1842,58 @@ class SQLiteRetroRepository(RetroRepository):
             )
         return stored_id
 
+    def get_projection_event(self, event_id: str) -> ProjectionEvent | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM projection_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return ProjectionEvent(
+                id=str(row["id"]),
+                project_id=str(row["project_id"]),
+                cause=str(row["cause"]),
+                cause_entity_id=str(row["cause_entity_id"]),
+                input_hash=str(row["input_hash"]),
+                status=ProjectionStatus(str(row["status"])),
+                error=str(row["error"]),
+            )
+        finally:
+            connection.close()
+
+    def finish_projection_event(
+        self, event_id: str, status: ProjectionStatus, error: str = ""
+    ) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE projection_events SET status = ?, error = ?, updated_at = ?
+                WHERE id = ?""",
+                (status.value, error, _now_text(), event_id),
+            )
+            _require_row(cursor, "projection event", event_id)
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    action="projection_event_finished",
+                    entity_type="projection_event",
+                    entity_id=event_id,
+                    after_hash=_hash_value({"status": status.value, "error": error}),
+                    detail={"status": status.value, "has_error": bool(error)},
+                ),
+            )
+
+    def projection_event_count(self, project_id: str) -> int:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM projection_events WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            return int(row[0])
+        finally:
+            connection.close()
+
     def save_managed_file_state(
         self,
         project_id: str,
@@ -1833,6 +1923,23 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"project_id": project_id, "managed_hash": managed_hash},
                 ),
             )
+
+    def get_managed_file_state(self, path: Path) -> ManagedFileState | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM managed_file_state WHERE path = ?", (str(path),)
+            ).fetchone()
+            if row is None:
+                return None
+            return ManagedFileState(
+                project_id=str(row["project_id"]),
+                path=Path(row["path"]),
+                managed_hash=str(row["managed_hash"]),
+                full_hash=str(row["full_hash"]),
+            )
+        finally:
+            connection.close()
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None:
         with self.transaction() as connection:

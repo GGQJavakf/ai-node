@@ -18,6 +18,9 @@ from agent_retro.domain.models import (
     KnowledgeType,
     NormalizedSession,
     ProjectMapping,
+    ProjectionEvent,
+    ProjectionStatus,
+    ManagedFileState,
     Reclassification,
     PurgePlan,
     PurgeStatus,
@@ -118,6 +121,8 @@ class RetroRepository(Protocol):
         self, project_id: str, at: datetime
     ) -> list[Knowledge]: ...
 
+    def list_project_knowledge(self, project_id: str) -> list[Knowledge]: ...
+
     def save_conflict(self, conflict: KnowledgeConflict) -> None: ...
 
     def create_conflict(self, conflict: KnowledgeConflict) -> KnowledgeConflict: ...
@@ -137,6 +142,8 @@ class RetroRepository(Protocol):
     def begin_sync(self, job: SyncJob) -> None: ...
 
     def finish_sync(self, job_id: str, status: str, error: str = "") -> None: ...
+
+    def has_rollback_required_sync(self) -> bool: ...
 
     def save_project_mapping(self, mapping: ProjectMapping, actor: str) -> None: ...
 
@@ -170,6 +177,14 @@ class RetroRepository(Protocol):
         input_hash: str,
     ) -> str: ...
 
+    def get_projection_event(self, event_id: str) -> ProjectionEvent | None: ...
+
+    def finish_projection_event(
+        self, event_id: str, status: ProjectionStatus, error: str = ""
+    ) -> None: ...
+
+    def projection_event_count(self, project_id: str) -> int: ...
+
     def save_managed_file_state(
         self,
         project_id: str,
@@ -177,6 +192,8 @@ class RetroRepository(Protocol):
         managed_hash: str,
         full_hash: str,
     ) -> None: ...
+
+    def get_managed_file_state(self, path: Path) -> ManagedFileState | None: ...
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 

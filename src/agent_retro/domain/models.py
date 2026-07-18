@@ -175,6 +175,25 @@ class SyncJob:
 
 
 @dataclass(frozen=True)
+class ProjectionEvent:
+    id: str
+    project_id: str
+    cause: str
+    cause_entity_id: str
+    input_hash: str
+    status: ProjectionStatus
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ManagedFileState:
+    project_id: str
+    path: Path
+    managed_hash: str
+    full_hash: str
+
+
+@dataclass(frozen=True)
 class ProjectMapping:
     id: str
     git_root: Path
