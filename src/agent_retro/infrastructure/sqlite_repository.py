@@ -1381,6 +1381,31 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def list_brief_knowledge(self, project_id: str, at: datetime) -> list[Knowledge]:
+        """Return latest accepted rows relevant to a project or global scope.
+
+        Expired, stale, and archived rows remain visible to the application so
+        it can disclose deterministic omission reasons without consulting
+        candidate/model state.
+        """
+
+        del at
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT item.* FROM knowledge AS item
+                JOIN (
+                    SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
+                ) AS latest ON latest.id = item.id AND latest.version = item.version
+                WHERE item.project_id = ?
+                   OR (item.scope = 'global' AND item.knowledge_type = 'RULE')
+                ORDER BY item.id""",
+                (project_id,),
+            ).fetchall()
+            return [self._knowledge_from_row(connection, row) for row in rows]
+        finally:
+            connection.close()
+
     def list_project_knowledge(self, project_id: str) -> list[Knowledge]:
         """Return the latest project-scoped active and archived projection rows."""
 
@@ -1628,6 +1653,20 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def list_open_conflicts(self, project_id: str) -> list[KnowledgeConflict]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT conflicts.* FROM conflicts
+                JOIN candidates ON candidates.id = conflicts.candidate_id
+                WHERE candidates.project_id = ? AND conflicts.status != 'resolved'
+                ORDER BY conflicts.id""",
+                (project_id,),
+            ).fetchall()
+            return [_conflict_from_row(row) for row in rows]
+        finally:
+            connection.close()
+
     def resolve_conflict(self, conflict_id: str, text: str, actor: str) -> Knowledge:
         if actor != "user":
             raise ValueError("conflict resolution actor must be user")
@@ -1838,6 +1877,17 @@ class SQLiteRetroRepository(RetroRepository):
             row = connection.execute(
                 "SELECT 1 FROM sync_jobs WHERE status = ? LIMIT 1",
                 (ProjectionStatus.ROLLBACK_REQUIRED.value,),
+            ).fetchone()
+            return row is not None
+        finally:
+            connection.close()
+
+    def has_purge_incomplete(self) -> bool:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM purge_jobs WHERE status = ? LIMIT 1",
+                (PurgeStatus.PURGE_INCOMPLETE.value,),
             ).fetchone()
             return row is not None
         finally:
