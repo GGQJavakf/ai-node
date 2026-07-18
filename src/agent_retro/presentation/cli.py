@@ -194,7 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="confirmed_operations",
     )
 
-    knowledge = commands.add_parser("knowledge", help="管理已接受知识")
+    knowledge = commands.add_parser("kb", aliases=["knowledge"], help="管理已接受知识")
     knowledge_commands = knowledge.add_subparsers(
         dest="knowledge_command", required=True
     )
@@ -327,7 +327,7 @@ def main(
                 exc,
                 "recovery_command",
                 (
-                    "retro knowledge purge <id> --plan"
+                    "retro kb purge <id> --plan"
                     if isinstance(
                         exc,
                         (
@@ -339,7 +339,7 @@ def main(
                             UnknownPurgePlan,
                         ),
                     )
-                    else "retro knowledge purge <id> --recover"
+                    else "retro kb purge <id> --recover"
                 ),
             )
             data = {"recovery_command": recovery_command}
@@ -542,7 +542,7 @@ def _run_command(
         return 0
 
     coordinator = build_projection_coordinator(settings, repository)
-    if args.command == "knowledge":
+    if args.command in {"kb", "knowledge"}:
         return _run_purge_command(
             args,
             build_purge_service(

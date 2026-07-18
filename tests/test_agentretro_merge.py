@@ -1999,7 +1999,12 @@ def test_repeated_apply_is_idempotent(tmp_path: Path) -> None:
     assert first.status == "synced"
     assert second.status == "already_applied"
     assert target.read_bytes() == b"after"
-    assert repository.get_sync_job(plan.id).status == "synced"
+    readback = SQLiteRetroRepository(repository.db_path, tmp_path / "backups")
+    assert readback.get_sync_job(plan.id).status == "synced"
+    assert any(
+        path.is_file() and path.read_bytes() == b"before"
+        for path in (tmp_path / "backups").rglob("*")
+    )
 
 
 def test_partial_merge_write_failure_rolls_back_every_target(tmp_path: Path) -> None:

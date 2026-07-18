@@ -57,14 +57,10 @@ def load_retro_settings(
     settings = RetroSettings(
         state_dir=state_dir,
         db_path=Path(values.get("AGENTRETRO_DB_PATH", state_dir / "retro.db")),
-        backup_dir=Path(
-            values.get("AGENTRETRO_BACKUP_DIR", state_dir / "backups")
-        ),
+        backup_dir=Path(values.get("AGENTRETRO_BACKUP_DIR", state_dir / "backups")),
         obsidian_root=Path(obsidian_value) if obsidian_value else None,
         brief_max_tokens=_read_int(values, "AGENTRETRO_BRIEF_MAX_TOKENS", 6000),
-        discovery_max_files=_read_int(
-            values, "AGENTRETRO_DISCOVERY_MAX_FILES", 1000
-        ),
+        discovery_max_files=_read_int(values, "AGENTRETRO_DISCOVERY_MAX_FILES", 1000),
         discovery_timeout_seconds=_read_float(
             values, "AGENTRETRO_DISCOVERY_TIMEOUT_SECONDS", 10.0
         ),

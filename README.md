@@ -58,8 +58,8 @@ timeout；凭据、token 和完整原始配置不会写入 AgentRetro。`retro b
 | `retro review list/show/accept/edit/reject` | 查看证据并人工决定知识生命周期 |
 | `retro sync conflicts/reconcile/retry` | 检查、处理或恢复 Obsidian 投影 |
 | `retro merge plan/apply` | 预览受控深度整理，并仅应用当前且已精确确认的计划 |
-| `retro knowledge purge <id> --plan` | 零写入列出敏感清除的全部已知副本与操作 ID |
-| `retro knowledge purge <id> --apply-plan ...` | 仅在逐项确认当前计划的全部操作 ID 后清除并验证残留 |
+| `retro kb purge <id> --plan` | 零写入列出敏感清除的全部已知副本与操作 ID |
+| `retro kb purge <id> --apply-plan ...` | 仅在逐项确认当前计划的全部操作 ID 后清除并验证残留 |
 | `retro brief <task> --project <id>` | 按任务与项目生成有证据引用的本地摘要 |
 | `retro doctor` | 只读检查数据库、路径、恢复和编码状态 |
 | `retro integrate codex` | 零写入预览 canonical `<codex-home>/AGENTS.md` 变更 |
@@ -74,6 +74,7 @@ timeout；凭据、token 和完整原始配置不会写入 AgentRetro。`retro b
 写入用户自有正文的深度整理必须先预览，再显式应用当前计划；删除、重命名、
 移动和冲突必须逐个确认其精确操作 ID。敏感清除同样先生成零写入不可变计划，
 只有确认该计划的每个操作 ID 后才执行，并在残留验证通过前绝不报告成功。
+`kb` 是知识命令的 canonical 名称；`knowledge` 作为兼容别名保留，两者使用同一解析器和执行路径。
 全局 Codex 指引始终默认预览，只有显式 `--apply` 或 `--remove` 才修改 canonical
 `<codex-home>/AGENTS.md` 的唯一托管块。
 

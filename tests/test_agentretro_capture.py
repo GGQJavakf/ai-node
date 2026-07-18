@@ -16,6 +16,7 @@ import pytest
 import _path  # noqa: F401
 from agent_retro.application.capture import CaptureService, SourceIntegrityError
 from agent_retro.application.ports import RetroRepository
+from agent_retro.domain.models import ProjectMapping
 from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     IncompleteSessionError,
@@ -797,6 +798,34 @@ def test_project_resolver_uses_root_then_unique_remote(tmp_path):
     assert exact.mapping_id == mapping.id
     assert clone.mapping_id == mapping.id
     assert unknown.status == "unknown"
+
+
+def test_project_resolver_reports_ambiguous_when_remote_matches_distinct_projects(
+    tmp_path,
+):
+    remote = "example.invalid/Owner/Repo"
+    resolver = ProjectResolver(
+        [
+            ProjectMapping(
+                id="mapping-a",
+                git_root=tmp_path / "first",
+                remote_identity=remote,
+                obsidian_project="Projects/First",
+            ),
+            ProjectMapping(
+                id="mapping-b",
+                git_root=tmp_path / "second",
+                remote_identity=remote,
+                obsidian_project="Projects/Second",
+            ),
+        ]
+    )
+
+    result = resolver.resolve(tmp_path / "third-clone", remote)
+
+    assert result.status == "ambiguous"
+    assert not result.mapping_id
+    assert not result.project_id
 
 
 def test_project_mapping_lifecycle_is_sqlite_backed_and_sanitized(tmp_path):

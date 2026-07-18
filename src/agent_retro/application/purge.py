@@ -63,7 +63,7 @@ class PurgeBlockedError(PurgeError):
     def __init__(self, status: str) -> None:
         super().__init__(status)
         self.status = status
-        self.recovery_command = "retro knowledge purge <id> --recover"
+        self.recovery_command = "retro kb purge <id> --recover"
 
 
 class PurgeRecoveryNotFound(PurgeError):

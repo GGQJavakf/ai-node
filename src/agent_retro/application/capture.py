@@ -79,8 +79,7 @@ class CaptureService:
         )
         if conflicting is not None:
             raise SourceIntegrityError(
-                "Codex 会话源哈希发生冲突: "
-                f"{source_session.source_session_id}"
+                f"Codex 会话源哈希发生冲突: {source_session.source_session_id}"
             )
 
         resolution = self._resolve_project(source_session.project_id)
@@ -118,9 +117,7 @@ class CaptureService:
             root, remote = path, ""
         return self.project_resolver.resolve(root, remote)
 
-    def _redacted_session(
-        self, session: NormalizedSession
-    ) -> NormalizedSession:
+    def _redacted_session(self, session: NormalizedSession) -> NormalizedSession:
         return replace(
             session,
             events=tuple(
@@ -129,18 +126,19 @@ class CaptureService:
             ),
         )
 
-    def _minimal_evidence(
-        self, session: NormalizedSession
-    ) -> tuple[Evidence, ...]:
+    def _minimal_evidence(self, session: NormalizedSession) -> tuple[Evidence, ...]:
         items: list[Evidence] = []
         for event in session.events:
             excerpt = _excerpt(event.content, self.evidence_excerpt_chars)
-            evidence_id = "evidence-" + hashlib.sha256(
-                (
-                    f"{session.source_session_id}:{event.id}:"
-                    f"{event.locator.content_hash}"
-                ).encode("utf-8")
-            ).hexdigest()[:24]
+            evidence_id = (
+                "evidence-"
+                + hashlib.sha256(
+                    (
+                        f"{session.source_session_id}:{event.id}:"
+                        f"{event.locator.content_hash}"
+                    ).encode("utf-8")
+                ).hexdigest()[:24]
+            )
             items.append(
                 Evidence(
                     id=evidence_id,
@@ -167,9 +165,7 @@ class CaptureService:
         events: list[NormalizedEvent] = []
         for event in session.events:
             value = excerpts[event.locator.event_id]
-            events.append(
-                replace(event, content=self.redactor.redact(value))
-            )
+            events.append(replace(event, content=self.redactor.redact(value)))
         return replace(session, project_id=project_id, events=tuple(events))
 
 

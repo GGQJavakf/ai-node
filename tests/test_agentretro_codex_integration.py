@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import hashlib
 import os
 from pathlib import Path
 
@@ -479,11 +480,12 @@ def test_failed_readback_and_failed_restore_enter_typed_rollback_required(tmp_pa
 def test_discovery_reads_only_canonical_target_and_requires_one_exact_block(tmp_path):
     codex_home, backup_root, target = _home(tmp_path)
     guidance = CodexGuidance(codex_home, backup_root)
-    guidance.apply(guidance.preview().id)
+    applied = guidance.apply(guidance.preview().id)
     (codex_home / "AGENTS.override.md").write_bytes(b"\xff\xfe unrelated")
     (codex_home / "memory.md").write_bytes(b"\xff\xfe native memory")
     before = _snapshot(tmp_path)
 
+    assert applied.target_hash == hashlib.sha256(target.read_bytes()).hexdigest()
     assert discover_managed_instruction(codex_home) is True
     assert _snapshot(tmp_path) == before
 

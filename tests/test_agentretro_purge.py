@@ -545,7 +545,9 @@ def test_apply_time_new_registered_residual_prevents_success(purge_fixture):
     assert MARKER not in _table_rows(repository, "purge_jobs")[0]["residual_json"]
 
 
-def test_atomic_file_failure_marks_incomplete_without_success(purge_fixture):
+def test_atomic_file_failure_marks_incomplete_without_success(
+    purge_fixture, tmp_path: Path
+):
     repository, service, *_ = purge_fixture
 
     def fail_replace(source: Path, target: Path) -> None:
@@ -573,6 +575,23 @@ def test_atomic_file_failure_marks_incomplete_without_success(purge_fixture):
         row["action"] == "purge_succeeded"
         for row in _table_rows(repository, "audit_log")
     )
+    job = _table_rows(repository, "purge_jobs")[0]
+    residuals = json.loads(job["residual_json"])
+    assert residuals
+    assert all(
+        set(item) == {"location_kind", "location"} and item["location_kind"]
+        for item in residuals
+    )
+    assert all(
+        item["location"].startswith(f"{item['location_kind']}:residual:")
+        for item in residuals
+    )
+    serialized = json.dumps(residuals, ensure_ascii=False)
+    assert MARKER not in serialized
+    assert str(tmp_path) not in serialized
+    assert tmp_path.as_posix() not in serialized
+    assert "expected_hash" not in serialized
+    assert "locator" not in serialized
 
 
 def test_registered_backup_symlink_is_rejected_without_following_it(purge_fixture):
@@ -926,14 +945,15 @@ def test_recover_success_triggers_the_same_idempotent_projection(purge_fixture):
     assert restarted.projection_result.event_id == events[0].id
 
 
-def test_purge_parser_requires_one_explicit_mutually_exclusive_mode():
+@pytest.mark.parametrize("command", ["kb", "knowledge"])
+def test_purge_parser_requires_one_explicit_mutually_exclusive_mode(command):
     parser = retro_cli.build_parser()
 
-    planned = parser.parse_args(["knowledge", "purge", KNOWLEDGE_ID, "--plan"])
+    planned = parser.parse_args([command, "purge", KNOWLEDGE_ID, "--plan"])
     assert planned.purge_plan
     applied = parser.parse_args(
         [
-            "knowledge",
+            command,
             "purge",
             KNOWLEDGE_ID,
             "--apply-plan",
@@ -947,12 +967,12 @@ def test_purge_parser_requires_one_explicit_mutually_exclusive_mode():
     assert applied.purge_plan_id == "purge-plan-id"
     assert applied.confirmed_operations == ["operation-a", "operation-b"]
     assert parser.parse_args(
-        ["knowledge", "purge", KNOWLEDGE_ID, "--recover"]
+        [command, "purge", KNOWLEDGE_ID, "--recover"]
     ).purge_recover
     with pytest.raises(SystemExit):
-        parser.parse_args(["knowledge", "purge", KNOWLEDGE_ID])
+        parser.parse_args([command, "purge", KNOWLEDGE_ID])
     with pytest.raises(SystemExit):
-        parser.parse_args(["knowledge", "purge", KNOWLEDGE_ID, "--plan", "--recover"])
+        parser.parse_args([command, "purge", KNOWLEDGE_ID, "--plan", "--recover"])
 
 
 def test_cli_plan_is_zero_write_and_emits_only_redacted_operations(
@@ -998,7 +1018,7 @@ def test_cli_apply_requires_confirmations_then_projects_in_the_same_command(
     }
     assert (
         retro_cli.main(
-            ["--json", "knowledge", "purge", KNOWLEDGE_ID, "--plan"],
+            ["--json", "kb", "purge", KNOWLEDGE_ID, "--plan"],
             home=tmp_path,
             env=env,
         )
@@ -1010,7 +1030,7 @@ def test_cli_apply_requires_confirmations_then_projects_in_the_same_command(
         retro_cli.main(
             [
                 "--json",
-                "knowledge",
+                "kb",
                 "purge",
                 KNOWLEDGE_ID,
                 "--apply-plan",
@@ -1023,11 +1043,11 @@ def test_cli_apply_requires_confirmations_then_projects_in_the_same_command(
     )
     refused = json.loads(capsys.readouterr().out)
     assert refused["code"] == "RETRO_PURGE_CONFIRMATION_REQUIRED"
-    assert refused["data"]["recovery_command"] == ("retro knowledge purge <id> --plan")
+    assert refused["data"]["recovery_command"] == ("retro kb purge <id> --plan")
 
     command = [
         "--json",
-        "knowledge",
+        "kb",
         "purge",
         KNOWLEDGE_ID,
         "--apply-plan",

@@ -3182,13 +3182,43 @@ class SQLiteRetroRepository(RetroRepository):
                         recovery_json,
                     ),
                 )
+            residual_labels: list[dict[str, str]] = []
+            kind_ordinals: dict[str, int] = {}
+            for location_kind, status in connection.execute(
+                """SELECT location_kind, status FROM purge_operations
+                WHERE purge_job_id = ? ORDER BY location_kind, id""",
+                (plan_id,),
+            ):
+                if status == "completed":
+                    continue
+                ordinal = kind_ordinals.get(location_kind, 0) + 1
+                kind_ordinals[location_kind] = ordinal
+                residual_labels.append(
+                    {
+                        "location_kind": location_kind,
+                        "location": f"{location_kind}:residual:{ordinal}",
+                    }
+                )
+            for location_kind in safe_kinds:
+                if location_kind in kind_ordinals:
+                    continue
+                kind_ordinals[location_kind] = 1
+                residual_labels.append(
+                    {
+                        "location_kind": location_kind,
+                        "location": f"{location_kind}:residual:1",
+                    }
+                )
+            residual_labels.sort(
+                key=lambda item: (item["location_kind"], item["location"])
+            )
             cursor = connection.execute(
                 """UPDATE purge_jobs SET status = ?, tombstone_json = ?,
                     residual_json = ?, updated_at = ? WHERE id = ?""",
                 (
                     PurgeStatus.PURGE_INCOMPLETE.value,
                     tombstone_json,
-                    json.dumps(safe_kinds, separators=(",", ":")),
+                    json.dumps(residual_labels, separators=(",", ":")),
                     _now_text(),
                     plan_id,
                 ),
@@ -3204,6 +3234,7 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={
                         "residual_count": residual_count,
                         "residual_kinds": safe_kinds,
+                        "residual_locations": residual_labels,
                         "status": PurgeStatus.PURGE_INCOMPLETE.value,
                     },
                 ),

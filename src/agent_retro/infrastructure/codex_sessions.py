@@ -118,16 +118,13 @@ class CodexSessionSource:
                 except SessionDiscoveryTimeout:
                     raise
                 except CodexSessionError as exc:
-                    self._diagnostics.append(
-                        f"跳过 {candidate.path}: {exc}"
-                    )
+                    self._diagnostics.append(f"跳过 {candidate.path}: {exc}")
                     continue
                 if session.completed:
                     self._finish_discovery()
                     return session
                 self._diagnostics.append(
-                    "跳过未完成会话 "
-                    f"{session.source_session_id}: {candidate.path}"
+                    f"跳过未完成会话 {session.source_session_id}: {candidate.path}"
                 )
         except BaseException:
             self._finish_discovery()
@@ -163,17 +160,14 @@ class CodexSessionSource:
         direct = [
             candidate
             for candidate in candidates
-            if candidate.path.stem in aliases
-            or session_id in candidate.path.stem
+            if candidate.path.stem in aliases or session_id in candidate.path.stem
         ]
         self._check_deadline(deadline)
         for candidate in direct:
             session = self._parse_bounded(candidate, deadline)
             if session.source_session_id == session_id:
                 return session
-            self._diagnostics.append(
-                f"跳过 ID 不匹配会话 {candidate.path}"
-            )
+            self._diagnostics.append(f"跳过 ID 不匹配会话 {candidate.path}")
         for candidate in candidates:
             if candidate in direct:
                 continue
@@ -194,9 +188,7 @@ class CodexSessionSource:
         available = self.codex_home.is_dir()
         self._check_deadline(deadline)
         if not available:
-            raise SessionNotFoundError(
-                f"Codex 会话源不可用: {self.codex_home}"
-            )
+            raise SessionNotFoundError(f"Codex 会话源不可用: {self.codex_home}")
 
     def _session_candidates_newest_first(
         self, deadline: float
@@ -361,8 +353,7 @@ class CodexSessionSource:
     def _check_size(self, candidate: _SessionCandidate) -> None:
         if candidate.size > self.max_session_bytes:
             raise SessionSizeLimitError(
-                "Codex 会话超过 "
-                f"{self.max_session_bytes} 字节限制: {candidate.path}"
+                f"Codex 会话超过 {self.max_session_bytes} 字节限制: {candidate.path}"
             )
 
     def _parse_bounded(
@@ -458,9 +449,12 @@ class CodexSessionSource:
             self._check_deadline(deadline)
             completed_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
         source_hash = digest.hexdigest()
-        internal_id = "session-" + hashlib.sha256(
-            f"{session_id}:{source_hash}".encode("utf-8")
-        ).hexdigest()[:24]
+        internal_id = (
+            "session-"
+            + hashlib.sha256(f"{session_id}:{source_hash}".encode("utf-8")).hexdigest()[
+                :24
+            ]
+        )
         source_path = path.resolve()
         self._check_deadline(deadline)
         return NormalizedSession(
@@ -523,9 +517,12 @@ class CodexSessionSource:
             )
             return None
         source_identity = str(payload.get("id") or payload.get("call_id") or kind)
-        event_id = "event-" + hashlib.sha256(
-            f"{session_id}:{line_number}:{source_identity}".encode("utf-8")
-        ).hexdigest()[:24]
+        event_id = (
+            "event-"
+            + hashlib.sha256(
+                f"{session_id}:{line_number}:{source_identity}".encode("utf-8")
+            ).hexdigest()[:24]
+        )
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         locator = SourceLocator(
             session_id=session_id,

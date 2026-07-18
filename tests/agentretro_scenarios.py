@@ -34,6 +34,7 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
         "tests/test_agentretro_capture.py::test_project_resolver_uses_root_then_unique_remote",
     ),
     "CR-12": (
+        "tests/test_agentretro_capture.py::test_project_resolver_reports_ambiguous_when_remote_matches_distinct_projects",
         "tests/test_agentretro_capture.py::test_project_resolver_uses_root_then_unique_remote",
         "tests/test_agentretro_capture.py::test_project_mapping_rejects_vault_escape_and_incompatible_collision",
         "tests/test_agentretro_review.py::test_each_deterministic_gate_blocks[candidate2-review2-evidence2-unknown_project]",
@@ -164,6 +165,7 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     ),
     "OS-06": (
         "tests/test_agentretro_obsidian.py::test_managed_block_rejects_malformed_boundaries[no markers]",
+        r"tests/test_agentretro_obsidian.py::test_managed_block_rejects_malformed_boundaries[<!-- agentretro:summary:start project=NPKI -->\n]",
     ),
     "OS-07": (
         "tests/test_agentretro_obsidian.py::test_plan_rejects_project_traversal",
@@ -194,9 +196,7 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "OS-15": (
         "tests/test_agentretro_merge.py::test_create_plan_is_immutable_persistent_complete_and_does_not_write_vault",
     ),
-    "OS-16": (
-        "tests/test_agentretro_merge.py::test_cli_merge_preview_and_exact_apply_use_relative_safe_output",
-    ),
+    "OS-16": ("tests/test_agentretro_merge.py::test_repeated_apply_is_idempotent",),
     "OS-17": (
         "tests/test_agentretro_merge.py::test_stale_merge_plan_cannot_apply_and_writes_nothing",
     ),
@@ -244,6 +244,7 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
         "tests/test_agentretro_task7_cli.py::test_cli_brief_uses_sqlite_service_and_emits_stable_path_free_json",
         "tests/test_agentretro_doctor.py::test_doctor_surfaces_rollback_purge_override_and_missing_model_without_paths",
         "tests/test_agentretro_obsidian.py::test_cli_accept_keeps_knowledge_when_vault_unavailable_then_sync_retry",
+        "tests/test_agentretro_review.py::test_review_failure_is_sanitized_immutable_and_keeps_candidate_pending[model]",
     ),
     "BR-06": (
         "tests/test_agentretro_briefing.py::test_brief_selects_only_active_accepted_knowledge_in_fixed_category_order",
