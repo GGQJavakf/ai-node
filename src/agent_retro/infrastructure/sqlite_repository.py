@@ -1882,6 +1882,29 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def rollback_required_sync_jobs(self) -> list[SyncJob]:
+        """Return redaction-safe recovery identities for blocked sync runs."""
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM sync_jobs WHERE status = ? ORDER BY id",
+                (ProjectionStatus.ROLLBACK_REQUIRED.value,),
+            ).fetchall()
+            return [
+                SyncJob(
+                    id=str(row["id"]),
+                    project_id=str(row["project_id"]),
+                    status=str(row["status"]),
+                    plan_json=str(row["plan_json"]),
+                    backup_path=Path(row["backup_path"]),
+                    error=str(row["error"]),
+                )
+                for row in rows
+            ]
+        finally:
+            connection.close()
+
     def has_purge_incomplete(self) -> bool:
         connection = self._connect()
         try:

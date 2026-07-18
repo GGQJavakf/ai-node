@@ -11,8 +11,15 @@ from pathlib import Path
 from typing import Mapping
 
 from agent_retro.application.bootstrap import (
+    build_doctor_service,
     build_projection_coordinator,
     build_retro_repository,
+)
+from agent_retro.application.brief import (
+    BriefBudgetError,
+    BriefRequest,
+    BriefService,
+    BriefTimeoutError,
 )
 from agent_retro.application.merge import (
     ConfirmationRequiredError,
@@ -28,6 +35,11 @@ from agent_retro.domain.models import CandidateStatus, KnowledgeType
 from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     effective_codex_home,
+)
+from agent_retro.infrastructure.codex_guidance import (
+    CodexGuidance,
+    GuidanceError,
+    discover_managed_instruction,
 )
 from agent_retro.infrastructure.legacy_model import (
     build_retro_llm_client_from_config,
@@ -50,7 +62,15 @@ from agent_retro.infrastructure.settings import (
     effective_model_timeout,
     load_retro_settings,
 )
-from agent_retro.presentation.output import safe_text, write_json
+from agent_retro.presentation.output import (
+    brief_json_data,
+    doctor_json_data,
+    render_brief_markdown,
+    render_brief_terminal,
+    render_doctor_terminal,
+    safe_text,
+    write_json,
+)
 from agent_retro.presentation.review_commands import run_review_command
 
 
@@ -160,6 +180,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         dest="confirmed_operations",
     )
+
+    brief = commands.add_parser("brief", help="生成任务范围内的本地知识简报")
+    brief.add_argument("task")
+    brief.add_argument("--project", required=True, dest="project_id")
+    brief.add_argument("--max-tokens", type=int, dest="max_tokens")
+    brief.add_argument("--markdown", action="store_true")
+
+    commands.add_parser("doctor", help="只读检查 AgentRetro 就绪状态")
+
+    integrate = commands.add_parser("integrate", help="管理显式 Codex 指引集成")
+    integrate_commands = integrate.add_subparsers(
+        dest="integrate_command", required=True
+    )
+    codex = integrate_commands.add_parser("codex", help="管理 canonical AGENTS.md")
+    action = codex.add_mutually_exclusive_group()
+    action.add_argument("--apply", action="store_true", dest="integrate_apply")
+    action.add_argument("--remove", action="store_true", dest="integrate_remove")
     return parser
 
 
@@ -173,6 +210,52 @@ def main(
     if args.command is not None:
         try:
             return _run_command(args, home=home, env=env)
+        except BriefBudgetError as exc:
+            data = {
+                "max_tokens": exc.max_tokens,
+                "reason": exc.reason,
+                "required_tokens": exc.required_tokens,
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_BRIEF_BUDGET_EXCEEDED",
+                        "message": "Mandatory rules exceed the brief budget.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
+            return 2
+        except BriefTimeoutError as exc:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_BRIEF_DEADLINE_EXCEEDED",
+                        "message": "Local brief rendering exceeded its deadline.",
+                        "data": {"reason": exc.reason},
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(str(exc)) + "\n")
+            return 2
+        except GuidanceError as exc:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_CODEX_INTEGRATION_FAILED",
+                        "message": "Codex guidance integration failed safely.",
+                        "data": {"reason": getattr(exc, "reason", "guidance_error")},
+                    }
+                )
+            else:
+                sys.stderr.write(
+                    safe_text(getattr(exc, "reason", "guidance_error")) + "\n"
+                )
+            return 2
         except ReviewUnavailableError:
             if args.json_output:
                 write_json(
@@ -293,7 +376,107 @@ def _run_command(
 ) -> int:
     values = os.environ if env is None else env
     settings = load_retro_settings(home=home, env=values)
+    codex_home = effective_codex_home(home=home, env=values)
+
+    if args.command == "doctor":
+        report = build_doctor_service(
+            settings, codex_home, load_legacy_model_config
+        ).run()
+        data = doctor_json_data(report)
+        if args.json_output:
+            write_json(
+                {
+                    "status": "ok" if report.exit_code == 0 else "error",
+                    "code": (
+                        "RETRO_DOCTOR_READY"
+                        if report.exit_code == 0
+                        else "RETRO_DOCTOR_ISSUES"
+                    ),
+                    "message": "AgentRetro doctor checks completed.",
+                    "data": data,
+                }
+            )
+        else:
+            sys.stdout.write(safe_text(render_doctor_terminal(report)))
+        return report.exit_code
+
+    if args.command == "integrate":
+        guidance = CodexGuidance(codex_home, settings.backup_dir)
+        action = (
+            "remove"
+            if args.integrate_remove
+            else "apply"
+            if args.integrate_apply
+            else "preview"
+        )
+        preview = (
+            guidance.preview_remove() if action == "remove" else guidance.preview()
+        )
+        data = _guidance_preview_data(preview)
+        data["override_conflict"] = (codex_home / "AGENTS.override.md").exists() or (
+            codex_home / "AGENTS.override.md"
+        ).is_symlink()
+        if action != "preview":
+            result = (
+                guidance.remove(preview.id)
+                if action == "remove"
+                else guidance.apply(preview.id)
+            )
+            data.update(
+                {
+                    "changed": result.changed,
+                    "result_status": result.status,
+                    "target_hash": result.target_hash,
+                }
+            )
+            if action == "apply":
+                data["discoverable"] = discover_managed_instruction(codex_home)
+        code = {
+            "preview": "RETRO_CODEX_INTEGRATION_PREVIEW",
+            "apply": "RETRO_CODEX_INTEGRATION_APPLIED",
+            "remove": "RETRO_CODEX_INTEGRATION_REMOVED",
+        }[action]
+        if args.json_output:
+            write_json(
+                {
+                    "status": "ok",
+                    "code": code,
+                    "message": "Codex guidance integration command completed.",
+                    "data": data,
+                }
+            )
+        else:
+            sys.stdout.write(safe_text(json_text(data)) + "\n")
+        return 0
+
     repository = build_retro_repository(settings)
+    if args.command == "brief":
+        result = BriefService(
+            repository,
+            timeout_seconds=settings.brief_timeout_seconds,
+            default_max_tokens=settings.brief_max_tokens,
+        ).build(
+            BriefRequest(
+                task=args.task,
+                project_id=args.project_id,
+                max_tokens=args.max_tokens,
+            )
+        )
+        if args.json_output:
+            write_json(
+                {
+                    "status": "ok",
+                    "code": "RETRO_BRIEF_READY",
+                    "message": "Task-scoped brief generated.",
+                    "data": brief_json_data(result),
+                }
+            )
+        elif args.markdown:
+            sys.stdout.write(safe_text(render_brief_markdown(result)))
+        else:
+            sys.stdout.write(safe_text(render_brief_terminal(result)))
+        return 0
+
     coordinator = build_projection_coordinator(settings, repository)
     resolver = ProjectResolver(repository.list_project_mappings())
     if args.command == "sync":
@@ -590,6 +773,21 @@ def _merge_plan_data(plan) -> dict[str, object]:
             }
             for item in plan.conflicts
         ],
+    }
+
+
+def _guidance_preview_data(preview) -> dict[str, object]:
+    return {
+        "action": preview.action,
+        "backup_location": (f"${{AGENTRETRO_BACKUP_DIR}}/{preview.id}/AGENTS.md"),
+        "changed": preview.changed,
+        "diff": preview.diff,
+        "managed_hash": preview.managed_hash,
+        "planned_hash": preview.planned_hash,
+        "preview_id": preview.id,
+        "target": "${CODEX_HOME}/AGENTS.md",
+        "target_hash": preview.target_hash,
+        "target_missing": preview.target_missing,
     }
 
 

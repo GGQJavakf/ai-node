@@ -50,13 +50,13 @@
 
 ## 5. Briefing, Diagnostics, and Codex Integration
 
-- [ ] 5.1 Implement deterministic local `retro brief` selection in fixed category order using NFKC/case-folded CJK and Latin tokens, configured keyword/recency/evidence weights, and stable knowledge-ID tie-breaking, without a model call or vector database.
-- [ ] 5.2 Implement the configurable 6000-token default budget using the conservative UTF-8 byte estimate, atomic item inclusion, reproducible omission notice, mandatory-rule overflow failure, evidence references, sync warnings, and terminal/Markdown/JSON formats.
-- [ ] 5.3 Implement `retro doctor` checks for source access and safety limits, database/migrations, redacted model readiness, audited project mappings, vault safety, backups, sync and purge recovery, canonical Codex integration and override conflicts, and console encoding.
-- [ ] 5.4 Implement preview-only `retro integrate codex` targeting exactly `<effective-codex-home>/AGENTS.md`, with canonical containment and symlink checks, one managed block, target hash, complete diff, backup location, and explicit missing-file creation preview.
-- [ ] 5.5 Implement explicit Codex integration apply and remove with readback, encoding/newline/byte preservation outside the block, manual-edit detection, refusal when `AGENTS.override.md` exists, no native-memory modification, and a non-writing discoverability smoke check.
-- [ ] 5.6 Verify the managed guidance triggers task-scoped `retro brief` only for work that depends on retained context and never requires an unconditional vault scan.
-- [ ] 5.7 Enforce the configurable local brief-render deadline and return a diagnostic instead of a successful partial brief.
+- [x] 5.1 Implement deterministic local `retro brief` selection in fixed category order using NFKC/case-folded CJK and Latin tokens, configured keyword/recency/evidence weights, and stable knowledge-ID tie-breaking, without a model call or vector database.
+- [x] 5.2 Implement the configurable 6000-token default budget using the conservative UTF-8 byte estimate, atomic item inclusion, reproducible omission notice, mandatory-rule overflow failure, evidence references, sync warnings, and terminal/Markdown/JSON formats.
+- [x] 5.3 Implement `retro doctor` checks for source access and safety limits, database/migrations, redacted model readiness, audited project mappings, vault safety, backups, sync and purge recovery, canonical Codex integration and override conflicts, and console encoding.
+- [x] 5.4 Implement preview-only `retro integrate codex` targeting exactly `<effective-codex-home>/AGENTS.md`, with canonical containment and symlink checks, one managed block, target hash, complete diff, backup location, and explicit missing-file creation preview.
+- [x] 5.5 Implement explicit Codex integration apply and remove with readback, encoding/newline/byte preservation outside the block, manual-edit detection, refusal when `AGENTS.override.md` exists, no native-memory modification, and a non-writing discoverability smoke check.
+- [x] 5.6 Verify the managed guidance triggers task-scoped `retro brief` only for work that depends on retained context and never requires an unconditional vault scan.
+- [x] 5.7 Enforce the configurable local brief-render deadline and return a diagnostic instead of a successful partial brief.
 - [ ] 5.8 Add tests whose names or metadata reference every briefing and integration scenario `BR-01` through `BR-28`, and record the scenario-to-test mapping in verification evidence.
 
 ## 6. End-to-End and Regression Verification
