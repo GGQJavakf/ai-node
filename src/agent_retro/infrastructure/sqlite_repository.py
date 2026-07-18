@@ -39,11 +39,12 @@ from agent_retro.domain.models import (
     ReviewVerdict,
     SourceLocator,
     SyncJob,
+    VaultAdoption,
 )
 from agent_retro.domain.projection import ProjectionFenceError, projection_input_hash
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _SCHEMA_V1 = (
     "CREATE TABLE schema_version (version INTEGER NOT NULL)",
@@ -216,6 +217,34 @@ _SCHEMA_V1 = (
     )""",
 )
 
+_SCHEMA_V2 = (
+    """CREATE TABLE vault_adoptions (
+        candidate_id TEXT PRIMARY KEY REFERENCES candidates(id),
+        project_id TEXT NOT NULL,
+        knowledge_id TEXT NOT NULL,
+        original_version INTEGER NOT NULL,
+        original_text_hash TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        vault_managed_hash TEXT NOT NULL,
+        vault_full_hash TEXT NOT NULL,
+        authority_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        blocker TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE managed_file_snapshots (
+        path TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        snapshot_kind TEXT NOT NULL,
+        owned_bytes BLOB NOT NULL,
+        managed_hash TEXT NOT NULL,
+        full_hash TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+)
+
 
 class SQLiteRetroRepository(RetroRepository):
     """SQLite implementation of the AgentRetro persistence port."""
@@ -346,11 +375,17 @@ class SQLiteRetroRepository(RetroRepository):
             connection.close()
 
     def _apply_migration(self, connection: sqlite3.Connection, version: int) -> None:
-        if version != 1:
-            raise ValueError(f"unsupported schema migration: {version}")
-        for statement in _SCHEMA_V1:
-            connection.execute(statement)
-        connection.execute("INSERT INTO schema_version(version) VALUES (1)")
+        if version == 1:
+            for statement in _SCHEMA_V1:
+                connection.execute(statement)
+            connection.execute("INSERT INTO schema_version(version) VALUES (1)")
+            return
+        if version == 2:
+            for statement in _SCHEMA_V2:
+                connection.execute(statement)
+            connection.execute("UPDATE schema_version SET version = 2")
+            return
+        raise ValueError(f"unsupported schema migration: {version}")
 
     def _restore_backup(self, backup_path: Path, expected_hash: str) -> None:
         restore_path = self.db_path.with_name(f".{self.db_path.name}.restore")
@@ -627,6 +662,7 @@ class SQLiteRetroRepository(RetroRepository):
         *,
         relative_path: Path,
         content_hash: str,
+        adoption: VaultAdoption | None = None,
     ) -> Candidate:
         """Atomically persist synthetic provenance and one pending vault edit."""
 
@@ -694,6 +730,32 @@ class SQLiteRetroRepository(RetroRepository):
                 VALUES (?, ?)""",
                 (candidate.id, evidence_id),
             )
+            if adoption is not None:
+                if adoption.candidate_id != candidate.id:
+                    raise ValueError("vault adoption candidate identity mismatch")
+                connection.execute(
+                    """INSERT OR IGNORE INTO vault_adoptions(
+                        candidate_id, project_id, knowledge_id, original_version,
+                        original_text_hash, relative_path, vault_managed_hash,
+                        vault_full_hash, authority_hash, status, blocker,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        adoption.candidate_id,
+                        adoption.project_id,
+                        adoption.knowledge_id,
+                        adoption.original_version,
+                        adoption.original_text_hash,
+                        adoption.relative_path.as_posix(),
+                        adoption.vault_managed_hash,
+                        adoption.vault_full_hash,
+                        adoption.authority_hash,
+                        adoption.status,
+                        adoption.blocker,
+                        now,
+                        now,
+                    ),
+                )
             self._append_audit_record(
                 connection,
                 self._audit_entry(
@@ -712,6 +774,17 @@ class SQLiteRetroRepository(RetroRepository):
             if saved is None:
                 raise sqlite3.IntegrityError("candidate readback failed")
             return saved
+
+    def get_vault_adoption(self, candidate_id: str) -> VaultAdoption | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM vault_adoptions WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            return None if row is None else _vault_adoption_from_row(row)
+        finally:
+            connection.close()
 
     def list_candidates(self, status: CandidateStatus) -> list[Candidate]:
         connection = self._connect()
@@ -959,6 +1032,12 @@ class SQLiteRetroRepository(RetroRepository):
             candidate = self._get_candidate(connection, candidate_id)
             if candidate is None:
                 raise KeyError(f"candidate not found: {candidate_id}")
+            adoption = connection.execute(
+                "SELECT 1 FROM vault_adoptions WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if adoption is not None:
+                raise ValueError("vault_adoption_requires_guarded_accept")
             existing = connection.execute(
                 "SELECT * FROM knowledge WHERE candidate_id = ? "
                 "ORDER BY version DESC LIMIT 1",
@@ -1070,6 +1149,101 @@ class SQLiteRetroRepository(RetroRepository):
             )
         return knowledge
 
+    def accept_vault_adoption(
+        self,
+        candidate_id: str,
+        text: str,
+        actor: str,
+        confidence: float,
+        *,
+        candidate_status: CandidateStatus,
+        expected_authority_hash: str,
+        managed_path: Path,
+        vault_managed_hash: str,
+        vault_full_hash: str,
+    ) -> Knowledge:
+        """Atomically supersede the adopted identity and advance its baseline."""
+
+        with self.transaction() as connection:
+            adoption_row = connection.execute(
+                "SELECT * FROM vault_adoptions WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if adoption_row is None:
+                raise KeyError(f"vault adoption not found: {candidate_id}")
+            adoption = _vault_adoption_from_row(adoption_row)
+            if adoption.status != "pending_review":
+                existing = connection.execute(
+                    "SELECT * FROM knowledge WHERE candidate_id = ? ORDER BY version DESC",
+                    (candidate_id,),
+                ).fetchone()
+                if adoption.status == "accepted" and existing is not None:
+                    return self._knowledge_from_row(connection, existing)
+                raise ValueError("vault_adoption_not_pending")
+            if adoption.blocker:
+                raise ValueError("vault_adoption_blocked")
+            if actor != "user":
+                raise ValueError("vault_adoption_actor_must_be_user")
+            candidate = self._get_candidate(connection, candidate_id)
+            if candidate is None:
+                raise KeyError(f"candidate not found: {candidate_id}")
+            if candidate.status is not CandidateStatus.PENDING_REVIEW:
+                raise ValueError("vault_adoption_candidate_not_pending")
+            current = self._latest_knowledge(connection, adoption.knowledge_id)
+            if (
+                current is None
+                or current.version != adoption.original_version
+                or current.status != "active"
+                or hashlib.sha256(current.text.encode("utf-8")).hexdigest()
+                != adoption.original_text_hash
+            ):
+                raise ValueError("vault_adoption_authority_changed")
+            current_authority = projection_input_hash(
+                self._list_project_knowledge(connection, adoption.project_id)
+            )
+            if (
+                current_authority != adoption.authority_hash
+                or expected_authority_hash != adoption.authority_hash
+                or vault_managed_hash != adoption.vault_managed_hash
+                or vault_full_hash != adoption.vault_full_hash
+            ):
+                raise ValueError("vault_adoption_authority_changed")
+            state = connection.execute(
+                "SELECT * FROM managed_file_state WHERE path = ?",
+                (str(managed_path),),
+            ).fetchone()
+            if state is None or str(state["project_id"]) != adoption.project_id:
+                raise ValueError("vault_adoption_baseline_changed")
+            knowledge = self._transition_knowledge(
+                connection,
+                current,
+                action="vault_adoption_accepted",
+                actor=actor,
+                status="active",
+                supersedes=(current.id,),
+                detail={"candidate_id": candidate_id, "source": "obsidian-manual-edit"},
+                candidate_id=candidate_id,
+                text=text,
+                confidence=confidence,
+                evidence_ids=candidate.evidence_ids,
+            )
+            connection.execute(
+                """UPDATE candidates SET status = ?, proposed_text = ?, updated_at = ?
+                WHERE id = ?""",
+                (candidate_status.value, text, _now_text(), candidate_id),
+            )
+            connection.execute(
+                """UPDATE managed_file_state SET managed_hash = ?, full_hash = ?,
+                updated_at = ? WHERE path = ?""",
+                (vault_managed_hash, vault_full_hash, _now_text(), str(managed_path)),
+            )
+            connection.execute(
+                """UPDATE vault_adoptions SET status = 'accepted', updated_at = ?
+                WHERE candidate_id = ?""",
+                (_now_text(), candidate_id),
+            )
+            return knowledge
+
     def reject_candidate(self, candidate_id: str, actor: str) -> Candidate:
         with self.transaction() as connection:
             candidate = self._get_candidate(connection, candidate_id)
@@ -1080,6 +1254,11 @@ class SQLiteRetroRepository(RetroRepository):
             connection.execute(
                 "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
                 (CandidateStatus.REJECTED.value, _now_text(), candidate_id),
+            )
+            connection.execute(
+                """UPDATE vault_adoptions SET status = 'rejected', updated_at = ?
+                WHERE candidate_id = ? AND status = 'pending_review'""",
+                (_now_text(), candidate_id),
             )
             rejected = self._get_candidate(connection, candidate_id)
             assert rejected is not None
@@ -1142,19 +1321,24 @@ class SQLiteRetroRepository(RetroRepository):
 
         connection = self._connect()
         try:
-            rows = connection.execute(
-                """SELECT item.* FROM knowledge AS item
-                JOIN (
-                    SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
-                ) AS latest ON latest.id = item.id AND latest.version = item.version
-                WHERE item.project_id = ? AND item.scope = 'project'
-                  AND item.status IN ('active', 'archived')
-                ORDER BY item.id""",
-                (project_id,),
-            ).fetchall()
-            return [self._knowledge_from_row(connection, row) for row in rows]
+            return self._list_project_knowledge(connection, project_id)
         finally:
             connection.close()
+
+    def _list_project_knowledge(
+        self, connection: sqlite3.Connection, project_id: str
+    ) -> list[Knowledge]:
+        rows = connection.execute(
+            """SELECT item.* FROM knowledge AS item
+            JOIN (
+                SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
+            ) AS latest ON latest.id = item.id AND latest.version = item.version
+            WHERE item.project_id = ? AND item.scope = 'project'
+              AND item.status IN ('active', 'archived')
+            ORDER BY item.id""",
+            (project_id,),
+        ).fetchall()
+        return [self._knowledge_from_row(connection, row) for row in rows]
 
     def _knowledge_from_row(
         self, connection: sqlite3.Connection, row: sqlite3.Row
@@ -2470,6 +2654,22 @@ def _conflict_from_row(row: sqlite3.Row) -> KnowledgeConflict:
         reason=str(row["reason"]),
         merge_text=str(row["merge_text"]),
         status=str(row["status"]),
+    )
+
+
+def _vault_adoption_from_row(row: sqlite3.Row) -> VaultAdoption:
+    return VaultAdoption(
+        candidate_id=str(row["candidate_id"]),
+        project_id=str(row["project_id"]),
+        knowledge_id=str(row["knowledge_id"]),
+        original_version=int(row["original_version"]),
+        original_text_hash=str(row["original_text_hash"]),
+        relative_path=Path(row["relative_path"]),
+        vault_managed_hash=str(row["vault_managed_hash"]),
+        vault_full_hash=str(row["vault_full_hash"]),
+        authority_hash=str(row["authority_hash"]),
+        status=str(row["status"]),
+        blocker=str(row["blocker"]),
     )
 
 

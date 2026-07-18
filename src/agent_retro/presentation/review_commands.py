@@ -8,6 +8,7 @@ import sys
 from collections.abc import Callable
 
 from agent_retro.application.knowledge import KnowledgeService
+from agent_retro.application.merge import MergeService
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
 from agent_retro.application.sync import ProjectionCoordinator, ProjectionResult
@@ -68,7 +69,12 @@ def run_review_command(
             data=data,
         )
         return 0
-    lifecycle = KnowledgeService(repository)
+    adoption_service = (
+        None
+        if settings.obsidian_root is None
+        else MergeService(repository, settings.obsidian_root, settings.backup_dir)
+    )
+    lifecycle = KnowledgeService(repository, adoption_service=adoption_service)
     if command == "accept":
         knowledge = lifecycle.accept(args.candidate_id, actor="user")
         projection = _project(

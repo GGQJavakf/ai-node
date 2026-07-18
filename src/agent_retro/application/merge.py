@@ -14,7 +14,14 @@ from typing import Mapping, Sequence
 
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.sync import ProjectionPersistenceError, SyncService
-from agent_retro.domain.models import Candidate, CandidateStatus, KnowledgeType, SyncJob
+from agent_retro.domain.models import (
+    Candidate,
+    CandidateStatus,
+    Knowledge,
+    KnowledgeType,
+    SyncJob,
+    VaultAdoption,
+)
 from agent_retro.domain.projection import projection_input_hash
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
@@ -459,6 +466,18 @@ class MergeService:
             raise ValueError("vault_edit_requires_one_changed_managed_entry")
         identifier = changed[0]
         kind = _kind_from_name(relative.name)
+        active_by_id = {
+            item.id: item
+            for item in self.repository.list_project_knowledge(project_id)
+            if item.status == "active"
+        }
+        original = active_by_id.get(identifier)
+        if (
+            original is None
+            or original.knowledge_type is not kind
+            or original.text != database_entries.get(identifier)
+        ):
+            raise StalePlanError("vault_adoption_identity_changed")
         identity = [
             conflict_id,
             identifier,
@@ -482,11 +501,71 @@ class MergeService:
             candidate,
             relative_path=relative,
             content_hash=sha256_bytes(vault_bytes),
+            adoption=VaultAdoption(
+                candidate_id=candidate.id,
+                project_id=project_id,
+                knowledge_id=original.id,
+                original_version=original.version,
+                original_text_hash=sha256_bytes(original.text.encode("utf-8")),
+                relative_path=relative,
+                vault_managed_hash=sha256_bytes(vault_bytes),
+                vault_full_hash=sha256_bytes(vault_bytes),
+                authority_hash=str(payload["authority_hash"]),
+            ),
         )
         self.repository.finish_sync(conflict_id, "pending_review")
         return ReconciliationResult(
             conflict_id, "pending_review", candidate_id=candidate_id
         )
+
+    def is_vault_adoption(self, candidate_id: str) -> bool:
+        return self.repository.get_vault_adoption(candidate_id) is not None
+
+    def accept_vault_adoption(
+        self,
+        candidate_id: str,
+        *,
+        text: str,
+        actor: str,
+        confidence: float,
+        candidate_status: CandidateStatus,
+    ) -> Knowledge:
+        if actor != "user":
+            raise ValueError("vault_adoption_actor_must_be_user")
+        adoption = self.repository.get_vault_adoption(candidate_id)
+        if adoption is None:
+            raise KeyError("vault_adoption_not_found")
+        relative = self._safe_relative(adoption.project_id, adoption.relative_path)
+        target = self.vault_root / relative
+        if not target.is_file():
+            raise StalePlanError("vault_adoption_target_changed")
+        current = target.read_bytes()
+        current_full_hash = sha256_bytes(current)
+        if (
+            current_full_hash != adoption.vault_full_hash
+            or sha256_bytes(current) != adoption.vault_managed_hash
+            or projection_input_hash(
+                self.repository.list_project_knowledge(adoption.project_id)
+            )
+            != adoption.authority_hash
+        ):
+            raise StalePlanError("vault_adoption_state_changed")
+        try:
+            return self.repository.accept_vault_adoption(
+                candidate_id,
+                text,
+                actor,
+                confidence,
+                candidate_status=candidate_status,
+                expected_authority_hash=adoption.authority_hash,
+                managed_path=target,
+                vault_managed_hash=adoption.vault_managed_hash,
+                vault_full_hash=adoption.vault_full_hash,
+            )
+        except ValueError as exc:
+            if str(exc).startswith("vault_adoption_"):
+                raise StalePlanError("vault_adoption_state_changed") from exc
+            raise
 
     def _load_plan(self, plan_id: str) -> MergePlan:
         job = self._get_job(plan_id)

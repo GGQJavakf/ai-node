@@ -27,6 +27,7 @@ from agent_retro.domain.models import (
     ReviewAttempt,
     ReviewResult,
     SyncJob,
+    VaultAdoption,
 )
 
 
@@ -34,7 +35,7 @@ from agent_retro.domain.models import (
 class RetroRepository(Protocol):
     """Typed boundary consumed by AgentRetro application services."""
 
-    def migrate(self, target_version: int = 1) -> None: ...
+    def migrate(self, target_version: int = 2) -> None: ...
 
     def transaction(self) -> AbstractContextManager[Any]: ...
 
@@ -60,7 +61,24 @@ class RetroRepository(Protocol):
         *,
         relative_path: Path,
         content_hash: str,
+        adoption: VaultAdoption | None = None,
     ) -> Candidate: ...
+
+    def get_vault_adoption(self, candidate_id: str) -> VaultAdoption | None: ...
+
+    def accept_vault_adoption(
+        self,
+        candidate_id: str,
+        text: str,
+        actor: str,
+        confidence: float,
+        *,
+        candidate_status: CandidateStatus,
+        expected_authority_hash: str,
+        managed_path: Path,
+        vault_managed_hash: str,
+        vault_full_hash: str,
+    ) -> Knowledge: ...
 
     def get_candidate(self, candidate_id: str) -> Candidate | None: ...
 
@@ -223,9 +241,7 @@ class RetroRepository(Protocol):
 
     def get_managed_file_state(self, path: Path) -> ManagedFileState | None: ...
 
-    def list_managed_file_states(
-        self, project_id: str
-    ) -> list[ManagedFileState]: ...
+    def list_managed_file_states(self, project_id: str) -> list[ManagedFileState]: ...
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 

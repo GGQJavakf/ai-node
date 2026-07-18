@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Callable, Protocol
 
 from agent_retro.application.ports import RetroRepository
 from agent_retro.domain.models import (
@@ -21,6 +21,20 @@ from agent_retro.domain.models import (
 
 class CandidateLifecycleError(ValueError):
     """The requested candidate transition is not allowed."""
+
+
+class VaultAdoptionLifecycle(Protocol):
+    def is_vault_adoption(self, candidate_id: str) -> bool: ...
+
+    def accept_vault_adoption(
+        self,
+        candidate_id: str,
+        *,
+        text: str,
+        actor: str,
+        confidence: float,
+        candidate_status: CandidateStatus,
+    ) -> Knowledge: ...
 
 
 @dataclass(frozen=True)
@@ -38,12 +52,22 @@ class KnowledgeService:
         repository: RetroRepository,
         *,
         clock: Callable[[], datetime] | None = None,
+        adoption_service: VaultAdoptionLifecycle | None = None,
     ) -> None:
         self.repository = repository
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.adoption_service = adoption_service
 
     def accept(self, candidate_id: str, *, actor: str) -> Knowledge:
         candidate = self._pending_user_candidate(candidate_id, actor)
+        if self._is_vault_adoption(candidate.id):
+            return self.adoption_service.accept_vault_adoption(
+                candidate.id,
+                text=candidate.proposed_text,
+                actor=actor,
+                confidence=self._confidence(candidate),
+                candidate_status=CandidateStatus.ACCEPTED,
+            )
         return self.repository.accept_candidate(
             candidate.id,
             candidate.proposed_text,
@@ -65,6 +89,22 @@ class KnowledgeService:
         candidate = self._pending_user_candidate(candidate_id, actor)
         if not text.strip():
             raise CandidateLifecycleError("edited knowledge text must be non-empty")
+        if self._is_vault_adoption(candidate.id):
+            if (
+                knowledge_type is not None
+                or scope is not None
+                or valid_until is not None
+            ):
+                raise CandidateLifecycleError(
+                    "vault adoption edit cannot change identity metadata"
+                )
+            return self.adoption_service.accept_vault_adoption(
+                candidate.id,
+                text=text,
+                actor=actor,
+                confidence=self._confidence(candidate),
+                candidate_status=CandidateStatus.EDITED,
+            )
         selected_type = knowledge_type or candidate.knowledge_type
         selected_valid_until = (
             valid_until
@@ -95,6 +135,12 @@ class KnowledgeService:
     def reject(self, candidate_id: str, *, actor: str) -> Candidate:
         self._pending_user_candidate(candidate_id, actor)
         return self.repository.reject_candidate(candidate_id, actor)
+
+    def _is_vault_adoption(self, candidate_id: str) -> bool:
+        return (
+            self.adoption_service is not None
+            and self.adoption_service.is_vault_adoption(candidate_id)
+        )
 
     def detect_conflict(
         self,

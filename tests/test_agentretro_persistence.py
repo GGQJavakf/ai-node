@@ -243,12 +243,12 @@ def test_projection_status_contract():
     ]
 
 
-def test_repository_creates_schema_version_one(tmp_path):
+def test_repository_creates_schema_version_two(tmp_path):
     repo = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
 
     repo.migrate()
 
-    assert repo.schema_version() == 1
+    assert repo.schema_version() == 2
     assert set(repo.table_names()) >= {
         "sessions",
         "session_events",
@@ -263,6 +263,8 @@ def test_repository_creates_schema_version_one(tmp_path):
         "purge_jobs",
         "purge_operations",
         "managed_file_state",
+        "managed_file_snapshots",
+        "vault_adoptions",
         "audit_log",
     }
     with repo.transaction() as connection:
@@ -306,7 +308,7 @@ def test_failed_migration_restores_database(tmp_path, monkeypatch):
     db_path = tmp_path / "retro.db"
     backup_dir = tmp_path / "backups"
     repo = SQLiteRetroRepository(db_path, backup_dir)
-    repo.migrate()
+    repo.migrate(target_version=1)
     before = db_path.read_bytes()
 
     monkeypatch.setattr(
@@ -393,7 +395,7 @@ def test_rollback_failure_does_not_skip_restore_or_replace_original_error(
 ):
     db_path = tmp_path / "retro.db"
     repo = SQLiteRetroRepository(db_path, tmp_path / "backups")
-    repo.migrate()
+    repo.migrate(target_version=1)
     before = db_path.read_bytes()
     original_connect = repo._connect
     connect_count = 0
@@ -441,7 +443,7 @@ def test_failed_migration_removes_sidecars_before_restoring_backup(
 ):
     db_path = tmp_path / "retro.db"
     repo = SQLiteRetroRepository(db_path, tmp_path / "backups")
-    repo.migrate()
+    repo.migrate(target_version=1)
     before = db_path.read_bytes()
     sidecars = [
         Path(f"{db_path}-journal"),
@@ -572,7 +574,7 @@ def test_bootstrap_uses_agentretro_settings_and_migrates_the_isolated_database(
     repo = build_retro_repository(settings)
 
     assert repo.db_path == tmp_path / ".agentretro" / "retro.db"
-    assert repo.schema_version() == 1
+    assert repo.schema_version() == 2
     assert not (tmp_path / "data" / "todos.db").exists()
 
 

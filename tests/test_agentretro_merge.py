@@ -17,7 +17,8 @@ from agent_retro.application.merge import (
     MergeService,
     StalePlanError,
 )
-from agent_retro.application.sync import SyncService
+from agent_retro.application.knowledge import KnowledgeService
+from agent_retro.application.sync import ProjectionCoordinator, SyncService
 from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.domain.models import (
     Candidate,
@@ -202,6 +203,238 @@ def test_adopt_vault_creates_pending_edit_candidate_with_provenance(
     evidence = repository.evidence_for_candidate(candidate.id)
     assert [item.kind for item in evidence] == ["obsidian-manual-edit"]
     assert repository.knowledge_for_candidate(candidate.id) is None
+
+    adoption = repository.get_vault_adoption(candidate.id)
+    assert adoption.knowledge_id == repository.list_project_knowledge("NPKI")[0].id
+    assert adoption.original_version == 1
+    assert adoption.original_text_hash == sha256_bytes("数据库规则".encode())
+    assert adoption.status == "pending_review"
+    # Adoption is not the authority boundary: baseline remains the last sync.
+    assert repository.get_managed_file_state(target).managed_hash != sha256_bytes(
+        target.read_bytes()
+    )
+
+
+def test_vault_adoption_accept_supersedes_same_identity_and_updates_baseline(
+    tmp_path: Path,
+) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+
+    with pytest.raises(ValueError, match="vault_adoption_requires_guarded_accept"):
+        repository.accept_candidate(candidate_id, "手工规则", "user", 0.0)
+
+    accepted = KnowledgeService(repository, adoption_service=service).accept(
+        candidate_id, actor="user"
+    )
+
+    assert accepted.id == original_id
+    assert accepted.version == 2
+    assert accepted.text == "手工规则"
+    versions = repository.knowledge_versions(original_id)
+    assert [item.status for item in versions] == ["superseded", "active"]
+    assert repository.get_vault_adoption(candidate_id).status == "accepted"
+    baseline = repository.get_managed_file_state(target)
+    assert baseline.managed_hash == sha256_bytes(target.read_bytes())
+    assert baseline.full_hash == sha256_bytes(target.read_bytes())
+
+
+@pytest.mark.parametrize("drift", ["vault", "authority"])
+def test_vault_adoption_accept_fails_closed_on_drift(
+    tmp_path: Path, drift: str
+) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    original_baseline = repository.get_managed_file_state(target)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+    if drift == "vault":
+        target.write_text("later vault edit", encoding="utf-8")
+    else:
+        repository.archive_knowledge(original_id, "user")
+
+    with pytest.raises(StalePlanError):
+        KnowledgeService(repository, adoption_service=service).accept(
+            candidate_id, actor="user"
+        )
+
+    assert (
+        repository.get_candidate(candidate_id).status is CandidateStatus.PENDING_REVIEW
+    )
+    assert repository.get_vault_adoption(candidate_id).status == "pending_review"
+    assert repository.get_managed_file_state(target) == original_baseline
+    if drift == "vault":
+        assert repository.knowledge_versions(original_id)[-1].version == 1
+
+
+def test_vault_adoption_reject_keeps_authority_and_baseline(tmp_path: Path) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    original_baseline = repository.get_managed_file_state(target)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+
+    rejected = KnowledgeService(repository, adoption_service=service).reject(
+        candidate_id, actor="user"
+    )
+
+    assert rejected.status is CandidateStatus.REJECTED
+    assert repository.get_vault_adoption(candidate_id).status == "rejected"
+    assert repository.knowledge_versions(original_id)[-1].version == 1
+    assert repository.get_managed_file_state(target) == original_baseline
+
+
+def test_cli_accept_vault_adoption_projects_canonical_version_in_same_command(
+    tmp_path: Path, capsys
+) -> None:
+    repository, service, vault, target = _synchronize_rule(tmp_path)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+    env = {
+        "AGENTRETRO_HOME": str(tmp_path),
+        "AGENTRETRO_DB_PATH": str(repository.db_path),
+        "AGENTRETRO_BACKUP_DIR": str(tmp_path / "backups"),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+    }
+
+    exit_code = main(
+        ["--json", "review", "accept", candidate_id], home=tmp_path, env=env
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert output["data"]["id"] == original_id
+    assert output["data"]["version"] == 2
+    assert output["data"]["projection"]["status"] == "synced"
+    assert "手工规则" in target.read_text(encoding="utf-8")
+    assert [item.id for item in repository.list_project_knowledge("NPKI")] == [
+        original_id
+    ]
+
+
+def test_vault_adoption_edit_uses_reviewed_text_on_same_identity(
+    tmp_path: Path,
+) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+
+    edited = KnowledgeService(repository, adoption_service=service).edit(
+        candidate_id, text="审核整理规则", actor="user"
+    )
+
+    assert edited.id == original_id
+    assert edited.version == 2
+    assert edited.text == "审核整理规则"
+    assert repository.get_candidate(candidate_id).status is CandidateStatus.EDITED
+    assert repository.get_vault_adoption(candidate_id).status == "accepted"
+
+
+def test_vault_adoption_transaction_failure_rolls_back_every_state(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    baseline = repository.get_managed_file_state(target)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+    original_transition = repository._transition_knowledge
+
+    def transition_then_fail(*args, **kwargs):
+        original_transition(*args, **kwargs)
+        raise sqlite3.OperationalError("injected")
+
+    monkeypatch.setattr(repository, "_transition_knowledge", transition_then_fail)
+
+    with pytest.raises(sqlite3.OperationalError, match="injected"):
+        KnowledgeService(repository, adoption_service=service).accept(
+            candidate_id, actor="user"
+        )
+
+    assert repository.knowledge_versions(original_id)[-1].version == 1
+    assert (
+        repository.get_candidate(candidate_id).status is CandidateStatus.PENDING_REVIEW
+    )
+    assert repository.get_vault_adoption(candidate_id).status == "pending_review"
+    assert repository.get_managed_file_state(target) == baseline
+
+
+def test_vault_drift_after_accept_is_projection_conflict_not_baseline_adoption(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault, target = _synchronize_rule(tmp_path)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    accepted = KnowledgeService(repository, adoption_service=service).accept(
+        candidate_id, actor="user"
+    )
+    accepted_baseline = repository.get_managed_file_state(target)
+    target.write_text("later external edit", encoding="utf-8")
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    )
+
+    result = coordinator.after_commit("manual_accept", accepted.id, accepted.project_id)
+
+    assert result.status.value == "sync_pending"
+    assert result.reason == "external_edit_conflict"
+    assert repository.get_managed_file_state(target) == accepted_baseline
+    assert accepted_baseline.full_hash != sha256_bytes(target.read_bytes())
 
 
 def test_keep_database_only_creates_replacement_preview_until_apply(

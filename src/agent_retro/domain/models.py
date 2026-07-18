@@ -194,6 +194,21 @@ class ManagedFileState:
 
 
 @dataclass(frozen=True)
+class VaultAdoption:
+    candidate_id: str
+    project_id: str
+    knowledge_id: str
+    original_version: int
+    original_text_hash: str
+    relative_path: Path
+    vault_managed_hash: str
+    vault_full_hash: str
+    authority_hash: str
+    status: str = "pending_review"
+    blocker: str = ""
+
+
+@dataclass(frozen=True)
 class ProjectMapping:
     id: str
     git_root: Path
