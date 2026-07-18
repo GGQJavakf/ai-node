@@ -281,7 +281,6 @@ def run_e2e_flow(
         ),
         "任务状态.md": (KnowledgeType.TASK_STATE, TASK_TEXT, (evidence_ids[0],)),
     }
-    projected_targets: dict[str, str] = {}
     for name, (kind, text, expected_evidence) in expected.items():
         target = managed_root / name
         after = target.read_bytes()
@@ -296,17 +295,28 @@ def run_e2e_flow(
         assert tuple(sorted(item.evidence_ids)) == tuple(sorted(expected_evidence))
         for evidence_id in expected_evidence:
             assert evidence_id in decoded
+
+    canonical_targets = {managed_root / name for name in expected}
+    aggregate_states = {
+        state.path: state
+        for state in repository.list_managed_file_states(PROJECT_ID)
+        if state.path in canonical_targets
+    }
+    assert len(aggregate_states) == 3
+    assert set(aggregate_states) == canonical_targets
+    for target, state in aggregate_states.items():
+        after = target.read_bytes()
+        after_hash = hashlib.sha256(after).hexdigest()
         snapshot = repository.get_managed_file_snapshot(target)
         assert snapshot is not None
+        assert state.project_id == PROJECT_ID
+        assert state.managed_hash == after_hash
+        assert state.full_hash == after_hash
         assert snapshot.snapshot_kind == "full"
         assert snapshot.owned_bytes == after
+        assert snapshot.managed_hash == state.managed_hash
+        assert snapshot.full_hash == state.full_hash
         assert snapshot.event_id == projection["event_id"]
-        projected_targets[name] = projection["status"]
-    assert projected_targets == {
-        "规则.md": "synced",
-        "经验.md": "synced",
-        "任务状态.md": "synced",
-    }
 
     assert (
         retro_cli.main(
