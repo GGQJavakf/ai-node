@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from agent_retro.application.ports import RetroRepository
 from agent_retro.domain.models import (
+    AcceptanceDecision,
     AuditEntry,
     Candidate,
     CandidateStatus,
@@ -635,8 +636,55 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def pending_model_candidates_for_session(
+        self, session_id: str
+    ) -> list[Candidate]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT c.id FROM candidates c
+                JOIN sessions s ON s.id = c.session_id
+                WHERE (s.id = ? OR s.source_session_id = ?)
+                  AND c.status = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM review_attempts a
+                    WHERE a.candidate_id = c.id AND a.status = 'completed'
+                  )
+                ORDER BY c.created_at, c.id""",
+                (session_id, session_id, CandidateStatus.PENDING_REVIEW.value),
+            ).fetchall()
+            return [
+                candidate
+                for row in rows
+                if (candidate := self._get_candidate(connection, str(row[0])))
+                is not None
+            ]
+        finally:
+            connection.close()
+
+    def evidence_for_candidate(self, candidate_id: str) -> list[Evidence]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT e.* FROM evidence e
+                JOIN candidate_evidence ce ON ce.evidence_id = e.id
+                WHERE ce.candidate_id = ? ORDER BY e.id""",
+                (candidate_id,),
+            ).fetchall()
+            return [_evidence_from_row(row) for row in rows]
+        finally:
+            connection.close()
+
     def save_review(self, candidate_id: str, result: ReviewResult) -> None:
         with self.transaction() as connection:
+            existing = connection.execute(
+                "SELECT review_json FROM candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"candidate not found: {candidate_id}")
+            if _review_from_json(str(existing[0])) == result:
+                return
             cursor = connection.execute(
                 "UPDATE candidates SET review_json = ?, updated_at = ? WHERE id = ?",
                 (_review_to_json(result), _now_text(), candidate_id),
@@ -652,6 +700,19 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"verdict": result.verdict.value},
                 ),
             )
+
+    def get_review_result(self, candidate_id: str) -> ReviewResult | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT review_json FROM candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"candidate not found: {candidate_id}")
+            return _review_from_json(str(row[0]))
+        finally:
+            connection.close()
 
     def begin_review_attempt(self, attempt: ReviewAttempt) -> ReviewAttempt:
         with self.transaction() as connection:
@@ -703,10 +764,17 @@ class SQLiteRetroRepository(RetroRepository):
         with self.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE review_attempts SET status = ?, result_json = ?, "
-                "error = ? WHERE id = ?",
+                "error = ? WHERE id = ? AND status = 'running'",
                 (status, result_json, error, attempt_id),
             )
-            _require_row(cursor, "review attempt", attempt_id)
+            if cursor.rowcount == 0:
+                existing = connection.execute(
+                    "SELECT status FROM review_attempts WHERE id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if existing is None:
+                    raise KeyError(f"review attempt not found: {attempt_id}")
+                raise ValueError(f"review attempt already finished: {attempt_id}")
             self._append_audit_record(
                 connection,
                 self._audit_entry(
@@ -720,8 +788,45 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
 
+    def find_completed_review_attempt(
+        self, candidate_id: str, input_hash: str
+    ) -> ReviewAttempt | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT * FROM review_attempts
+                WHERE candidate_id = ? AND input_hash = ? AND status = 'completed'
+                ORDER BY attempt_no LIMIT 1""",
+                (candidate_id, input_hash),
+            ).fetchone()
+            return None if row is None else _review_attempt_from_row(row)
+        finally:
+            connection.close()
+
+    def review_attempts_for_candidate(
+        self, candidate_id: str
+    ) -> list[ReviewAttempt]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM review_attempts WHERE candidate_id = ? "
+                "ORDER BY attempt_no",
+                (candidate_id,),
+            ).fetchall()
+            return [_review_attempt_from_row(row) for row in rows]
+        finally:
+            connection.close()
+
     def accept_candidate(
-        self, candidate_id: str, text: str, actor: str, confidence: float
+        self,
+        candidate_id: str,
+        text: str,
+        actor: str,
+        confidence: float,
+        *,
+        candidate_status: CandidateStatus = CandidateStatus.ACCEPTED,
+        valid_until: datetime | None = None,
+        decision: AcceptanceDecision | None = None,
     ) -> Knowledge:
         with self.transaction() as connection:
             candidate = self._get_candidate(connection, candidate_id)
@@ -757,7 +862,7 @@ class SQLiteRetroRepository(RetroRepository):
                     confidence=confidence,
                     accepted_by=actor,
                     evidence_ids=candidate.evidence_ids,
-                    valid_until=None,
+                    valid_until=valid_until,
                     updated_at=updated_at,
                 )
                 connection.execute(
@@ -792,8 +897,18 @@ class SQLiteRetroRepository(RetroRepository):
                 )
             connection.execute(
                 "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
-                (CandidateStatus.ACCEPTED.value, _now_text(), candidate_id),
+                (candidate_status.value, _now_text(), candidate_id),
             )
+            audit_detail: dict[str, Any] = {"candidate_id": candidate_id}
+            if decision is not None:
+                audit_detail.update(
+                    {
+                        "threshold": decision.threshold,
+                        "blockers": list(decision.blockers),
+                        "verdict": decision.verdict.value,
+                        "evidence_ids": list(decision.evidence_ids),
+                    }
+                )
             self._append_audit_record(
                 connection,
                 self._audit_entry(
@@ -803,10 +918,28 @@ class SQLiteRetroRepository(RetroRepository):
                     entity_id=knowledge.id,
                     before_hash=_hash_value(candidate),
                     after_hash=_hash_value(knowledge),
-                    detail={"candidate_id": candidate_id},
+                    detail=audit_detail,
                 ),
             )
         return knowledge
+
+    def knowledge_for_candidate(self, candidate_id: str) -> Knowledge | None:
+        versions = self.knowledge_versions_for_candidate(candidate_id)
+        return versions[-1] if versions else None
+
+    def knowledge_versions_for_candidate(
+        self, candidate_id: str
+    ) -> list[Knowledge]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM knowledge WHERE candidate_id = ? "
+                "ORDER BY version",
+                (candidate_id,),
+            ).fetchall()
+            return [self._knowledge_from_row(connection, row) for row in rows]
+        finally:
+            connection.close()
 
     def list_active_knowledge(
         self, project_id: str, at: datetime
@@ -1227,6 +1360,28 @@ class SQLiteRetroRepository(RetroRepository):
         with self.transaction() as connection:
             self._append_audit_record(connection, entry)
 
+    def list_audit_entries(
+        self, *, action: str | None = None, entity_id: str | None = None
+    ) -> list[AuditEntry]:
+        connection = self._connect()
+        try:
+            clauses: list[str] = []
+            parameters: list[str] = []
+            if action is not None:
+                clauses.append("action = ?")
+                parameters.append(action)
+            if entity_id is not None:
+                clauses.append("entity_id = ?")
+                parameters.append(entity_id)
+            sql = "SELECT * FROM audit_log"
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY created_at, id"
+            rows = connection.execute(sql, tuple(parameters)).fetchall()
+            return [_audit_from_row(row) for row in rows]
+        finally:
+            connection.close()
+
     def _append_audit_record(
         self, connection: sqlite3.Connection, entry: AuditEntry
     ) -> None:
@@ -1333,6 +1488,31 @@ def _candidate_from_row(
         status=CandidateStatus(row["status"]),
         extraction_confidence=float(row["extraction_confidence"]),
         evidence_ids=evidence_ids,
+    )
+
+
+def _review_attempt_from_row(row: sqlite3.Row) -> ReviewAttempt:
+    return ReviewAttempt(
+        id=str(row["id"]),
+        candidate_id=str(row["candidate_id"]),
+        input_hash=str(row["input_hash"]),
+        status=str(row["status"]),
+        result_json=str(row["result_json"]),
+        error=str(row["error"]),
+    )
+
+
+def _audit_from_row(row: sqlite3.Row) -> AuditEntry:
+    return AuditEntry(
+        id=str(row["id"]),
+        actor=str(row["actor"]),
+        action=str(row["action"]),
+        entity_type=str(row["entity_type"]),
+        entity_id=str(row["entity_id"]),
+        before_hash=str(row["before_hash"]),
+        after_hash=str(row["after_hash"]),
+        detail_json=str(row["detail_json"]),
+        created_at=_datetime(str(row["created_at"])),
     )
 
 

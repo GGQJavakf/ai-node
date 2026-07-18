@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 from agent_retro.domain.models import (
+    AcceptanceDecision,
     AuditEntry,
     Candidate,
     CandidateStatus,
@@ -52,7 +53,15 @@ class RetroRepository(Protocol):
 
     def list_candidates(self, status: CandidateStatus) -> list[Candidate]: ...
 
+    def pending_model_candidates_for_session(
+        self, session_id: str
+    ) -> list[Candidate]: ...
+
+    def evidence_for_candidate(self, candidate_id: str) -> list[Evidence]: ...
+
     def save_review(self, candidate_id: str, result: ReviewResult) -> None: ...
+
+    def get_review_result(self, candidate_id: str) -> ReviewResult | None: ...
 
     def begin_review_attempt(self, attempt: ReviewAttempt) -> ReviewAttempt: ...
 
@@ -64,9 +73,31 @@ class RetroRepository(Protocol):
         error: str = "",
     ) -> None: ...
 
+    def find_completed_review_attempt(
+        self, candidate_id: str, input_hash: str
+    ) -> ReviewAttempt | None: ...
+
+    def review_attempts_for_candidate(
+        self, candidate_id: str
+    ) -> list[ReviewAttempt]: ...
+
     def accept_candidate(
-        self, candidate_id: str, text: str, actor: str, confidence: float
+        self,
+        candidate_id: str,
+        text: str,
+        actor: str,
+        confidence: float,
+        *,
+        candidate_status: CandidateStatus = CandidateStatus.ACCEPTED,
+        valid_until: datetime | None = None,
+        decision: AcceptanceDecision | None = None,
     ) -> Knowledge: ...
+
+    def knowledge_for_candidate(self, candidate_id: str) -> Knowledge | None: ...
+
+    def knowledge_versions_for_candidate(
+        self, candidate_id: str
+    ) -> list[Knowledge]: ...
 
     def list_active_knowledge(
         self, project_id: str, at: datetime
@@ -128,3 +159,7 @@ class RetroRepository(Protocol):
     ) -> None: ...
 
     def append_audit(self, entry: AuditEntry) -> None: ...
+
+    def list_audit_entries(
+        self, *, action: str | None = None, entity_id: str | None = None
+    ) -> list[AuditEntry]: ...

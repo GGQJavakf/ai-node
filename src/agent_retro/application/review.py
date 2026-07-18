@@ -2,15 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
-from typing import Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Callable, Protocol, Sequence
+from uuid import uuid4
 
+from agent_retro.application.ports import RetroRepository
+from agent_retro.application.review_contracts import (
+    canonical_extraction_input,
+    canonical_json,
+    canonical_review_input,
+    redacted_result,
+    review_result_from_json,
+    review_result_to_json,
+    safe_error,
+)
 from agent_retro.domain.models import (
+    AcceptanceDecision,
     Candidate,
+    CandidateStatus,
     Evidence,
     KnowledgeType,
+    ReviewAttempt,
     ReviewResult,
+    ReviewVerdict,
 )
 
 
@@ -50,6 +67,27 @@ _SPECULATION_MARKERS = (
 class GateResult:
     allowed: bool
     blockers: tuple[str, ...]
+
+
+class ExtractedCandidateData(Protocol):
+    knowledge_type: str
+    proposed_text: str
+    evidence_ids: list[str]
+    confidence: float
+
+
+class ExtractionGateway(Protocol):
+    def extract(
+        self, redacted_evidence_json: str, *, timeout: int
+    ) -> Sequence[ExtractedCandidateData]: ...
+
+
+class ReviewGateway(Protocol):
+    def review(self, redacted_review_json: str, *, timeout: int) -> ReviewResult: ...
+
+
+class ReviewUnavailableError(RuntimeError):
+    """Stored candidates remain pending and can be retried safely."""
 
 
 def threshold_passes(kind: KnowledgeType, confidence: float) -> bool:
@@ -107,3 +145,198 @@ def _is_speculative(candidate: Candidate, evidence: Sequence[Evidence]) -> bool:
         return True
     normalized = f" {candidate.proposed_text.casefold()} "
     return any(marker in normalized for marker in _SPECULATION_MARKERS)
+
+
+class ReviewService:
+    """Persist extracted candidates, then review them through an independent call."""
+
+    def __init__(
+        self,
+        repository: RetroRepository,
+        extractor: ExtractionGateway,
+        reviewer: ReviewGateway,
+        *,
+        model_timeout_seconds: int,
+        redact: Callable[[str], str],
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        if (
+            isinstance(model_timeout_seconds, bool)
+            or not isinstance(model_timeout_seconds, int)
+            or model_timeout_seconds <= 0
+        ):
+            raise ValueError("model_timeout_seconds must be a positive integer")
+        self.repository = repository
+        self.extractor = extractor
+        self.reviewer = reviewer
+        self.model_timeout_seconds = model_timeout_seconds
+        self.redact = redact
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def review_session(self, session_id: str) -> list[ReviewResult | None]:
+        session = self.repository.find_session_by_source_id(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+        pending = self.repository.pending_model_candidates_for_session(session_id)
+        if pending:
+            return [self.retry_candidate(item.id) for item in pending]
+        evidence = self.repository.list_evidence(session.id)
+        return self._extract_then_review(
+            session.source_session_id, session.project_id, evidence
+        )
+
+    def review_stored_evidence(
+        self,
+        session_id: str,
+        project_id: str,
+        evidence: Sequence[Evidence],
+    ) -> list[ReviewResult]:
+        pending = self.repository.pending_model_candidates_for_session(session_id)
+        results = (
+            [self.retry_candidate(item.id) for item in pending]
+            if pending
+            else self._extract_then_review(session_id, project_id, evidence)
+        )
+        if any(result is None for result in results):
+            raise ReviewUnavailableError(
+                "model review failed; retry is available for stored candidates"
+            )
+        return [result for result in results if result is not None]
+
+    def retry_candidate(self, candidate_id: str) -> ReviewResult | None:
+        candidate = self.repository.get_candidate(candidate_id)
+        if candidate is None:
+            raise KeyError(f"candidate not found: {candidate_id}")
+        evidence = self.repository.evidence_for_candidate(candidate_id)
+        input_json = canonical_review_input(candidate, evidence, self.redact)
+        input_hash = hashlib.sha256(input_json.encode("utf-8")).hexdigest()
+        completed = self.repository.find_completed_review_attempt(
+            candidate_id, input_hash
+        )
+        if completed is not None:
+            result = review_result_from_json(completed.result_json)
+            self._apply_review_result(candidate, evidence, result)
+            return result
+        if candidate.status is not CandidateStatus.PENDING_REVIEW:
+            return self.repository.get_review_result(candidate_id)
+
+        attempt = self.repository.begin_review_attempt(
+            ReviewAttempt(
+                id=f"review-{uuid4()}",
+                candidate_id=candidate_id,
+                input_hash=input_hash,
+                status="running",
+                result_json="",
+                error="",
+            )
+        )
+        try:
+            result = self.reviewer.review(
+                input_json, timeout=self.model_timeout_seconds
+            )
+            result = redacted_result(result, self.redact)
+        except Exception as exc:
+            self.repository.finish_review_attempt(
+                attempt.id, "failed", error=safe_error(exc)
+            )
+            return None
+        self.repository.finish_review_attempt(
+            attempt.id,
+            "completed",
+            result_json=review_result_to_json(result),
+        )
+        self._apply_review_result(candidate, evidence, result)
+        return result
+
+    def retry_session(self, session_id: str) -> list[ReviewResult | None]:
+        return [
+            self.retry_candidate(candidate.id)
+            for candidate in self.repository.pending_model_candidates_for_session(
+                session_id
+            )
+        ]
+
+    def _extract_then_review(
+        self,
+        session_id: str,
+        project_id: str,
+        evidence: Sequence[Evidence],
+    ) -> list[ReviewResult | None]:
+        extraction_input = canonical_extraction_input(evidence, self.redact)
+        try:
+            extracted = self.extractor.extract(
+                extraction_input, timeout=self.model_timeout_seconds
+            )
+        except Exception as exc:
+            raise ReviewUnavailableError(
+                f"model extraction failed; retry is available ({safe_error(exc)})"
+            ) from exc
+        candidates = tuple(
+            self._candidate_from_extraction(
+                session_id, project_id, item, evidence
+            )
+            for item in extracted
+        )
+        self.repository.save_candidates(candidates)
+        return [self.retry_candidate(candidate.id) for candidate in candidates]
+
+    def _candidate_from_extraction(
+        self,
+        session_id: str,
+        project_id: str,
+        item: ExtractedCandidateData,
+        evidence: Sequence[Evidence],
+    ) -> Candidate:
+        evidence_ids = tuple(item.evidence_ids)
+        known_ids = {entry.id for entry in evidence}
+        if not evidence_ids or not set(evidence_ids) <= known_ids:
+            raise ValueError("extracted candidate references unavailable evidence")
+        text = self.redact(item.proposed_text)
+        identity = canonical_json(
+            [session_id, project_id, item.knowledge_type, text, evidence_ids]
+        )
+        return Candidate(
+            id="candidate-"
+            + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24],
+            knowledge_type=KnowledgeType(item.knowledge_type),
+            project_id=project_id,
+            scope="project",
+            proposed_text=text,
+            evidence_ids=evidence_ids,
+            status=CandidateStatus.PENDING_REVIEW,
+            extraction_confidence=item.confidence,
+        )
+
+    def _apply_review_result(
+        self,
+        candidate: Candidate,
+        evidence: Sequence[Evidence],
+        result: ReviewResult,
+    ) -> None:
+        self.repository.save_review(candidate.id, result)
+        gates = evaluate_gates(candidate, result, evidence)
+        if (
+            result.verdict is not ReviewVerdict.ACCEPT
+            or not threshold_passes(candidate.knowledge_type, result.confidence)
+            or not gates.allowed
+        ):
+            return
+        valid_until = (
+            self.clock() + timedelta(days=14)
+            if candidate.knowledge_type is KnowledgeType.TASK_STATE
+            else None
+        )
+        self.repository.accept_candidate(
+            candidate.id,
+            result.normalized_text,
+            actor="model-review",
+            confidence=result.confidence,
+            candidate_status=CandidateStatus.AUTO_ACCEPTED,
+            valid_until=valid_until,
+            decision=AcceptanceDecision(
+                threshold=_THRESHOLDS[candidate.knowledge_type],
+                blockers=gates.blockers,
+                verdict=result.verdict,
+                evidence_ids=candidate.evidence_ids,
+            ),
+        )

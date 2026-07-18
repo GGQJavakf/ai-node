@@ -125,6 +125,16 @@ class ReviewAttempt:
 
 
 @dataclass(frozen=True)
+class AcceptanceDecision:
+    """Typed automatic-acceptance facts persisted in the audit record."""
+
+    threshold: float
+    blockers: tuple[str, ...]
+    verdict: ReviewVerdict
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Knowledge:
     id: str
     version: int
