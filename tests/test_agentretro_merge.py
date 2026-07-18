@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import threading
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -123,20 +124,47 @@ def _synchronize_rule(
     )
     item = repository.accept_candidate("candidate-rule-1", "数据库规则", "user", 0.98)
 
-    # Seed a canonical projection directly through the same immutable renderer,
-    # then record the last synchronized hashes as Task 5 does.
-    plan = ObsidianProjection(vault, tmp_path / "backups").plan("NPKI", [item])
-    for write in plan.writes:
-        write.target.parent.mkdir(parents=True, exist_ok=True)
-        write.target.write_bytes(write.after_bytes)
-        repository.save_managed_file_state(
-            "NPKI",
-            write.target,
-            write.after_managed_hash,
-            sha256_bytes(write.after_bytes),
-        )
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    )
+    assert coordinator.after_commit("seed-rule", item.id, "NPKI").status.value == (
+        "synced"
+    )
     target = vault / "项目" / "NPKI" / "AgentRetro" / "规则.md"
     return repository, service, vault, target
+
+
+def _synchronize_all_targets(
+    tmp_path: Path,
+) -> tuple[SQLiteRetroRepository, MergeService, Path]:
+    repository, service, vault, _ = _synchronize_rule(tmp_path)
+    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text(
+        "summary outside\n"
+        "<!-- agentretro:summary:start project=NPKI -->\nold\n"
+        "<!-- agentretro:summary:end -->\nsummary footer\n",
+        encoding="utf-8",
+    )
+    index = vault / "项目" / "项目索引.md"
+    index.write_text(
+        "index outside\n"
+        "<!-- agentretro:index:start project=NPKI -->\nold\n"
+        "<!-- agentretro:index:end -->\nindex footer\n",
+        encoding="utf-8",
+    )
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    )
+    knowledge = repository.list_project_knowledge("NPKI")[0]
+    assert coordinator.after_commit("seed-all", knowledge.id, "NPKI").status.value == (
+        "synced"
+    )
+    return repository, service, vault
 
 
 def test_external_edit_blocks_automatic_sync_and_preserves_both_versions(
@@ -511,6 +539,183 @@ def test_manual_edit_leaves_both_sides_unchanged_and_records_awaiting_input(
     assert result.status == "awaiting_user_input"
     assert target.read_bytes() == before
     assert repository.get_sync_job(conflict.id).status == "awaiting_user_input"
+
+
+def test_successful_sync_persists_verifiable_snapshots_for_every_managed_target(
+    tmp_path: Path,
+) -> None:
+    repository, _, vault = _synchronize_all_targets(tmp_path)
+    states = repository.list_managed_file_states("NPKI")
+    snapshots = [repository.get_managed_file_snapshot(item.path) for item in states]
+
+    assert all(item is not None for item in snapshots)
+    by_name = {item.path.name: item for item in snapshots}
+    assert by_name["规则.md"].snapshot_kind == "full"
+    assert by_name["变更日志.md"].snapshot_kind == "full"
+    assert len(by_name["变更日志.md"].owned_bytes) > 0
+    assert by_name["项目_NPKI.md"].snapshot_kind == "managed_block"
+    assert by_name["项目索引.md"].snapshot_kind == "managed_block"
+    assert b"summary outside" not in by_name["项目_NPKI.md"].owned_bytes
+    assert b"index outside" not in by_name["项目索引.md"].owned_bytes
+    assert all(str(item.path).startswith(str(vault)) for item in snapshots)
+
+
+def test_log_snapshot_is_stable_across_synced_event_retry(tmp_path: Path) -> None:
+    repository, service, vault = _synchronize_all_targets(tmp_path)
+    log = vault / "项目" / "NPKI" / "AgentRetro" / "变更日志.md"
+    before = repository.get_managed_file_snapshot(log)
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    )
+
+    result = coordinator.retry(before.event_id)
+
+    assert result.status.value == "synced"
+    assert repository.get_managed_file_snapshot(log) == before
+
+
+def test_snapshot_finalize_failure_rolls_back_snapshot_and_synced_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository, service, vault, _ = _synchronize_rule(tmp_path)
+    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text(
+        "outside\n<!-- agentretro:summary:start project=NPKI -->\nold\n"
+        "<!-- agentretro:summary:end -->\n",
+        encoding="utf-8",
+    )
+    original_append = repository._append_audit_record
+
+    def fail_completed(connection, entry) -> None:
+        if entry.action == "sync_completed":
+            raise sqlite3.OperationalError("injected snapshot finalize failure")
+        original_append(connection, entry)
+
+    monkeypatch.setattr(repository, "_append_audit_record", fail_completed)
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    )
+    knowledge = repository.list_project_knowledge("NPKI")[0]
+
+    result = coordinator.after_commit("snapshot-failure", knowledge.id, "NPKI")
+
+    assert result.status.value == "sync_pending"
+    assert result.reason == "journal_update_failed"
+    assert repository.get_managed_file_snapshot(summary) is None
+    assert repository.get_projection_event(result.event_id).status.value != "synced"
+
+
+def test_log_keep_database_uses_nonempty_snapshot(tmp_path: Path) -> None:
+    repository, service, vault = _synchronize_all_targets(tmp_path)
+    log = vault / "项目" / "NPKI" / "AgentRetro" / "变更日志.md"
+    snapshot = repository.get_managed_file_snapshot(log)
+    assert snapshot.owned_bytes
+    log.write_bytes(b"external log edit\n")
+    conflict = next(
+        item
+        for item in service.find_external_edits("NPKI")
+        if item.path.name == log.name
+    )
+
+    result = service.reconcile(conflict.id, "keep_database", actor="user")
+    preview = service.preview(result.plan_id)
+
+    assert preview.targets[0].output_bytes == snapshot.owned_bytes
+    assert preview.targets[0].output_bytes != b""
+    assert service.apply(result.plan_id, confirmed=True).status == "synced"
+    assert log.read_bytes() == snapshot.owned_bytes
+
+
+def test_summary_keep_database_preserves_current_outside_prose_and_payload_omits_it(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _synchronize_all_targets(tmp_path)
+    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    content = summary.read_bytes()
+    content = content.replace(b"summary outside", b"new outside prose")
+    content = content.replace(
+        b"- \xe8\xa7\x84\xe5\x88\x99: 1", b"- \xe8\xa7\x84\xe5\x88\x99: 999"
+    )
+    summary.write_bytes(content)
+    conflict = next(
+        item
+        for item in service.find_external_edits("NPKI")
+        if item.path.name == summary.name
+    )
+    job = repository.get_sync_job(conflict.id)
+
+    assert "new outside prose" not in job.plan_json
+    payload = json.loads(job.plan_json)
+    assert b"new outside prose" not in base64.b64decode(payload["vault_base64"])
+    result = service.reconcile(conflict.id, "keep_database", actor="user")
+    preview = service.preview(result.plan_id)
+
+    assert b"new outside prose" in preview.targets[0].output_bytes
+    assert b"summary footer" in preview.targets[0].output_bytes
+    assert b"999" not in preview.targets[0].output_bytes
+    assert service.apply(result.plan_id, confirmed=True).status == "synced"
+    assert b"new outside prose" in summary.read_bytes()
+
+
+@pytest.mark.parametrize("name", ["项目_NPKI.md", "项目索引.md", "变更日志.md"])
+def test_adopt_vault_is_typed_unsupported_for_nonaggregate_targets(
+    tmp_path: Path, name: str
+) -> None:
+    repository, service, vault = _synchronize_all_targets(tmp_path)
+    target = next(path for path in vault.rglob(name))
+    if name == "项目索引.md":
+        target.write_bytes(
+            target.read_bytes().replace(
+                "[[项目/NPKI]]".encode(), "[[项目/OTHER]]".encode()
+            )
+        )
+    elif name == "项目_NPKI.md":
+        target.write_bytes(
+            target.read_bytes().replace("- 规则: 1".encode(), "- 规则: 999".encode())
+        )
+    else:
+        target.write_bytes(target.read_bytes() + b"external\n")
+    conflict = next(
+        item for item in service.find_external_edits("NPKI") if item.path.name == name
+    )
+    before_candidates = len(repository.list_candidates(CandidateStatus.PENDING_REVIEW))
+
+    with pytest.raises(ValueError, match="vault_adoption_unsupported_target"):
+        service.reconcile(conflict.id, "adopt_vault", actor="user")
+
+    assert (
+        len(repository.list_candidates(CandidateStatus.PENDING_REVIEW))
+        == before_candidates
+    )
+    assert target.exists()
+
+
+def test_legacy_managed_state_without_snapshot_is_diagnostic_and_zero_write(
+    tmp_path: Path,
+) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    with repository.transaction() as connection:
+        connection.execute(
+            "DELETE FROM managed_file_snapshots WHERE path = ?", (str(target),)
+        )
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+
+    diagnostics = service.find_external_edits("NPKI")
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].status == "managed_snapshot_unavailable"
+    assert repository.get_sync_job(diagnostics[0].id) is None
+    for action in ("keep_database", "adopt_vault"):
+        with pytest.raises(ValueError, match="managed_snapshot_unavailable"):
+            service.reconcile(diagnostics[0].id, action, actor="user")
 
 
 def test_reconciliation_payload_tampering_fails_before_plan_or_vault_write(

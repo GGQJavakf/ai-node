@@ -15,7 +15,12 @@ from pathlib import Path
 from typing import Callable
 
 from agent_retro.application.ports import RetroRepository
-from agent_retro.domain.models import ProjectionEvent, ProjectionStatus, SyncJob
+from agent_retro.domain.models import (
+    ManagedFileUpdate,
+    ProjectionEvent,
+    ProjectionStatus,
+    SyncJob,
+)
 from agent_retro.domain.projection import ProjectionFenceError, projection_input_hash
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
@@ -23,6 +28,7 @@ from agent_retro.infrastructure.obsidian import (
     SyncPlan,
     UnsafeVaultPathError,
     VaultNotConfiguredError,
+    managed_block_bytes,
     managed_block_hash,
     sha256_bytes,
 )
@@ -585,10 +591,19 @@ class SyncService:
             return self._finish_after_rollback(event_id, status, error)
 
         states = [
-            (
-                write.target,
-                write.after_managed_hash or sha256_bytes(write.after_bytes),
-                sha256_bytes(write.after_bytes),
+            ManagedFileUpdate(
+                path=write.target,
+                managed_hash=(
+                    write.after_managed_hash or sha256_bytes(write.after_bytes)
+                ),
+                full_hash=sha256_bytes(write.after_bytes),
+                snapshot_kind=write.ownership_kind,
+                owned_bytes=(
+                    managed_block_bytes(write.after_bytes)
+                    if write.ownership_kind == "managed_block"
+                    else write.after_bytes
+                ),
+                event_id=event_id,
             )
             for write in plan.writes
         ]

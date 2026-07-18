@@ -30,6 +30,8 @@ from agent_retro.domain.models import (
     ProjectMapping,
     Reclassification,
     ManagedFileState,
+    ManagedFileSnapshot,
+    ManagedFileUpdate,
     ProjectionEvent,
     ProjectionStatus,
     PurgePlan,
@@ -1782,7 +1784,7 @@ class SQLiteRetroRepository(RetroRepository):
         self,
         event_id: str,
         project_id: str,
-        file_states: Sequence[tuple[Path, str, str]],
+        file_states: Sequence[ManagedFileUpdate],
         expected_input_hash: str,
     ) -> None:
         """Atomically publish post-write hashes and finish both journal records."""
@@ -1792,7 +1794,8 @@ class SQLiteRetroRepository(RetroRepository):
                 connection, event_id, expected_input_hash
             ):
                 raise ProjectionFenceError("projection_superseded")
-            for path, managed_hash, full_hash in file_states:
+            for item in file_states:
+                path, managed_hash, full_hash = item
                 connection.execute(
                     """INSERT INTO managed_file_state(
                         path, project_id, managed_hash, full_hash, updated_at
@@ -1804,6 +1807,32 @@ class SQLiteRetroRepository(RetroRepository):
                         updated_at = excluded.updated_at""",
                     (str(path), project_id, managed_hash, full_hash, _now_text()),
                 )
+                snapshot_kind = getattr(item, "snapshot_kind", "")
+                if snapshot_kind:
+                    connection.execute(
+                        """INSERT INTO managed_file_snapshots(
+                            path, project_id, snapshot_kind, owned_bytes,
+                            managed_hash, full_hash, event_id, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(path) DO UPDATE SET
+                            project_id = excluded.project_id,
+                            snapshot_kind = excluded.snapshot_kind,
+                            owned_bytes = excluded.owned_bytes,
+                            managed_hash = excluded.managed_hash,
+                            full_hash = excluded.full_hash,
+                            event_id = excluded.event_id,
+                            updated_at = excluded.updated_at""",
+                        (
+                            str(path),
+                            project_id,
+                            snapshot_kind,
+                            bytes(item.owned_bytes),
+                            managed_hash,
+                            full_hash,
+                            item.event_id,
+                            _now_text(),
+                        ),
+                    )
             sync_cursor = connection.execute(
                 "UPDATE sync_jobs SET status = ?, error = '', updated_at = ? WHERE id = ?",
                 (ProjectionStatus.SYNCED.value, _now_text(), event_id),
@@ -2405,6 +2434,26 @@ class SQLiteRetroRepository(RetroRepository):
                 path=Path(row["path"]),
                 managed_hash=str(row["managed_hash"]),
                 full_hash=str(row["full_hash"]),
+            )
+        finally:
+            connection.close()
+
+    def get_managed_file_snapshot(self, path: Path) -> ManagedFileSnapshot | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM managed_file_snapshots WHERE path = ?", (str(path),)
+            ).fetchone()
+            if row is None:
+                return None
+            return ManagedFileSnapshot(
+                project_id=str(row["project_id"]),
+                path=Path(row["path"]),
+                snapshot_kind=str(row["snapshot_kind"]),
+                owned_bytes=bytes(row["owned_bytes"]),
+                managed_hash=str(row["managed_hash"]),
+                full_hash=str(row["full_hash"]),
+                event_id=str(row["event_id"]),
             )
         finally:
             connection.close()

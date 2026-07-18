@@ -25,9 +25,10 @@ from agent_retro.domain.models import (
 from agent_retro.domain.projection import projection_input_hash
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
-    ObsidianProjection,
     managed_block_hash,
+    managed_block_bytes,
     parse_aggregate_entries,
+    replace_managed_block_bytes,
     sha256_bytes,
 )
 
@@ -338,10 +339,6 @@ class MergeService:
         self._require_mapping(project_id)
         knowledge = self.repository.list_project_knowledge(project_id)
         authority_hash = projection_input_hash(knowledge)
-        canonical = ObsidianProjection(self.vault_root, self.backup_root).plan(
-            project_id, knowledge
-        )
-        intended = {write.target: write.after_bytes for write in canonical.writes}
         conflicts = []
         for state in self.repository.list_managed_file_states(project_id):
             target = self._absolute_from_state(project_id, state.path)
@@ -356,8 +353,62 @@ class MergeService:
                 current_managed_hash = sha256_bytes(current)
             if current_managed_hash == state.managed_hash:
                 continue
-            database_bytes = intended.get(target, b"")
             relative = target.relative_to(self.vault_root)
+            snapshot = self.repository.get_managed_file_snapshot(target)
+            if snapshot is None:
+                conflicts.append(
+                    ReconciliationConflict(
+                        _diagnostic_id(
+                            project_id, relative, "managed_snapshot_unavailable"
+                        ),
+                        project_id,
+                        relative,
+                        state.managed_hash,
+                        current_managed_hash,
+                        "managed_snapshot_unavailable",
+                    )
+                )
+                continue
+            if (
+                snapshot.project_id != project_id
+                or snapshot.managed_hash != state.managed_hash
+                or snapshot.snapshot_kind not in ("full", "managed_block")
+            ):
+                conflicts.append(
+                    ReconciliationConflict(
+                        _diagnostic_id(
+                            project_id, relative, "managed_snapshot_invalid"
+                        ),
+                        project_id,
+                        relative,
+                        state.managed_hash,
+                        current_managed_hash,
+                        "managed_snapshot_invalid",
+                    )
+                )
+                continue
+            try:
+                vault_owned_bytes = (
+                    managed_block_bytes(current)
+                    if snapshot.snapshot_kind == "managed_block"
+                    else current
+                )
+            except BoundaryError:
+                conflicts.append(
+                    ReconciliationConflict(
+                        _diagnostic_id(
+                            project_id, relative, "managed_boundary_invalid"
+                        ),
+                        project_id,
+                        relative,
+                        state.managed_hash,
+                        current_managed_hash,
+                        "managed_boundary_invalid",
+                    )
+                )
+                continue
+            database_bytes = snapshot.owned_bytes
+            current_full_hash = sha256_bytes(current)
             conflict_id = _reconciliation_id(
                 project_id,
                 relative,
@@ -365,6 +416,8 @@ class MergeService:
                 current_managed_hash,
                 authority_hash,
                 database_bytes,
+                snapshot.snapshot_kind,
+                current_full_hash,
             )
             payload = _json(
                 {
@@ -375,8 +428,10 @@ class MergeService:
                     "recorded_hash": state.managed_hash,
                     "vault_hash": current_managed_hash,
                     "authority_hash": authority_hash,
+                    "snapshot_kind": snapshot.snapshot_kind,
+                    "vault_full_hash": current_full_hash,
                     "database_base64": _b64(database_bytes),
-                    "vault_base64": _b64(current),
+                    "vault_base64": _b64(vault_owned_bytes),
                 }
             )
             existing = self._get_job(conflict_id)
@@ -408,6 +463,13 @@ class MergeService:
     ) -> ReconciliationResult:
         if actor != "user":
             raise ValueError("reconciliation_actor_must_be_user")
+        for diagnostic in (
+            "managed_snapshot_unavailable",
+            "managed_snapshot_invalid",
+            "managed_boundary_invalid",
+        ):
+            if conflict_id.startswith(f"reconcile-diagnostic-{diagnostic}-"):
+                raise ValueError(diagnostic)
         job = self._get_job(conflict_id)
         if job is None:
             raise KeyError("reconciliation_conflict_not_found")
@@ -425,8 +487,10 @@ class MergeService:
         project_id = str(payload["project_id"])
         relative = self._safe_relative(project_id, Path(payload["path"]))
         target = self.vault_root / relative
-        vault_bytes = _unb64(payload["vault_base64"])
+        vault_owned_bytes = _unb64(payload["vault_base64"])
         database_bytes = _unb64(payload["database_base64"])
+        snapshot_kind = str(payload["snapshot_kind"])
+        vault_full_hash = str(payload["vault_full_hash"])
         if (
             _reconciliation_id(
                 project_id,
@@ -435,6 +499,8 @@ class MergeService:
                 str(payload["vault_hash"]),
                 str(payload["authority_hash"]),
                 database_bytes,
+                snapshot_kind,
+                vault_full_hash,
             )
             != conflict_id
         ):
@@ -443,20 +509,45 @@ class MergeService:
             self.repository.list_project_knowledge(project_id)
         ) != str(payload["authority_hash"]):
             raise StalePlanError("reconciliation_authority_changed")
-        if not target.exists() or target.read_bytes() != vault_bytes:
+        if not target.is_file():
+            raise StalePlanError("reconciliation_target_changed")
+        current_full = target.read_bytes()
+        try:
+            current_owned = (
+                managed_block_bytes(current_full)
+                if snapshot_kind == "managed_block"
+                else current_full
+            )
+        except BoundaryError as exc:
+            raise StalePlanError("reconciliation_target_changed") from exc
+        if (
+            current_owned != vault_owned_bytes
+            or sha256_bytes(current_full) != vault_full_hash
+        ):
             raise StalePlanError("reconciliation_target_changed")
         if action == "manual_edit":
             self.repository.finish_sync(conflict_id, "awaiting_user_input")
             return ReconciliationResult(conflict_id, "awaiting_user_input")
         if action == "keep_database":
-            plan = self.create_plan(project_id, replacements={relative: database_bytes})
+            replacement = (
+                replace_managed_block_bytes(current_full, project_id, database_bytes)
+                if snapshot_kind == "managed_block"
+                else database_bytes
+            )
+            plan = self.create_plan(project_id, replacements={relative: replacement})
             return ReconciliationResult(
                 conflict_id, "preview_required", plan_id=plan.id
             )
         if action != "adopt_vault":
             raise ValueError("unsupported_reconciliation_action")
+        if snapshot_kind != "full" or relative.name not in {
+            "规则.md",
+            "经验.md",
+            "任务状态.md",
+        }:
+            raise ValueError("vault_adoption_unsupported_target")
         database_entries = parse_aggregate_entries(database_bytes)
-        vault_entries = parse_aggregate_entries(vault_bytes)
+        vault_entries = parse_aggregate_entries(vault_owned_bytes)
         changed = [
             identifier
             for identifier in sorted(set(database_entries) | set(vault_entries))
@@ -500,7 +591,7 @@ class MergeService:
         self.repository.save_manual_edit_candidate(
             candidate,
             relative_path=relative,
-            content_hash=sha256_bytes(vault_bytes),
+            content_hash=vault_full_hash,
             adoption=VaultAdoption(
                 candidate_id=candidate.id,
                 project_id=project_id,
@@ -508,8 +599,8 @@ class MergeService:
                 original_version=original.version,
                 original_text_hash=sha256_bytes(original.text.encode("utf-8")),
                 relative_path=relative,
-                vault_managed_hash=sha256_bytes(vault_bytes),
-                vault_full_hash=sha256_bytes(vault_bytes),
+                vault_managed_hash=sha256_bytes(vault_owned_bytes),
+                vault_full_hash=vault_full_hash,
                 authority_hash=str(payload["authority_hash"]),
             ),
         )
@@ -707,6 +798,8 @@ def _reconciliation_id(
     vault_hash: str,
     authority_hash: str,
     database_bytes: bytes,
+    snapshot_kind: str,
+    vault_full_hash: str,
 ) -> str:
     identity = [
         project_id,
@@ -715,9 +808,19 @@ def _reconciliation_id(
         vault_hash,
         authority_hash,
         sha256_bytes(database_bytes),
+        snapshot_kind,
+        vault_full_hash,
     ]
     return (
         "reconcile-" + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
+    )
+
+
+def _diagnostic_id(project_id: str, relative: Path, status: str) -> str:
+    identity = [project_id, relative.as_posix(), status]
+    return (
+        f"reconcile-diagnostic-{status}-"
+        + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
     )
 
 

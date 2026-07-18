@@ -34,6 +34,7 @@ class PlannedWrite:
     after_bytes: bytes
     before_managed_hash: str = ""
     after_managed_hash: str = ""
+    ownership_kind: str = "full"
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,31 @@ def managed_block_hash(content: bytes) -> str:
     if len(starts) != 1 or len(ends) != 1 or ends[0].start() <= starts[0].end():
         raise BoundaryError("managed boundary must contain exactly one ordered pair")
     return sha256_bytes(content[starts[0].end() : ends[0].start()])
+
+
+def managed_block_bytes(content: bytes) -> bytes:
+    starts = list(_START.finditer(content))
+    ends = list(_END.finditer(content))
+    if len(starts) != 1 or len(ends) != 1 or ends[0].start() <= starts[0].end():
+        raise BoundaryError("managed boundary must contain exactly one ordered pair")
+    return content[starts[0].end() : ends[0].start()]
+
+
+def replace_managed_block_bytes(
+    content: bytes, project_id: str, owned_bytes: bytes
+) -> bytes:
+    """Restore exact owned bytes while preserving the current surrounding prose."""
+
+    starts = list(_START.finditer(content))
+    ends = list(_END.finditer(content))
+    if len(starts) != 1 or len(ends) != 1:
+        raise BoundaryError("managed boundary must contain exactly one start/end pair")
+    start, end = starts[0], ends[0]
+    if start.group(1) != end.group(1) or end.start() <= start.end():
+        raise BoundaryError("managed boundary kinds do not match")
+    if start.group(2).decode("utf-8") != project_id:
+        raise BoundaryError("managed boundary project does not match mapping")
+    return content[: start.end()] + owned_bytes + content[end.start() :]
 
 
 def parse_aggregate_entries(content: bytes) -> dict[str, str]:
@@ -169,6 +195,7 @@ class ObsidianProjection:
                         after,
                         managed_block_hash(before),
                         managed_block_hash(after),
+                        "managed_block",
                     )
                 )
 

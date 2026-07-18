@@ -21,6 +21,8 @@ from agent_retro.domain.models import (
     ProjectionEvent,
     ProjectionStatus,
     ManagedFileState,
+    ManagedFileSnapshot,
+    ManagedFileUpdate,
     Reclassification,
     PurgePlan,
     PurgeStatus,
@@ -175,7 +177,7 @@ class RetroRepository(Protocol):
         self,
         event_id: str,
         project_id: str,
-        file_states: Sequence[tuple[Path, str, str]],
+        file_states: Sequence[ManagedFileUpdate],
         expected_input_hash: str,
     ) -> None: ...
 
@@ -240,6 +242,8 @@ class RetroRepository(Protocol):
     ) -> None: ...
 
     def get_managed_file_state(self, path: Path) -> ManagedFileState | None: ...
+
+    def get_managed_file_snapshot(self, path: Path) -> ManagedFileSnapshot | None: ...
 
     def list_managed_file_states(self, project_id: str) -> list[ManagedFileState]: ...
 

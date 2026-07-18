@@ -194,6 +194,33 @@ class ManagedFileState:
 
 
 @dataclass(frozen=True)
+class ManagedFileSnapshot:
+    project_id: str
+    path: Path
+    snapshot_kind: str
+    owned_bytes: bytes
+    managed_hash: str
+    full_hash: str
+    event_id: str
+
+
+@dataclass(frozen=True)
+class ManagedFileUpdate:
+    path: Path
+    managed_hash: str
+    full_hash: str
+    snapshot_kind: str
+    owned_bytes: bytes
+    event_id: str
+
+    def __iter__(self):
+        # Preserve the established tuple-shaped port for lightweight test doubles.
+        yield self.path
+        yield self.managed_hash
+        yield self.full_hash
+
+
+@dataclass(frozen=True)
 class VaultAdoption:
     candidate_id: str
     project_id: str
