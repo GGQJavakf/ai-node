@@ -299,9 +299,7 @@ def test_malformed_session_fails_closed(fixtures_dir, tmp_path):
     with pytest.raises(SessionNotFoundError):
         source.latest_completed()
 
-    assert any(
-        "缺少 session ID" in item for item in source.last_discovery.diagnostics
-    )
+    assert any("缺少 session ID" in item for item in source.last_discovery.diagnostics)
 
 
 def test_unknown_optional_event_is_diagnosed_and_never_normalized(codex_home):
@@ -310,7 +308,9 @@ def test_unknown_optional_event_is_diagnosed_and_never_normalized(codex_home):
     session = source.load("session-unknown")
 
     assert [event.kind for event in session.events] == ["user"]
-    assert any("future_optional_event" in warning for warning in source.last_discovery.warnings)
+    assert any(
+        "future_optional_event" in warning for warning in source.last_discovery.warnings
+    )
 
 
 def test_candidate_budget_selects_global_newest_before_stat_and_parse(
@@ -400,7 +400,10 @@ def test_nonstandard_and_date_mismatched_sessions_are_not_statted_or_opened(
     assert forbidden.isdisjoint(stated_jsonl)
     assert forbidden.isdisjoint(opened_jsonl)
     assert all(
-        any(str(path) in item and "非规范" in item for item in source.last_discovery.diagnostics)
+        any(
+            str(path) in item and "非规范" in item
+            for item in source.last_discovery.diagnostics
+        )
         for path in forbidden
     )
 
@@ -556,9 +559,7 @@ def test_empty_peek_timeout_after_open_or_eof_is_not_not_found(
     assert source.last_discovery.diagnostics[-1] == "会话发现超过配置时限"
 
 
-def test_deadline_interrupts_directory_enumeration(
-    fixtures_dir, tmp_path, monkeypatch
-):
+def test_deadline_interrupts_directory_enumeration(fixtures_dir, tmp_path, monkeypatch):
     sessions = tmp_path / "sessions"
     _copy_fixture(fixtures_dir, sessions, "active")
     _copy_fixture(fixtures_dir, sessions, "completed")
@@ -604,9 +605,7 @@ def test_deadline_interrupts_directory_enumeration(
         source.latest_completed()
 
 
-def test_deadline_is_checked_after_the_last_non_session_entry(
-    tmp_path, monkeypatch
-):
+def test_deadline_is_checked_after_the_last_non_session_entry(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex"
     sessions = codex_home / "sessions"
     sessions.mkdir(parents=True)
@@ -718,12 +717,16 @@ def test_discovery_timeout_has_an_explicit_diagnostic(fixtures_dir, tmp_path):
 def test_effective_codex_home_prefers_explicit_environment(tmp_path):
     configured = tmp_path / "configured-codex"
 
-    assert effective_codex_home(
-        home=tmp_path / "user", env={"CODEX_HOME": str(configured)}
-    ) == configured.resolve()
-    assert effective_codex_home(home=tmp_path / "user", env={}) == (
-        tmp_path / "user" / ".codex"
-    ).resolve()
+    assert (
+        effective_codex_home(
+            home=tmp_path / "user", env={"CODEX_HOME": str(configured)}
+        )
+        == configured.resolve()
+    )
+    assert (
+        effective_codex_home(home=tmp_path / "user", env={})
+        == (tmp_path / "user" / ".codex").resolve()
+    )
 
 
 def test_redactor_covers_headers_fields_pem_and_connection_strings():
@@ -753,7 +756,10 @@ def test_redactor_covers_headers_fields_pem_and_connection_strings():
 @pytest.mark.parametrize(
     ("remote", "expected"),
     [
-        ("https://user:password@example.invalid/Owner/Repo.git", "example.invalid/Owner/Repo"),
+        (
+            "https://user:password@example.invalid/Owner/Repo.git",
+            "example.invalid/Owner/Repo",
+        ),
         ("git@example.invalid:Owner/Repo.git", "example.invalid/Owner/Repo"),
         ("ssh://git@example.invalid/Owner/Repo.git", "example.invalid/Owner/Repo"),
     ],
@@ -773,9 +779,7 @@ def test_project_resolver_uses_root_then_unique_remote(tmp_path):
     vault.mkdir()
     mapping = ProjectMappingService(
         repo, vault_root=vault, review_stored_evidence=_ignore_review
-    ).map(
-        first_root, "Projects/First"
-    )
+    ).map(first_root, "Projects/First")
     resolver = ProjectResolver(repo.list_project_mappings())
 
     exact = resolver.resolve(first_root, "example.invalid/Owner/Repo")
@@ -829,7 +833,9 @@ def test_project_mapping_rejects_vault_escape_and_incompatible_collision(tmp_pat
 def test_compatible_remote_mapping_is_reused_for_another_clone(tmp_path):
     repo = _repository(tmp_path)
     first = _git_repository(tmp_path / "first", "git@example.invalid:Owner/Repo.git")
-    second = _git_repository(tmp_path / "second", "https://example.invalid/Owner/Repo.git")
+    second = _git_repository(
+        tmp_path / "second", "https://example.invalid/Owner/Repo.git"
+    )
     vault = tmp_path / "vault"
     vault.mkdir()
     service = ProjectMappingService(
@@ -869,9 +875,7 @@ def test_capture_is_redacted_transactional_idempotent_and_integrity_checked(
 
 
 def test_source_identity_lookup_is_a_mandatory_capture_port():
-    assert callable(
-        getattr(RetroRepository, "find_session_by_source_id", None)
-    )
+    assert callable(getattr(RetroRepository, "find_session_by_source_id", None))
     assert "getattr" not in inspect.getsource(CaptureService._capture)
 
 
@@ -890,9 +894,7 @@ def test_project_mapping_service_requires_review_callback(tmp_path):
     with pytest.raises(TypeError):
         ProjectMappingService(repo, vault_root=vault)
     with pytest.raises(TypeError):
-        ProjectMappingService(
-            repo, vault_root=vault, review_stored_evidence=None
-        )
+        ProjectMappingService(repo, vault_root=vault, review_stored_evidence=None)
 
 
 def test_parser_failure_creates_no_partial_capture(fixtures_dir, tmp_path):
@@ -907,8 +909,7 @@ def test_parser_failure_creates_no_partial_capture(fixtures_dir, tmp_path):
         service.capture_last()
 
     assert any(
-        "缺少 session ID" in item
-        for item in service.source.last_discovery.diagnostics
+        "缺少 session ID" in item for item in service.source.last_discovery.diagnostics
     )
 
     connection = sqlite3.connect(repo.db_path)
@@ -950,21 +951,20 @@ def test_reclassify_reviews_stored_redacted_evidence_before_repository_update(
     mapping_service.reclassify("session-completed", mapping.id, actor="tester")
 
     assert len(reviewed) == 1
-    assert reviewed[0][0:2] == ("session-completed", "Projects/Example")
+    assert reviewed[0][0] == "session-completed"
+    assert reviewed[0][1].startswith("awaiting:")
+    assert reviewed[0][1] == reviewed[0][3]
     assert reviewed[0][2]
     assert reviewed[0][3].startswith("awaiting:")
     assert all(
-        ("TOKEN" + "_FOR_REDACTION_TEST") not in item.excerpt
-        for item in reviewed[0][2]
+        ("TOKEN" + "_FOR_REDACTION_TEST") not in item.excerpt for item in reviewed[0][2]
     )
     persisted = repo.find_session_by_source_id("session-completed")
     assert persisted is not None
     assert persisted.project_id == "Projects/Example"
 
 
-def test_reclassify_callback_failure_leaves_session_awaiting(
-    fixtures_dir, tmp_path
-):
+def test_reclassify_callback_failure_leaves_session_awaiting(fixtures_dir, tmp_path):
     codex_home = tmp_path / "codex"
     _copy_fixture(fixtures_dir, codex_home, "completed")
     repo = _repository(tmp_path)
@@ -992,8 +992,7 @@ def test_reclassify_callback_failure_leaves_session_awaiting(
     connection = sqlite3.connect(repo.db_path)
     try:
         count = connection.execute(
-            "SELECT COUNT(*) FROM audit_log "
-            "WHERE action = 'session_reclassified'"
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'session_reclassified'"
         ).fetchone()[0]
     finally:
         connection.close()
@@ -1004,22 +1003,25 @@ def test_cli_requires_exactly_one_capture_selector_and_has_project_commands():
     parser = build_parser()
 
     assert parser.parse_args(["capture", "--last"]).capture_last is True
-    assert parser.parse_args(
-        ["capture", "--session", "session-completed"]
-    ).session_id == "session-completed"
+    assert (
+        parser.parse_args(["capture", "--session", "session-completed"]).session_id
+        == "session-completed"
+    )
     with pytest.raises(SystemExit):
         parser.parse_args(["capture"])
     with pytest.raises(SystemExit):
+        parser.parse_args(["capture", "--last", "--session", "session-completed"])
+    assert (
         parser.parse_args(
-            ["capture", "--last", "--session", "session-completed"]
-        )
-    assert parser.parse_args(
-        ["project", "map", "--root", ".", "--vault-project", "Projects/Test"]
-    ).project_command == "map"
+            ["project", "map", "--root", ".", "--vault-project", "Projects/Test"]
+        ).project_command
+        == "map"
+    )
     assert parser.parse_args(["project", "list"]).project_command == "list"
-    assert parser.parse_args(
-        ["project", "remove", "mapping-1"]
-    ).project_command == "remove"
+    assert (
+        parser.parse_args(["project", "remove", "mapping-1"]).project_command
+        == "remove"
+    )
     with pytest.raises(SystemExit):
         parser.parse_args(["project", "reclassify", "session-1", "mapping-1"])
 
@@ -1040,11 +1042,14 @@ def test_cli_capture_last_then_named_session_uses_only_injected_paths(
     assert first["data"]["captured"] is True
     assert first["data"]["session_id"] == "session-completed"
 
-    assert main(
-        ["--json", "capture", "--session", "session-completed"],
-        home=tmp_path,
-        env=env,
-    ) == 0
+    assert (
+        main(
+            ["--json", "capture", "--session", "session-completed"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
     second = json.loads(capsys.readouterr().out)
     assert second["data"]["reused"] is True
     assert (state_home / "retro.db").is_file()

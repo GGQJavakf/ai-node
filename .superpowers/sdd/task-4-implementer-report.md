@@ -109,3 +109,40 @@ Status: complete for the explicitly scoped non-CLI milestone.
 - No CLI or model gateway wiring was added in Milestone C, per the milestone instruction.
 - OpenSpec checkboxes remain unchanged because `2.8`, `3.6`, and `3.9` explicitly require CLI surfaces not authorized in this milestone; partially covered task groups were not reported as complete.
 - No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
+
+## Milestone D: review CLI, model composition, and stored-evidence reclassification
+
+Status: complete for OpenSpec tasks `2.8` and `3.1` through `3.9`; purge and scenario-index work remain open.
+
+### RED evidence
+
+- First command: `python -m pytest tests/test_agentretro_cli.py -q`.
+- First result: `3 failed`; the parser did not recognize `review`, and the CLI had no `_build_review_service` composition boundary.
+- Second command: `python -m pytest tests/test_agentretro_foundation.py::test_legacy_model_client_from_config_refilters_and_copies_allowlist tests/test_agentretro_cli.py -q`.
+- Second result: `6 failed, 5 passed`; failures identified the missing allowlisted one-read model composition, incorrect null-retry success, and missing project reclassification CLI wiring.
+- Final security RED: the focused sensitive-error test failed because `api_key=must-not-leak` appeared in the JSON detail; the generic error path now applies the shared redactor before human or JSON output.
+
+### GREEN evidence
+
+- Focused command: `python -m pytest tests/test_agentretro_cli.py tests/test_agentretro_review.py tests/test_agentretro_knowledge.py tests/test_agentretro_capture.py tests/test_agentretro_foundation.py -q`.
+- Result: `137 passed in 5.72s`.
+- Full command: `python -m pytest -q`.
+- Final result after the sensitive-error regression test: `322 passed in 15.95s`.
+- Formatting and lint checks: all seven changed Python files were already formatted after the scoped formatter run, and `ruff check` reported `All checks passed!`.
+- OpenSpec command: `openspec validate add-agentretro-mvp --strict`.
+- Result: `Change 'add-agentretro-mvp' is valid`.
+
+### Implemented behavior
+
+- `retro review` now exposes run, list, show, accept, edit, reject, retry, merge, promote, and archive commands with typed arguments and mutually exclusive retry selectors.
+- List, show, and manual lifecycle commands compose no model client. Run, retry, and project reclassification build the review service from one allowlisted legacy-config read, with a stable error when the model is absent.
+- JSON responses use stable English messages and serialize enums and datetimes safely; human output remains Unicode-safe.
+- Model unavailability produces a stable retryable result rather than a successful null response.
+- `retro project reclassify` reviews only evidence already persisted in SQLite. Failed review leaves the session and candidates awaiting classification; successful review then reclassifies the session and its pending candidates transactionally.
+- The model-client helper reapplies the allowlist to the already-read config, so unrelated legacy values cannot reach client construction.
+
+### Scope boundary
+
+- OpenSpec tasks `2.8` and `3.1` through `3.9` are marked complete. Tasks `3.10` and `3.11` remain open.
+- Tests use injected or monkeypatched gateways and temporary SQLite repositories; no real model request or user session path was used.
+- No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.

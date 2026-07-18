@@ -6,22 +6,37 @@ import argparse
 import os
 import sys
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
 from agent_retro.application.bootstrap import build_retro_repository
 from agent_retro.application.capture import CaptureResult, CaptureService
+from agent_retro.application.review import ReviewService, ReviewUnavailableError
+from agent_retro.domain.models import CandidateStatus, KnowledgeType
 from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     effective_codex_home,
+)
+from agent_retro.infrastructure.legacy_model import (
+    build_retro_llm_client_from_config,
+    load_legacy_model_config,
+)
+from agent_retro.infrastructure.llm_review import (
+    LLMExtractionGateway,
+    LLMReviewGateway,
 )
 from agent_retro.infrastructure.project_mapping import (
     ProjectMappingService,
     ProjectResolver,
 )
 from agent_retro.infrastructure.redaction import Redactor
-from agent_retro.infrastructure.settings import load_retro_settings
+from agent_retro.infrastructure.settings import (
+    effective_model_timeout,
+    load_retro_settings,
+)
 from agent_retro.presentation.output import safe_text, write_json
+from agent_retro.presentation.review_commands import run_review_command
 
 
 _READY_MESSAGE = "AgentRetro 已就绪。"
@@ -46,15 +61,56 @@ def build_parser() -> argparse.ArgumentParser:
     selector.add_argument("--session", dest="session_id")
 
     project = commands.add_parser("project", help="管理项目映射")
-    project_commands = project.add_subparsers(
-        dest="project_command", required=True
-    )
+    project_commands = project.add_subparsers(dest="project_command", required=True)
     map_command = project_commands.add_parser("map", help="创建项目映射")
     map_command.add_argument("--root", required=True, type=Path)
     map_command.add_argument("--vault-project", required=True)
     project_commands.add_parser("list", help="列出活动项目映射")
     remove = project_commands.add_parser("remove", help="停用项目映射")
     remove.add_argument("mapping_id")
+    reclassify = project_commands.add_parser(
+        "reclassify", help="重新分类 awaiting 会话"
+    )
+    reclassify.add_argument("--session", dest="session_id", required=True)
+    reclassify.add_argument("--mapping", dest="mapping_id", required=True)
+
+    review = commands.add_parser("review", help="审核知识候选")
+    review_commands = review.add_subparsers(dest="review_command", required=True)
+    run = review_commands.add_parser("run", help="提取并审核一个已捕获会话")
+    run.add_argument("--session", dest="session_id", required=True)
+    list_command = review_commands.add_parser("list", help="列出知识候选")
+    list_command.add_argument(
+        "--status",
+        dest="candidate_status",
+        choices=[item.value for item in CandidateStatus],
+    )
+    show = review_commands.add_parser("show", help="查看知识候选")
+    show.add_argument("candidate_id")
+    accept = review_commands.add_parser("accept", help="接受知识候选")
+    accept.add_argument("candidate_id")
+    edit = review_commands.add_parser("edit", help="编辑并接受知识候选")
+    edit.add_argument("candidate_id")
+    edit.add_argument("--text", required=True)
+    edit.add_argument(
+        "--type",
+        dest="knowledge_type",
+        choices=[item.value for item in KnowledgeType],
+    )
+    edit.add_argument("--scope", choices=("project", "global"))
+    edit.add_argument("--valid-until", dest="valid_until", type=_datetime_argument)
+    reject = review_commands.add_parser("reject", help="拒绝知识候选")
+    reject.add_argument("candidate_id")
+    retry = review_commands.add_parser("retry", help="重试模型审核")
+    retry_selector = retry.add_mutually_exclusive_group(required=True)
+    retry_selector.add_argument("--candidate", dest="retry_candidate_id")
+    retry_selector.add_argument("--session", dest="retry_session_id")
+    merge = review_commands.add_parser("merge", help="合并知识冲突")
+    merge.add_argument("conflict_id")
+    merge.add_argument("--text", required=True)
+    promote = review_commands.add_parser("promote", help="提升为全局知识")
+    promote.add_argument("knowledge_id")
+    archive = review_commands.add_parser("archive", help="归档知识")
+    archive.add_argument("knowledge_id")
     return parser
 
 
@@ -68,18 +124,32 @@ def main(
     if args.command is not None:
         try:
             return _run_command(args, home=home, env=env)
-        except (OSError, RuntimeError, ValueError) as exc:
+        except ReviewUnavailableError:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_REVIEW_RETRYABLE",
+                        "message": ("Model review is unavailable; retry is available."),
+                        "data": {"retryable": True},
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text("模型审核暂不可用；可安全重试。") + "\n")
+            return 2
+        except (KeyError, OSError, RuntimeError, ValueError) as exc:
+            detail = Redactor().redact(str(exc))
             if args.json_output:
                 write_json(
                     {
                         "status": "error",
                         "code": "RETRO_COMMAND_FAILED",
-                        "message": str(exc),
-                        "data": {},
+                        "message": "AgentRetro command failed.",
+                        "data": {"detail": detail},
                     }
                 )
             else:
-                sys.stderr.write(safe_text(str(exc)) + "\n")
+                sys.stderr.write(safe_text(detail) + "\n")
             return 2
     if args.json_output:
         write_json(_READY_ENVELOPE)
@@ -114,10 +184,23 @@ def _run_command(
         _write_capture_result(result, args.json_output)
         return 0
 
+    if args.command == "review":
+        return run_review_command(
+            args,
+            settings,
+            repository,
+            build_review_service=_build_review_service,
+        )
+
+    review_stored_evidence = _review_unavailable
+    if args.project_command == "reclassify":
+        review_stored_evidence = _build_review_service(
+            settings, repository
+        ).review_stored_evidence
     service = ProjectMappingService(
         repository,
         vault_root=settings.obsidian_root,
-        review_stored_evidence=_review_unavailable,
+        review_stored_evidence=review_stored_evidence,
     )
     if args.project_command == "map":
         mapping = service.map(args.root, args.vault_project)
@@ -127,6 +210,12 @@ def _run_command(
     elif args.project_command == "remove":
         service.remove(args.mapping_id)
         data = {"mapping_id": args.mapping_id, "active": False}
+    elif args.project_command == "reclassify":
+        service.reclassify(args.session_id, args.mapping_id)
+        data = {
+            "session_id": args.session_id,
+            "mapping_id": args.mapping_id,
+        }
     else:
         raise ValueError(f"unsupported project command: {args.project_command}")
     if args.json_output:
@@ -134,7 +223,11 @@ def _run_command(
             {
                 "status": "ok",
                 "code": "RETRO_PROJECT_UPDATED",
-                "message": "Project mapping command completed.",
+                "message": (
+                    "Project session reclassified."
+                    if args.project_command == "reclassify"
+                    else "Project mapping command completed."
+                ),
                 "data": data,
             }
         )
@@ -169,6 +262,29 @@ def _write_capture_result(result: CaptureResult, json_output: bool) -> None:
             )
             + "\n"
         )
+
+
+def _build_review_service(settings, repository):
+    legacy = load_legacy_model_config()
+    model_value = legacy.get("model")
+    if not isinstance(model_value, str) or not model_value.strip():
+        raise RuntimeError("AgentRetro model is not configured.")
+    model = model_value.strip()
+    client = build_retro_llm_client_from_config(legacy)
+    return ReviewService(
+        repository,
+        LLMExtractionGateway(client, model=model),
+        LLMReviewGateway(client, model=model),
+        model_timeout_seconds=effective_model_timeout(settings, legacy),
+        redact=Redactor().redact,
+    )
+
+
+def _datetime_argument(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("valid-until must be ISO-8601") from exc
 
 
 def _mapping_data(mapping) -> dict[str, object]:

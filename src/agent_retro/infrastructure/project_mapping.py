@@ -92,7 +92,11 @@ def resolve_git_identity(path: Path) -> tuple[Path, str]:
         text=True,
         timeout=10,
     )
-    remote = normalize_git_remote(remote_result.stdout) if remote_result.returncode == 0 else ""
+    remote = (
+        normalize_git_remote(remote_result.stdout)
+        if remote_result.returncode == 0
+        else ""
+    )
     return root, remote
 
 
@@ -165,7 +169,9 @@ class ProjectMappingService:
         if not callable(review_stored_evidence):
             raise TypeError("review_stored_evidence callback is required")
         self.repository = repository
-        self.vault_root = Path(vault_root).expanduser().resolve() if vault_root else None
+        self.vault_root = (
+            Path(vault_root).expanduser().resolve() if vault_root else None
+        )
         self.review_stored_evidence = review_stored_evidence
 
     def map(
@@ -180,9 +186,7 @@ class ProjectMappingService:
                 continue
             if existing.obsidian_project == project:
                 return existing
-            raise ProjectMappingConflictError(
-                "Git root 或 remote 已映射到不兼容的项目"
-            )
+            raise ProjectMappingConflictError("Git root 或 remote 已映射到不兼容的项目")
         identity = json.dumps(
             [str(root), remote, project], ensure_ascii=False, separators=(",", ":")
         )
@@ -203,12 +207,8 @@ class ProjectMappingService:
     def remove(self, mapping_id: str, actor: str = "user") -> None:
         self.repository.deactivate_project_mapping(mapping_id, actor)
 
-    def reclassify(
-        self, session_id: str, mapping_id: str, actor: str = "user"
-    ) -> None:
-        mappings = {
-            item.id: item for item in self.repository.list_project_mappings()
-        }
+    def reclassify(self, session_id: str, mapping_id: str, actor: str = "user") -> None:
+        mappings = {item.id: item for item in self.repository.list_project_mappings()}
         mapping = mappings.get(mapping_id)
         if mapping is None:
             raise ProjectMappingError(f"项目映射不存在或已停用: {mapping_id}")
@@ -220,9 +220,7 @@ class ProjectMappingService:
                 f"会话不在 awaiting classification 状态: {session_id}"
             )
         evidence = self.repository.list_evidence(session.id)
-        self.review_stored_evidence(
-            session_id, mapping.obsidian_project, tuple(evidence)
-        )
+        self.review_stored_evidence(session_id, session.project_id, tuple(evidence))
         self.repository.reclassify_session(
             session_id,
             mapping.obsidian_project,
@@ -247,9 +245,7 @@ class ProjectMappingService:
         try:
             target.relative_to(self.vault_root)
         except ValueError as exc:
-            raise UnsafeProjectPathError(
-                "vault project 不能逃逸 vault root"
-            ) from exc
+            raise UnsafeProjectPathError("vault project 不能逃逸 vault root") from exc
         return relative.as_posix().strip("/")
 
 

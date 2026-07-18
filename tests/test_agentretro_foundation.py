@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 import _path  # noqa: F401
+from agent_retro.infrastructure import legacy_model
 from agent_retro.domain.models import KnowledgeType
 from agent_retro.infrastructure.legacy_model import (
     MODEL_CONFIG_KEYS,
@@ -250,6 +251,24 @@ def test_legacy_model_client_receives_only_a_fresh_allowlisted_dictionary(
     assert set(passed_config) == set(MODEL_CONFIG_KEYS)
     assert "sqlite_path" not in passed_config
     load_settings.assert_called_once_with("project-root")
+
+
+@patch("agent_retro.infrastructure.legacy_model.build_llm_client")
+def test_legacy_model_client_from_config_refilters_and_copies_allowlist(
+    build_llm_client,
+):
+    source = {key: f"value-{key}" for key in MODEL_CONFIG_KEYS}
+    source["unrelated_secret"] = "must-not-be-forwarded"
+    sentinel = object()
+    build_llm_client.return_value = sentinel
+
+    result = legacy_model.build_retro_llm_client_from_config(source)
+
+    passed_config = build_llm_client.call_args.args[0]
+    assert result is sentinel
+    assert passed_config is not source
+    assert set(passed_config) == set(MODEL_CONFIG_KEYS)
+    assert "unrelated_secret" not in passed_config
 
 
 def test_parser_has_independent_program_name():

@@ -16,21 +16,21 @@
 - [x] 2.5 Implement Git-root and normalized-remote project routing plus audited SQLite project mapping records, including unknown and ambiguous project states.
 - [x] 2.6 Implement pre-model and pre-persistence redaction, minimal evidence excerpts, source locators, and tests proving captured instructions cannot trigger actions.
 - [x] 2.7 Wire `retro capture` to one database transaction so parser or evidence failure creates no partial session, candidate, or knowledge state.
-- [ ] 2.8 Implement `retro project map/list/remove/reclassify` with containment checks, collision rejection, actor/time audit records, and reclassification of awaiting sessions without reparsing source events.
+- [x] 2.8 Implement `retro project map/list/remove/reclassify` with containment checks, collision rejection, actor/time audit records, and reclassification of awaiting sessions without reparsing source events.
 - [x] 2.9 Bound newest-first session discovery by configured candidate count and deadline, stream parsing, reject oversized files before model work, and preserve an explicit diagnostic for every skipped or timed-out source.
 - [ ] 2.10 Add tests whose names or metadata reference every Codex retrospective scenario `CR-01` through `CR-22`, and record the scenario-to-test mapping in verification evidence.
 
 ## 3. Knowledge Extraction, Review, and Lifecycle
 
-- [ ] 3.1 Define `RULE`, `LESSON`, and `TASK_STATE` models, type-specific evidence validators, project/global scope, versioning, status transitions, and 14-day task-state expiry.
-- [ ] 3.2 Implement a strict structured extraction request and response parser that produces evidence-bound candidates without accepting them.
-- [ ] 3.3 Implement the separate structured review request and response parser for verdict, confidence, reason, normalized text, duplicate assessment, and conflict assessment.
-- [ ] 3.4 Implement type thresholds and deterministic hard gates for secrets, evidence, project identity, duplicates, conflicts, speculation, rule authority, and lesson verification.
-- [ ] 3.5 Implement automatic acceptance with complete gate and actor audit records, and keep below-threshold or unavailable-model candidates pending.
-- [ ] 3.6 Implement `retro review` list/show/accept/edit/reject commands with evidence display, before/after hashes, and stable JSON output.
-- [ ] 3.7 Implement conflict detection, old-item-active behavior, merge suggestions, explicit merge resolution, and superseded-version history.
-- [ ] 3.8 Implement project-to-global promotion, stale task-state handling, and ordinary archive without physical deletion.
-- [ ] 3.9 Implement `retro review retry --candidate/--session` with immutable attempt records, fresh model review, idempotent lifecycle transitions, and no duplicate accepted knowledge.
+- [x] 3.1 Define `RULE`, `LESSON`, and `TASK_STATE` models, type-specific evidence validators, project/global scope, versioning, status transitions, and 14-day task-state expiry.
+- [x] 3.2 Implement a strict structured extraction request and response parser that produces evidence-bound candidates without accepting them.
+- [x] 3.3 Implement the separate structured review request and response parser for verdict, confidence, reason, normalized text, duplicate assessment, and conflict assessment.
+- [x] 3.4 Implement type thresholds and deterministic hard gates for secrets, evidence, project identity, duplicates, conflicts, speculation, rule authority, and lesson verification.
+- [x] 3.5 Implement automatic acceptance with complete gate and actor audit records, and keep below-threshold or unavailable-model candidates pending.
+- [x] 3.6 Implement `retro review` list/show/accept/edit/reject commands with evidence display, before/after hashes, and stable JSON output.
+- [x] 3.7 Implement conflict detection, old-item-active behavior, merge suggestions, explicit merge resolution, and superseded-version history.
+- [x] 3.8 Implement project-to-global promotion, stale task-state handling, and ordinary archive without physical deletion.
+- [x] 3.9 Implement `retro review retry --candidate/--session` with immutable attempt records, fresh model review, idempotent lifecycle transitions, and no duplicate accepted knowledge.
 - [ ] 3.10 Implement `retro kb purge plan/apply` so an immutable plan enumerates every AgentRetro-owned SQLite, vault, backup, log, and index copy; require plan ID plus exact operation confirmation; create only a content-free tombstone; and leave `purge_incomplete` with residual locations if any cleanup fails.
 - [ ] 3.11 Add tests whose names or metadata reference every knowledge-review scenario `KR-01` through `KR-24`, and record the scenario-to-test mapping in verification evidence.
 

@@ -36,3 +36,10 @@ def build_retro_llm_client(project_root: str | None = None):
     """Build the shared LLM client without exposing unrelated legacy settings."""
 
     return build_llm_client(load_legacy_model_config(project_root))
+
+
+def build_retro_llm_client_from_config(config: dict[str, object]):
+    """Build from one already-read config while reapplying the allowlist."""
+
+    filtered = {key: config.get(key) for key in MODEL_CONFIG_KEYS}
+    return build_llm_client(filtered)
