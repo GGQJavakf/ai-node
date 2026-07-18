@@ -203,9 +203,16 @@ class SQLiteRetroRepository(RetroRepository):
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            return connection
+        except BaseException:
+            try:
+                connection.close()
+            except BaseException:
+                pass
+            raise
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -260,25 +267,28 @@ class SQLiteRetroRepository(RetroRepository):
         if target_version < 1:
             raise ValueError("target_version must be at least 1")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        current_version = self.schema_version()
-        if current_version == target_version:
-            return
-        if current_version > target_version:
-            raise ValueError("database downgrades are not supported")
-
+        database_existed = self.db_path.exists()
+        connection: sqlite3.Connection | None = None
         backup_path: Path | None = None
         backup_hash: str | None = None
-        if self.db_path.exists():
-            self.backup_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-            backup_path = self.backup_dir / (
-                f"migration-{current_version}-to-{target_version}-{stamp}.db"
-            )
-            shutil.copy2(self.db_path, backup_path)
-            backup_hash = _sha256_file(backup_path)
-
-        connection = self._connect()
         try:
+            current_version = self.schema_version()
+            if current_version == target_version:
+                return
+            if current_version > target_version:
+                raise ValueError("database downgrades are not supported")
+
+            if database_existed:
+                self._prepare_database_for_backup()
+                self.backup_dir.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                backup_path = self.backup_dir / (
+                    f"migration-{current_version}-to-{target_version}-{stamp}.db"
+                )
+                shutil.copy2(self.db_path, backup_path)
+                backup_hash = _sha256_file(backup_path)
+
+            connection = self._connect()
             connection.execute("BEGIN IMMEDIATE")
             for version in range(current_version + 1, target_version + 1):
                 self._apply_migration(connection, version)
@@ -295,11 +305,18 @@ class SQLiteRetroRepository(RetroRepository):
                 )
             connection.commit()
         except BaseException:
-            connection.rollback()
-            connection.close()
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except BaseException:
+                    pass
+                try:
+                    connection.close()
+                except BaseException:
+                    pass
             if backup_path is not None and backup_hash is not None:
                 self._restore_backup(backup_path, backup_hash)
-            else:
+            elif not database_existed:
                 self._remove_failed_database()
             raise
         else:
@@ -316,20 +333,56 @@ class SQLiteRetroRepository(RetroRepository):
 
     def _restore_backup(self, backup_path: Path, expected_hash: str) -> None:
         restore_path = self.db_path.with_name(f".{self.db_path.name}.restore")
-        shutil.copy2(backup_path, restore_path)
-        os.replace(restore_path, self.db_path)
-        actual_hash = _sha256_file(self.db_path)
-        if actual_hash != expected_hash:
-            raise RuntimeError("migration backup restoration hash mismatch")
+        self._remove_database_sidecars()
+        try:
+            shutil.copy2(backup_path, restore_path)
+            if _sha256_file(restore_path) != expected_hash:
+                raise RuntimeError("migration backup copy hash mismatch")
+            os.replace(restore_path, self.db_path)
+            if _sha256_file(self.db_path) != expected_hash:
+                raise RuntimeError("migration backup restoration hash mismatch")
+            self._verify_database_readback()
+        finally:
+            restore_path.unlink(missing_ok=True)
+            self._remove_database_sidecars()
 
-    def _remove_failed_database(self) -> None:
+    def _prepare_database_for_backup(self) -> None:
+        """Recover journals and checkpoint WAL before copying the main file."""
+
+        connection = self._connect()
+        try:
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if checkpoint is not None and int(checkpoint[0]) != 0:
+                raise RuntimeError("database WAL checkpoint is busy")
+            result = connection.execute("PRAGMA quick_check").fetchone()
+            if result is None or str(result[0]).lower() != "ok":
+                raise RuntimeError("database failed pre-migration readback")
+        finally:
+            connection.close()
+        self._remove_database_sidecars()
+
+    def _verify_database_readback(self) -> None:
+        connection = sqlite3.connect(self.db_path)
+        try:
+            result = connection.execute("PRAGMA quick_check").fetchone()
+            if result is None or str(result[0]).lower() != "ok":
+                raise RuntimeError("restored database failed readback")
+        finally:
+            connection.close()
+
+    def _remove_database_sidecars(self) -> None:
         for path in (
-            self.db_path,
             Path(f"{self.db_path}-journal"),
             Path(f"{self.db_path}-wal"),
             Path(f"{self.db_path}-shm"),
         ):
             path.unlink(missing_ok=True)
+
+    def _remove_failed_database(self) -> None:
+        self.db_path.unlink(missing_ok=True)
+        self._remove_database_sidecars()
 
     def find_session(
         self, source_session_id: str, source_hash: str
@@ -360,9 +413,9 @@ class SQLiteRetroRepository(RetroRepository):
                     str(session.source_path),
                     session.source_hash,
                     session.project_id,
-                    session.status,
+                    "completed" if session.completed else "active",
                     _datetime_text(session.completed_at),
-                    _datetime_text(session.captured_at),
+                    _now_text(),
                 ),
             )
             for item in evidence:
@@ -376,8 +429,8 @@ class SQLiteRetroRepository(RetroRepository):
                         item.id,
                         item.session_id,
                         item.kind,
-                        item.event_id,
-                        item.content_hash,
+                        item.locator.event_id,
+                        item.locator.content_hash,
                         item.excerpt,
                     ),
                 )
@@ -395,6 +448,8 @@ class SQLiteRetroRepository(RetroRepository):
     def save_candidates(self, candidates: Sequence[Candidate]) -> None:
         with self.transaction() as connection:
             for candidate in candidates:
+                session_id = self._candidate_session_id(connection, candidate)
+                now = _now_text()
                 connection.execute(
                     """INSERT INTO candidates(
                         id, session_id, knowledge_type, project_id, scope,
@@ -403,16 +458,16 @@ class SQLiteRetroRepository(RetroRepository):
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         candidate.id,
-                        candidate.session_id,
+                        session_id,
                         candidate.knowledge_type.value,
                         candidate.project_id,
                         candidate.scope,
                         candidate.proposed_text,
                         candidate.status.value,
                         candidate.extraction_confidence,
-                        _review_to_json(candidate.review),
-                        _datetime_text(candidate.created_at),
-                        _datetime_text(candidate.updated_at),
+                        _review_to_json(None),
+                        now,
+                        now,
                     ),
                 )
                 connection.executemany(
@@ -431,6 +486,23 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"count": len(ids)},
                 ),
             )
+
+    def _candidate_session_id(
+        self, connection: sqlite3.Connection, candidate: Candidate
+    ) -> str:
+        if not candidate.evidence_ids:
+            raise ValueError("candidate must reference evidence")
+        placeholders = ",".join("?" for _ in candidate.evidence_ids)
+        rows = connection.execute(
+            f"SELECT id, session_id FROM evidence WHERE id IN ({placeholders})",
+            candidate.evidence_ids,
+        ).fetchall()
+        if len(rows) != len(set(candidate.evidence_ids)):
+            raise ValueError("candidate references unknown evidence")
+        session_ids = {str(row["session_id"]) for row in rows}
+        if len(session_ids) != 1:
+            raise ValueError("candidate evidence must belong to one session")
+        return session_ids.pop()
 
     def get_candidate(self, candidate_id: str) -> Candidate | None:
         connection = self._connect()
@@ -502,11 +574,11 @@ class SQLiteRetroRepository(RetroRepository):
                     attempt.id,
                     attempt.candidate_id,
                     attempt.input_hash,
-                    attempt.attempt_no,
+                    self._next_review_attempt_no(connection, attempt.candidate_id),
                     attempt.status,
                     attempt.result_json,
                     attempt.error,
-                    _datetime_text(attempt.created_at),
+                    _now_text(),
                 ),
             )
             self._append_audit_record(
@@ -520,6 +592,16 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
         return attempt
+
+    def _next_review_attempt_no(
+        self, connection: sqlite3.Connection, candidate_id: str
+    ) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 FROM review_attempts "
+            "WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return int(row[0])
 
     def finish_review_attempt(
         self,
@@ -562,8 +644,17 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if existing is not None:
                 knowledge = self._knowledge_from_row(connection, existing)
+                if (
+                    knowledge.text != text
+                    or knowledge.accepted_by != actor
+                    or knowledge.confidence != confidence
+                ):
+                    raise ValueError(
+                        f"candidate {candidate_id} conflicts with accepted knowledge"
+                    )
+                return knowledge
             else:
-                created_at = datetime.now(timezone.utc)
+                updated_at = datetime.now(timezone.utc)
                 knowledge = Knowledge(
                     id=f"knowledge-{candidate.id}",
                     version=1,
@@ -575,9 +666,9 @@ class SQLiteRetroRepository(RetroRepository):
                     status="active",
                     confidence=confidence,
                     accepted_by=actor,
-                    created_at=created_at,
-                    valid_until=None,
                     evidence_ids=candidate.evidence_ids,
+                    valid_until=None,
+                    updated_at=updated_at,
                 )
                 connection.execute(
                     """INSERT INTO knowledge(
@@ -597,7 +688,7 @@ class SQLiteRetroRepository(RetroRepository):
                         knowledge.confidence,
                         knowledge.accepted_by,
                         _optional_datetime_text(knowledge.valid_until),
-                        _datetime_text(knowledge.created_at),
+                        _datetime_text(knowledge.updated_at),
                     ),
                 )
                 connection.executemany(
@@ -663,9 +754,9 @@ class SQLiteRetroRepository(RetroRepository):
             status=str(row["status"]),
             confidence=float(row["confidence"]),
             accepted_by=str(row["accepted_by"]),
-            valid_until=_optional_datetime(row["valid_until"]),
-            created_at=_datetime(row["created_at"]),
             evidence_ids=tuple(str(item[0]) for item in evidence_rows),
+            valid_until=_optional_datetime(row["valid_until"]),
+            updated_at=_datetime(row["created_at"]),
         )
 
     def save_conflict(self, conflict: KnowledgeConflict) -> None:
@@ -682,8 +773,8 @@ class SQLiteRetroRepository(RetroRepository):
                     conflict.reason,
                     conflict.merge_text,
                     conflict.status,
-                    _datetime_text(conflict.created_at),
-                    _optional_datetime_text(conflict.resolved_at),
+                    _now_text(),
+                    None,
                 ),
             )
             self._append_audit_record(
@@ -711,8 +802,8 @@ class SQLiteRetroRepository(RetroRepository):
                     job.plan_json,
                     str(job.backup_path),
                     job.error,
-                    _datetime_text(job.created_at),
-                    _datetime_text(job.updated_at),
+                    _now_text(),
+                    _now_text(),
                 ),
             )
             self._append_audit_record(
@@ -764,8 +855,8 @@ class SQLiteRetroRepository(RetroRepository):
                     mapping.remote_identity,
                     mapping.obsidian_project,
                     int(mapping.active),
-                    _datetime_text(mapping.created_at),
-                    _datetime_text(mapping.updated_at),
+                    _now_text(),
+                    _now_text(),
                 ),
             )
             self._append_audit_record(
@@ -799,8 +890,6 @@ class SQLiteRetroRepository(RetroRepository):
                     remote_identity=str(row["remote_identity"]),
                     obsidian_project=str(row["obsidian_project"]),
                     active=bool(row["active"]),
-                    created_at=_datetime(row["created_at"]),
-                    updated_at=_datetime(row["updated_at"]),
                 )
                 for row in rows
             ]
@@ -918,10 +1007,10 @@ class SQLiteRetroRepository(RetroRepository):
                     plan.knowledge_id,
                     plan_hash,
                     plan.status.value,
-                    plan.tombstone_json,
-                    plan.residual_json,
-                    _datetime_text(plan.created_at),
-                    _datetime_text(plan.updated_at),
+                    "",
+                    "",
+                    _now_text(),
+                    _now_text(),
                 ),
             )
             for operation in plan.operations:
@@ -936,8 +1025,8 @@ class SQLiteRetroRepository(RetroRepository):
                         operation.location_kind,
                         operation.location,
                         operation.expected_hash,
-                        operation.status,
-                        operation.error,
+                        "planned",
+                        "",
                     ),
                 )
             self._append_audit_record(
@@ -1011,7 +1100,7 @@ class SQLiteRetroRepository(RetroRepository):
                 entry.entity_id,
                 entry.before_hash,
                 entry.after_hash,
-                _json_text(entry.detail),
+                entry.detail_json,
                 _datetime_text(entry.created_at),
             ),
         )
@@ -1035,7 +1124,7 @@ class SQLiteRetroRepository(RetroRepository):
             entity_id=entity_id,
             before_hash=before_hash,
             after_hash=after_hash,
-            detail=detail,
+            detail_json=_json_text(detail),
             created_at=datetime.now(timezone.utc),
         )
 
@@ -1052,9 +1141,9 @@ def _session_from_row(row: sqlite3.Row) -> NormalizedSession:
         source_path=Path(row["source_path"]),
         source_hash=str(row["source_hash"]),
         project_id=str(row["project_id"]),
-        status=str(row["status"]),
+        completed=str(row["status"]) == "completed",
         completed_at=_datetime(row["completed_at"]),
-        captured_at=_datetime(row["captured_at"]),
+        events=(),
     )
 
 
@@ -1063,7 +1152,6 @@ def _candidate_from_row(
 ) -> Candidate:
     return Candidate(
         id=str(row["id"]),
-        session_id=str(row["session_id"]),
         knowledge_type=KnowledgeType(row["knowledge_type"]),
         project_id=str(row["project_id"]),
         scope=str(row["scope"]),
@@ -1071,9 +1159,6 @@ def _candidate_from_row(
         status=CandidateStatus(row["status"]),
         extraction_confidence=float(row["extraction_confidence"]),
         evidence_ids=evidence_ids,
-        review=_review_from_json(str(row["review_json"])),
-        created_at=_datetime(row["created_at"]),
-        updated_at=_datetime(row["updated_at"]),
     )
 
 
@@ -1086,8 +1171,8 @@ def _review_to_json(result: ReviewResult | None) -> str:
             "confidence": result.confidence,
             "reason": result.reason,
             "normalized_text": result.normalized_text,
-            "duplicate": result.duplicate,
-            "conflict": result.conflict,
+            "duplicate_of": result.duplicate_of,
+            "conflict_with": result.conflict_with,
         }
     )
 
@@ -1101,8 +1186,12 @@ def _review_from_json(value: str) -> ReviewResult | None:
         confidence=float(data["confidence"]),
         reason=str(data["reason"]),
         normalized_text=str(data["normalized_text"]),
-        duplicate=bool(data["duplicate"]),
-        conflict=bool(data["conflict"]),
+        duplicate_of=(
+            None if data.get("duplicate_of") is None else str(data["duplicate_of"])
+        ),
+        conflict_with=(
+            None if data.get("conflict_with") is None else str(data["conflict_with"])
+        ),
     )
 
 
