@@ -39,7 +39,6 @@ from agent_retro.infrastructure.codex_sessions import (
 from agent_retro.infrastructure.codex_guidance import (
     CodexGuidance,
     GuidanceError,
-    discover_managed_instruction,
 )
 from agent_retro.infrastructure.legacy_model import (
     build_retro_llm_client_from_config,
@@ -430,7 +429,7 @@ def _run_command(
                 }
             )
             if action == "apply":
-                data["discoverable"] = discover_managed_instruction(codex_home)
+                data["discoverable"] = result.discoverable
         code = {
             "preview": "RETRO_CODEX_INTEGRATION_PREVIEW",
             "apply": "RETRO_CODEX_INTEGRATION_APPLIED",

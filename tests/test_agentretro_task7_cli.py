@@ -156,6 +156,39 @@ def test_cli_integration_defaults_to_zero_write_preview_then_applies_and_removes
     assert not target.exists()
 
 
+def test_cli_discoverability_exception_restores_absence_and_returns_typed_error(
+    tmp_path, capsys, monkeypatch
+):
+    env = _env(tmp_path)
+    target = tmp_path / "codex" / "AGENTS.md"
+    guidance_type = retro_cli.CodexGuidance
+
+    def guidance_with_failed_discovery(codex_home, backup_root):
+        return guidance_type(
+            codex_home,
+            backup_root,
+            discoverer=lambda home: (_ for _ in ()).throw(
+                RuntimeError("secret discovery failure")
+            ),
+        )
+
+    monkeypatch.setattr(retro_cli, "CodexGuidance", guidance_with_failed_discovery)
+
+    assert (
+        retro_cli.main(
+            ["--json", "integrate", "codex", "--apply"],
+            home=tmp_path,
+            env=env,
+        )
+        == 2
+    )
+    payload = _json(capsys)
+    assert payload["code"] == "RETRO_CODEX_INTEGRATION_FAILED"
+    assert payload["data"] == {"reason": "discoverability_failed"}
+    assert "secret discovery failure" not in json.dumps(payload)
+    assert not target.exists()
+
+
 def test_cli_brief_deadline_and_codex_override_have_typed_errors(
     tmp_path, capsys, monkeypatch
 ):

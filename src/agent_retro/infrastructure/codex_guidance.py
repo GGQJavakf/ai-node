@@ -76,6 +76,10 @@ class GuidanceRollbackRequired(GuidanceWriteError):
         super().__init__("rollback_required", backup_path)
 
 
+class _GuidanceDiscoverabilityFailure(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class GuidancePreview:
     id: str
@@ -100,6 +104,7 @@ class GuidanceResult:
     changed: bool
     target_hash: str | None
     backup_path: Path | None
+    discoverable: bool | None
 
 
 @dataclass(frozen=True)
@@ -156,6 +161,7 @@ class CodexGuidance:
         replace: Callable[[Path, Path], None] = os.replace,
         readback: Callable[[Path], bytes] = Path.read_bytes,
         backup_writer: Callable[[Path, bytes], None] = _default_backup_writer,
+        discoverer: Callable[[Path], bool] | None = None,
     ) -> None:
         self._home_input = Path(codex_home).expanduser().absolute()
         self._backup_input = Path(backup_root).expanduser().absolute()
@@ -163,6 +169,12 @@ class CodexGuidance:
         self.replace = replace
         self.readback = readback
         self.backup_writer = backup_writer
+        if discoverer is None:
+            self.discoverer = lambda home: discover_managed_instruction(
+                home, preferred_encoding=self.preferred_encoding
+            )
+        else:
+            self.discoverer = discoverer
         self._generation = 0
         self._current_preview: GuidancePreview | None = None
 
@@ -224,7 +236,7 @@ class CodexGuidance:
         preview = self._current_preview
         if preview is None or preview.id != preview_id or preview.action != action:
             raise GuidanceStalePreview("preview_not_current")
-        _, target, _ = self._canonical_paths()
+        home, target, _ = self._canonical_paths()
         override = target.with_name("AGENTS.override.md")
         if override.exists() or override.is_symlink():
             raise GuidanceOverrideConflict()
@@ -241,6 +253,14 @@ class CodexGuidance:
         if block.managed_hash != preview.managed_hash:
             raise GuidanceStalePreview("target_hash_changed")
         if not preview.changed:
+            discoverable: bool | None = None
+            if action == "apply":
+                try:
+                    discoverable = bool(self.discoverer(home))
+                except Exception as exc:
+                    raise GuidanceWriteError("discoverability_failed") from exc
+                if not discoverable:
+                    raise GuidanceWriteError("discoverability_failed")
             self._current_preview = None
             return GuidanceResult(
                 preview_id=preview.id,
@@ -249,6 +269,7 @@ class CodexGuidance:
                 changed=False,
                 target_hash=current_hash,
                 backup_path=None,
+                discoverable=discoverable,
             )
 
         backup_path: Path | None = None
@@ -281,8 +302,21 @@ class CodexGuidance:
                     raise OSError("managed block readback mismatch")
                 if action == "remove" and verified:
                     raise OSError("managed block removal mismatch")
+            if action == "apply":
+                try:
+                    discoverable = bool(self.discoverer(home))
+                except Exception as exc:
+                    raise _GuidanceDiscoverabilityFailure from exc
+                if not discoverable:
+                    raise _GuidanceDiscoverabilityFailure
         except Exception as exc:
-            reason = "readback_failed" if replaced else "replace_failed"
+            reason = (
+                "discoverability_failed"
+                if isinstance(exc, _GuidanceDiscoverabilityFailure)
+                else "readback_failed"
+                if replaced
+                else "replace_failed"
+            )
             if replaced:
                 try:
                     self._restore(target, current, target_exists)
@@ -300,6 +334,7 @@ class CodexGuidance:
                 _sha256(preview._planned_bytes) if preview._planned_exists else None
             ),
             backup_path=backup_path,
+            discoverable=True if action == "apply" else None,
         )
 
     def _canonical_paths(self) -> tuple[Path, Path, Path]:
@@ -461,7 +496,11 @@ class CodexGuidance:
             raise OSError("created target removal failed")
 
 
-def discover_managed_instruction(codex_home: Path) -> bool:
+def discover_managed_instruction(
+    codex_home: Path,
+    *,
+    preferred_encoding: Callable[[], str] = lambda: locale.getpreferredencoding(False),
+) -> bool:
     """Read only canonical ``AGENTS.md`` and recognize one exact v1 block."""
 
     home_input = Path(codex_home).expanduser().absolute()
@@ -476,7 +515,12 @@ def discover_managed_instruction(codex_home: Path) -> bool:
         if target.parent != home or not target.is_file():
             return False
         raw = target.read_bytes()
-        helper = CodexGuidance(home, home / ".unused-agentretro-backups")
+        helper = CodexGuidance(
+            home,
+            home / ".unused-agentretro-backups",
+            preferred_encoding=preferred_encoding,
+            discoverer=lambda path: True,
+        )
         return helper._managed_block(helper._decode(raw)).present
     except (GuidanceError, OSError):
         return False

@@ -96,6 +96,7 @@ def test_apply_and_remove_preserve_every_outside_byte_and_keep_backup(tmp_path):
 
     assert applied.status == "applied"
     assert applied.changed is True
+    assert applied.discoverable is True
     assert applied.backup_path is not None
     assert applied.backup_path.read_bytes() == original
     assert after_apply != original
@@ -421,6 +422,21 @@ def test_readback_failure_rolls_back_exact_original(tmp_path):
 
     assert caught.value.reason == "readback_failed"
     assert target.read_bytes() == b"original\n"
+
+
+def test_discoverability_false_rolls_back_exact_original(tmp_path):
+    codex_home, backup_root, target = _home(tmp_path)
+    original = b"original\n"
+    target.write_bytes(original)
+    guidance = CodexGuidance(codex_home, backup_root, discoverer=lambda home: False)
+
+    with pytest.raises(GuidanceWriteError) as caught:
+        guidance.apply(guidance.preview().id)
+
+    assert caught.value.reason == "discoverability_failed"
+    assert caught.value.backup_path is not None
+    assert caught.value.backup_path.read_bytes() == original
+    assert target.read_bytes() == original
 
 
 def test_failed_readback_and_failed_restore_enter_typed_rollback_required(tmp_path):
