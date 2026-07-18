@@ -125,9 +125,39 @@ def effective_model_timeout(
 ) -> int:
     """Resolve the bounded model timeout without retaining legacy settings."""
 
-    return int(
-        settings.model_timeout_seconds
-        or legacy.get("request_timeout")
-        or legacy.get("codex_request_timeout")
-        or 120
-    )
+    if settings.model_timeout_seconds is not None:
+        return _validated_timeout(
+            settings.model_timeout_seconds,
+            "AGENTRETRO_MODEL_TIMEOUT_SECONDS",
+        )
+
+    for source_key in ("request_timeout", "codex_request_timeout"):
+        if source_key in legacy and legacy[source_key] is not None:
+            return _validated_timeout(legacy[source_key], source_key)
+
+    return 120
+
+
+def _validated_timeout(value: object, source_key: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{source_key} must be a positive integer timeout")
+
+    if isinstance(value, int):
+        timeout = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{source_key} must be a positive integer timeout")
+        timeout = int(value)
+    elif isinstance(value, str):
+        try:
+            timeout = int(value.strip(), 10)
+        except ValueError as exc:
+            raise ValueError(
+                f"{source_key} must be a positive integer timeout"
+            ) from exc
+    else:
+        raise ValueError(f"{source_key} must be a positive integer timeout")
+
+    if timeout <= 0:
+        raise ValueError(f"{source_key} must be a positive integer timeout")
+    return timeout

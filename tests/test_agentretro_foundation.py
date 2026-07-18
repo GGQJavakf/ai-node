@@ -1,5 +1,5 @@
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -125,6 +125,77 @@ def test_effective_model_timeout_uses_documented_precedence(
     assert effective_model_timeout(settings, legacy) == expected
 
 
+@pytest.mark.parametrize(
+    "invalid_value",
+    [True, "not-a-number", float("nan"), float("inf"), 12.5, 0, -1, ""],
+)
+def test_effective_model_timeout_rejects_invalid_high_priority_legacy_value(
+    tmp_path, invalid_value
+):
+    settings = load_retro_settings(home=tmp_path, env={})
+
+    with pytest.raises(ValueError, match="request_timeout"):
+        effective_model_timeout(
+            settings,
+            {
+                "request_timeout": invalid_value,
+                "codex_request_timeout": 90,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_value",
+    [False, "not-a-number", float("nan"), float("-inf"), 7.5, 0, -30, ""],
+)
+def test_effective_model_timeout_rejects_invalid_codex_legacy_value(
+    tmp_path, invalid_value
+):
+    settings = load_retro_settings(home=tmp_path, env={})
+
+    with pytest.raises(ValueError, match="codex_request_timeout"):
+        effective_model_timeout(
+            settings,
+            {
+                "request_timeout": None,
+                "codex_request_timeout": invalid_value,
+            },
+        )
+
+
+@pytest.mark.parametrize("invalid_value", [True, float("nan"), 3.5, 0, -1])
+def test_effective_model_timeout_rejects_invalid_agentretro_override(
+    tmp_path, invalid_value
+):
+    settings = replace(
+        load_retro_settings(home=tmp_path, env={}),
+        model_timeout_seconds=invalid_value,
+    )
+
+    with pytest.raises(ValueError, match="AGENTRETRO_MODEL_TIMEOUT_SECONDS"):
+        effective_model_timeout(
+            settings,
+            {"request_timeout": 60, "codex_request_timeout": 90},
+        )
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected"),
+    [
+        ({"request_timeout": "60", "codex_request_timeout": 90}, 60),
+        ({"request_timeout": 60.0, "codex_request_timeout": 90}, 60),
+        ({"request_timeout": None, "codex_request_timeout": "90"}, 90),
+        ({"request_timeout": None, "codex_request_timeout": 90.0}, 90),
+    ],
+)
+def test_effective_model_timeout_accepts_positive_integer_values(
+    tmp_path, legacy, expected
+):
+    settings = load_retro_settings(home=tmp_path, env={})
+
+    assert effective_model_timeout(settings, legacy) == expected
+
+
 @patch("agent_retro.infrastructure.legacy_model.load_settings")
 def test_legacy_model_adapter_filters_unrelated_settings(load_settings):
     load_settings.return_value = {
@@ -186,7 +257,42 @@ def test_parser_has_independent_program_name():
 
     assert parser.prog == "retro"
     assert parser.description == "Codex 会话复盘与知识沉淀"
+
+
+def test_main_emits_stable_chinese_human_output(capsys):
     assert main([]) == 0
+
+    assert capsys.readouterr().out == "AgentRetro 已就绪。\n"
+
+
+def test_main_json_emits_stable_english_envelope_without_ansi(capsys):
+    assert main(["--json"]) == 0
+
+    raw_output = capsys.readouterr().out
+    assert "\x1b[" not in raw_output
+    assert json.loads(raw_output) == {
+        "code": "RETRO_READY",
+        "data": {},
+        "message": "AgentRetro is ready.",
+        "status": "ok",
+    }
+
+
+def test_legacy_and_retro_entry_points_are_independently_callable():
+    from ai_todo_assistant.presentation.cli import main as legacy_main
+    from agent_retro.presentation.cli import main as retro_main
+
+    assert callable(legacy_main)
+    assert callable(retro_main)
+    assert legacy_main is not retro_main
+    assert legacy_main.__module__ == "ai_todo_assistant.presentation.cli"
+    assert retro_main.__module__ == "agent_retro.presentation.cli"
+
+    with patch("ai_todo_assistant.presentation.cli.TodoCLI") as todo_cli:
+        legacy_main()
+
+    todo_cli.assert_called_once_with()
+    todo_cli.return_value.run.assert_called_once_with()
 
 
 def test_output_is_unicode_safe_and_json_remains_machine_readable():

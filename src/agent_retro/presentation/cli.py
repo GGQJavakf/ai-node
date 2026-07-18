@@ -3,7 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
+
+from agent_retro.presentation.output import safe_text, write_json
+
+
+_READY_MESSAGE = "AgentRetro 已就绪。"
+_READY_ENVELOPE = {
+    "status": "ok",
+    "code": "RETRO_READY",
+    "message": "AgentRetro is ready.",
+    "data": {},
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,5 +27,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    build_parser().parse_args(argv)
+    args = build_parser().parse_args(argv)
+    if args.json_output:
+        write_json(_READY_ENVELOPE)
+    else:
+        sys.stdout.write(safe_text(_READY_MESSAGE) + "\n")
     return 0
