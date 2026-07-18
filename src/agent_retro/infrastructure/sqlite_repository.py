@@ -662,6 +662,25 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def candidates_for_session(self, session_id: str) -> list[Candidate]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT c.id FROM candidates c
+                JOIN sessions s ON s.id = c.session_id
+                WHERE s.id = ? OR s.source_session_id = ?
+                ORDER BY c.created_at, c.id""",
+                (session_id, session_id),
+            ).fetchall()
+            return [
+                candidate
+                for row in rows
+                if (candidate := self._get_candidate(connection, str(row[0])))
+                is not None
+            ]
+        finally:
+            connection.close()
+
     def evidence_for_candidate(self, candidate_id: str) -> list[Evidence]:
         connection = self._connect()
         try:
@@ -827,6 +846,8 @@ class SQLiteRetroRepository(RetroRepository):
         candidate_status: CandidateStatus = CandidateStatus.ACCEPTED,
         valid_until: datetime | None = None,
         decision: AcceptanceDecision | None = None,
+        knowledge_type: KnowledgeType | None = None,
+        scope: str | None = None,
     ) -> Knowledge:
         with self.transaction() as connection:
             candidate = self._get_candidate(connection, candidate_id)
@@ -849,14 +870,16 @@ class SQLiteRetroRepository(RetroRepository):
                     )
                 return knowledge
             else:
+                if candidate.status is not CandidateStatus.PENDING_REVIEW:
+                    raise ValueError(f"candidate {candidate_id} must be pending")
                 updated_at = datetime.now(timezone.utc)
                 knowledge = Knowledge(
                     id=f"knowledge-{candidate.id}",
                     version=1,
                     candidate_id=candidate.id,
-                    knowledge_type=candidate.knowledge_type,
+                    knowledge_type=knowledge_type or candidate.knowledge_type,
                     project_id=candidate.project_id,
-                    scope=candidate.scope,
+                    scope=scope or candidate.scope,
                     text=text,
                     status="active",
                     confidence=confidence,
@@ -896,8 +919,21 @@ class SQLiteRetroRepository(RetroRepository):
                     ),
                 )
             connection.execute(
-                "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
-                (candidate_status.value, _now_text(), candidate_id),
+                """UPDATE candidates
+                SET status = ?, proposed_text = ?, knowledge_type = ?, scope = ?,
+                    updated_at = ? WHERE id = ?""",
+                (
+                    candidate_status.value,
+                    (
+                        text
+                        if candidate_status is CandidateStatus.EDITED
+                        else candidate.proposed_text
+                    ),
+                    (knowledge_type or candidate.knowledge_type).value,
+                    scope or candidate.scope,
+                    _now_text(),
+                    candidate_id,
+                ),
             )
             audit_detail: dict[str, Any] = {"candidate_id": candidate_id}
             if decision is not None:
@@ -913,7 +949,11 @@ class SQLiteRetroRepository(RetroRepository):
                 connection,
                 self._audit_entry(
                     actor=actor,
-                    action="candidate_accepted",
+                    action=(
+                        "candidate_edited"
+                        if candidate_status is CandidateStatus.EDITED
+                        else "candidate_accepted"
+                    ),
                     entity_type="knowledge",
                     entity_id=knowledge.id,
                     before_hash=_hash_value(candidate),
@@ -922,6 +962,33 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
         return knowledge
+
+    def reject_candidate(self, candidate_id: str, actor: str) -> Candidate:
+        with self.transaction() as connection:
+            candidate = self._get_candidate(connection, candidate_id)
+            if candidate is None:
+                raise KeyError(f"candidate not found: {candidate_id}")
+            if candidate.status is not CandidateStatus.PENDING_REVIEW:
+                raise ValueError(f"candidate {candidate_id} must be pending")
+            connection.execute(
+                "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
+                (CandidateStatus.REJECTED.value, _now_text(), candidate_id),
+            )
+            rejected = self._get_candidate(connection, candidate_id)
+            assert rejected is not None
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    actor=actor,
+                    action="candidate_rejected",
+                    entity_type="candidate",
+                    entity_id=candidate_id,
+                    before_hash=_hash_value(candidate),
+                    after_hash=_hash_value(rejected),
+                    detail={"candidate_id": candidate_id},
+                ),
+            )
+            return rejected
 
     def knowledge_for_candidate(self, candidate_id: str) -> Knowledge | None:
         versions = self.knowledge_versions_for_candidate(candidate_id)
@@ -936,6 +1003,17 @@ class SQLiteRetroRepository(RetroRepository):
                 "SELECT * FROM knowledge WHERE candidate_id = ? "
                 "ORDER BY version",
                 (candidate_id,),
+            ).fetchall()
+            return [self._knowledge_from_row(connection, row) for row in rows]
+        finally:
+            connection.close()
+
+    def knowledge_versions(self, knowledge_id: str) -> list[Knowledge]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM knowledge WHERE id = ? ORDER BY version",
+                (knowledge_id,),
             ).fetchall()
             return [self._knowledge_from_row(connection, row) for row in rows]
         finally:
@@ -966,6 +1044,18 @@ class SQLiteRetroRepository(RetroRepository):
             ORDER BY evidence_id""",
             (row["id"], row["version"]),
         ).fetchall()
+        supersedes: tuple[str, ...] = ()
+        audit_rows = connection.execute(
+            "SELECT detail_json FROM audit_log WHERE entity_id = ? "
+            "ORDER BY created_at, id",
+            (row["id"],),
+        ).fetchall()
+        for audit_row in audit_rows:
+            detail = json.loads(str(audit_row["detail_json"]))
+            if detail.get("knowledge_version") == int(row["version"]):
+                supersedes = tuple(
+                    str(item) for item in detail.get("supersedes", ())
+                )
         return Knowledge(
             id=str(row["id"]),
             version=int(row["version"]),
@@ -980,35 +1070,323 @@ class SQLiteRetroRepository(RetroRepository):
             evidence_ids=tuple(str(item[0]) for item in evidence_rows),
             valid_until=_optional_datetime(row["valid_until"]),
             updated_at=_datetime(row["created_at"]),
+            supersedes=supersedes,
         )
+
+    def _latest_knowledge(
+        self, connection: sqlite3.Connection, knowledge_id: str
+    ) -> Knowledge | None:
+        row = connection.execute(
+            "SELECT * FROM knowledge WHERE id = ? ORDER BY version DESC LIMIT 1",
+            (knowledge_id,),
+        ).fetchone()
+        return None if row is None else self._knowledge_from_row(connection, row)
+
+    def _insert_knowledge(
+        self, connection: sqlite3.Connection, knowledge: Knowledge
+    ) -> None:
+        connection.execute(
+            """INSERT INTO knowledge(
+                id, version, candidate_id, knowledge_type, project_id,
+                scope, text, status, confidence, accepted_by,
+                valid_until, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                knowledge.id,
+                knowledge.version,
+                knowledge.candidate_id,
+                knowledge.knowledge_type.value,
+                knowledge.project_id,
+                knowledge.scope,
+                knowledge.text,
+                knowledge.status,
+                knowledge.confidence,
+                knowledge.accepted_by,
+                _optional_datetime_text(knowledge.valid_until),
+                _datetime_text(knowledge.updated_at),
+            ),
+        )
+        connection.executemany(
+            """INSERT INTO knowledge_evidence(
+                knowledge_id, knowledge_version, evidence_id
+            ) VALUES (?, ?, ?)""",
+            (
+                (knowledge.id, knowledge.version, evidence_id)
+                for evidence_id in knowledge.evidence_ids
+            ),
+        )
+
+    def _transition_knowledge(
+        self,
+        connection: sqlite3.Connection,
+        current: Knowledge,
+        *,
+        action: str,
+        actor: str,
+        status: str,
+        supersedes: tuple[str, ...],
+        detail: Mapping[str, Any],
+        candidate_id: str | None = None,
+        scope: str | None = None,
+        text: str | None = None,
+        confidence: float | None = None,
+        evidence_ids: tuple[str, ...] | None = None,
+    ) -> Knowledge:
+        connection.execute(
+            "UPDATE knowledge SET status = 'superseded' "
+            "WHERE id = ? AND version = ?",
+            (current.id, current.version),
+        )
+        created = Knowledge(
+            id=current.id,
+            version=current.version + 1,
+            candidate_id=candidate_id or current.candidate_id,
+            knowledge_type=current.knowledge_type,
+            project_id=current.project_id,
+            scope=scope or current.scope,
+            text=text if text is not None else current.text,
+            status=status,
+            confidence=(
+                current.confidence if confidence is None else confidence
+            ),
+            accepted_by=actor,
+            evidence_ids=(
+                current.evidence_ids if evidence_ids is None else evidence_ids
+            ),
+            valid_until=current.valid_until,
+            updated_at=datetime.now(timezone.utc),
+            supersedes=supersedes,
+        )
+        self._insert_knowledge(connection, created)
+        audit_detail = dict(detail)
+        audit_detail.update(
+            {
+                "knowledge_version": created.version,
+                "supersedes": list(supersedes),
+            }
+        )
+        self._append_audit_record(
+            connection,
+            self._audit_entry(
+                actor=actor,
+                action=action,
+                entity_type="knowledge",
+                entity_id=current.id,
+                before_hash=_hash_value(current),
+                after_hash=_hash_value(created),
+                detail=audit_detail,
+            ),
+        )
+        return created
 
     def save_conflict(self, conflict: KnowledgeConflict) -> None:
         with self.transaction() as connection:
-            connection.execute(
-                """INSERT INTO conflicts(
-                    id, active_knowledge_id, candidate_id, reason, merge_text,
-                    status, created_at, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    conflict.id,
-                    conflict.active_knowledge_id,
-                    conflict.candidate_id,
-                    conflict.reason,
-                    conflict.merge_text,
-                    conflict.status,
-                    _now_text(),
-                    None,
-                ),
+            self._save_conflict(connection, conflict)
+
+    def _save_conflict(
+        self, connection: sqlite3.Connection, conflict: KnowledgeConflict
+    ) -> None:
+        connection.execute(
+            """INSERT INTO conflicts(
+                id, active_knowledge_id, candidate_id, reason, merge_text,
+                status, created_at, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                conflict.id,
+                conflict.active_knowledge_id,
+                conflict.candidate_id,
+                conflict.reason,
+                conflict.merge_text,
+                conflict.status,
+                _now_text(),
+                None,
+            ),
+        )
+        self._append_audit_record(
+            connection,
+            self._audit_entry(
+                action="conflict_saved",
+                entity_type="conflict",
+                entity_id=conflict.id,
+                after_hash=_hash_value(conflict),
+                detail={"candidate_id": conflict.candidate_id},
+            ),
+        )
+
+    def create_conflict(self, conflict: KnowledgeConflict) -> KnowledgeConflict:
+        with self.transaction() as connection:
+            active = self._latest_knowledge(
+                connection, conflict.active_knowledge_id
             )
-            self._append_audit_record(
+            if active is None:
+                raise ValueError(
+                    f"knowledge not found: {conflict.active_knowledge_id}"
+                )
+            if active.status != "active":
+                raise ValueError(
+                    f"knowledge {active.id} must be active for conflict detection"
+                )
+            candidate = self._get_candidate(connection, conflict.candidate_id)
+            if candidate is None:
+                raise ValueError(f"candidate not found: {conflict.candidate_id}")
+            if candidate.status is not CandidateStatus.PENDING_REVIEW:
+                raise ValueError(
+                    f"candidate {candidate.id} must be pending for conflict detection"
+                )
+            if (
+                candidate.project_id != active.project_id
+                or candidate.knowledge_type is not active.knowledge_type
+                or candidate.scope != active.scope
+            ):
+                raise ValueError(
+                    "conflict candidate must match active project, type, and scope"
+                )
+            self._save_conflict(connection, conflict)
+            return conflict
+
+    def get_conflict(self, conflict_id: str) -> KnowledgeConflict | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM conflicts WHERE id = ?", (conflict_id,)
+            ).fetchone()
+            return None if row is None else _conflict_from_row(row)
+        finally:
+            connection.close()
+
+    def resolve_conflict(
+        self, conflict_id: str, text: str, actor: str
+    ) -> Knowledge:
+        if actor != "user":
+            raise ValueError("conflict resolution actor must be user")
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM conflicts WHERE id = ?", (conflict_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"conflict not found: {conflict_id}")
+            conflict = _conflict_from_row(row)
+            if conflict.status != "open":
+                raise ValueError(f"conflict {conflict_id} must be open")
+            active = self._latest_knowledge(
+                connection, conflict.active_knowledge_id
+            )
+            if active is None or active.status != "active":
+                raise ValueError(
+                    f"knowledge {conflict.active_knowledge_id} must be active"
+                )
+            candidate = self._get_candidate(connection, conflict.candidate_id)
+            if candidate is None:
+                raise KeyError(f"candidate not found: {conflict.candidate_id}")
+            if candidate.status is not CandidateStatus.PENDING_REVIEW:
+                raise ValueError(f"candidate {candidate.id} must be pending")
+            candidate_row = connection.execute(
+                "SELECT review_json FROM candidates WHERE id = ?",
+                (candidate.id,),
+            ).fetchone()
+            review = _review_from_json(str(candidate_row["review_json"]))
+            evidence_ids = tuple(
+                dict.fromkeys((*active.evidence_ids, *candidate.evidence_ids))
+            )
+            supersedes = (
+                f"{active.id}:v{active.version}",
+                f"candidate:{candidate.id}",
+            )
+            merged = self._transition_knowledge(
                 connection,
-                self._audit_entry(
-                    action="conflict_saved",
-                    entity_type="conflict",
-                    entity_id=conflict.id,
-                    after_hash=_hash_value(conflict),
-                    detail={"candidate_id": conflict.candidate_id},
+                active,
+                action="conflict_resolved",
+                actor=actor,
+                status="active",
+                supersedes=supersedes,
+                detail={"conflict_id": conflict.id},
+                candidate_id=candidate.id,
+                text=text,
+                confidence=(
+                    candidate.extraction_confidence
+                    if review is None
+                    else review.confidence
                 ),
+                evidence_ids=evidence_ids,
+            )
+            connection.execute(
+                "UPDATE candidates SET status = ?, updated_at = ? WHERE id = ?",
+                (CandidateStatus.ACCEPTED.value, _now_text(), candidate.id),
+            )
+            connection.execute(
+                "UPDATE conflicts SET status = 'resolved', resolved_at = ? "
+                "WHERE id = ?",
+                (_now_text(), conflict.id),
+            )
+            return merged
+
+    def promote_global(self, knowledge_id: str, actor: str) -> Knowledge:
+        if actor != "user":
+            raise ValueError("global promotion actor must be user")
+        with self.transaction() as connection:
+            current = self._latest_knowledge(connection, knowledge_id)
+            if current is None:
+                raise KeyError(f"knowledge not found: {knowledge_id}")
+            if current.status != "active":
+                raise ValueError(f"knowledge {knowledge_id} must be active")
+            if current.scope == "global":
+                raise ValueError(f"knowledge {knowledge_id} is already global")
+            supersedes = (f"{current.id}:v{current.version}",)
+            return self._transition_knowledge(
+                connection,
+                current,
+                action="knowledge_promoted_global",
+                actor=actor,
+                status="active",
+                scope="global",
+                supersedes=supersedes,
+                detail={},
+            )
+
+    def expire_task_states(self, at: datetime) -> list[Knowledge]:
+        with self.transaction() as connection:
+            rows = connection.execute(
+                """SELECT * FROM knowledge
+                WHERE knowledge_type = ? AND status = 'active'
+                  AND valid_until IS NOT NULL AND valid_until <= ?
+                ORDER BY created_at, id, version""",
+                (KnowledgeType.TASK_STATE.value, _datetime_text(at)),
+            ).fetchall()
+            expired: list[Knowledge] = []
+            for row in rows:
+                current = self._knowledge_from_row(connection, row)
+                supersedes = (f"{current.id}:v{current.version}",)
+                expired.append(
+                    self._transition_knowledge(
+                        connection,
+                        current,
+                        action="task_state_expired",
+                        actor="system-expiry",
+                        status="stale",
+                        supersedes=supersedes,
+                        detail={"expired_at": _datetime_text(at)},
+                    )
+                )
+            return expired
+
+    def archive_knowledge(self, knowledge_id: str, actor: str) -> Knowledge:
+        if actor != "user":
+            raise ValueError("archive actor must be user")
+        with self.transaction() as connection:
+            current = self._latest_knowledge(connection, knowledge_id)
+            if current is None:
+                raise KeyError(f"knowledge not found: {knowledge_id}")
+            if current.status != "active":
+                raise ValueError(f"knowledge {knowledge_id} must be active")
+            supersedes = (f"{current.id}:v{current.version}",)
+            return self._transition_knowledge(
+                connection,
+                current,
+                action="knowledge_archived",
+                actor=actor,
+                status="archived",
+                supersedes=supersedes,
+                detail={},
             )
 
     def begin_sync(self, job: SyncJob) -> None:
@@ -1174,10 +1552,42 @@ class SQLiteRetroRepository(RetroRepository):
                     f"session is not awaiting classification: {session_id}"
                 )
             internal_session_id = str(row["id"])
+            pending_rows = connection.execute(
+                """SELECT id, project_id FROM candidates
+                WHERE session_id = ? AND status = ? ORDER BY created_at, id""",
+                (internal_session_id, CandidateStatus.PENDING_REVIEW.value),
+            ).fetchall()
+            before_state = {
+                "project_id": before_project,
+                "pending_candidates": [
+                    {
+                        "id": str(item["id"]),
+                        "project_id": str(item["project_id"]),
+                    }
+                    for item in pending_rows
+                ],
+            }
             connection.execute(
                 "UPDATE sessions SET project_id = ? WHERE id = ?",
                 (project_id, internal_session_id),
             )
+            connection.execute(
+                """UPDATE candidates SET project_id = ?, updated_at = ?
+                WHERE session_id = ? AND status = ?""",
+                (
+                    project_id,
+                    _now_text(),
+                    internal_session_id,
+                    CandidateStatus.PENDING_REVIEW.value,
+                ),
+            )
+            after_state = {
+                "project_id": project_id,
+                "pending_candidates": [
+                    {"id": str(item["id"]), "project_id": project_id}
+                    for item in pending_rows
+                ],
+            }
             self._append_audit_record(
                 connection,
                 self._audit_entry(
@@ -1185,9 +1595,12 @@ class SQLiteRetroRepository(RetroRepository):
                     action="session_reclassified",
                     entity_type="session",
                     entity_id=internal_session_id,
-                    before_hash=_hash_value({"project_id": before_project}),
-                    after_hash=_hash_value({"project_id": project_id}),
-                    detail={"mapping_id": mapping_id},
+                    before_hash=_hash_value(before_state),
+                    after_hash=_hash_value(after_state),
+                    detail={
+                        "mapping_id": mapping_id,
+                        "pending_candidate_count": len(pending_rows),
+                    },
                 ),
             )
             return internal_session_id
@@ -1488,6 +1901,17 @@ def _candidate_from_row(
         status=CandidateStatus(row["status"]),
         extraction_confidence=float(row["extraction_confidence"]),
         evidence_ids=evidence_ids,
+    )
+
+
+def _conflict_from_row(row: sqlite3.Row) -> KnowledgeConflict:
+    return KnowledgeConflict(
+        id=str(row["id"]),
+        active_knowledge_id=str(row["active_knowledge_id"]),
+        candidate_id=str(row["candidate_id"]),
+        reason=str(row["reason"]),
+        merge_text=str(row["merge_text"]),
+        status=str(row["status"]),
     )
 
 

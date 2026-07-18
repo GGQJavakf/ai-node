@@ -149,6 +149,7 @@ class Knowledge:
     evidence_ids: tuple[str, ...]
     valid_until: datetime | None
     updated_at: datetime
+    supersedes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

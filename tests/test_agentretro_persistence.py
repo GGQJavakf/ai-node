@@ -164,6 +164,7 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
             "evidence_ids",
             "valid_until",
             "updated_at",
+            "supersedes",
         ),
         KnowledgeConflict: (
             "id",

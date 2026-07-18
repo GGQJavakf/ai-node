@@ -177,9 +177,14 @@ class ReviewService:
         session = self.repository.find_session_by_source_id(session_id)
         if session is None:
             raise KeyError(f"session not found: {session_id}")
+        existing = self.repository.candidates_for_session(session_id)
         pending = self.repository.pending_model_candidates_for_session(session_id)
         if pending:
             return [self.retry_candidate(item.id) for item in pending]
+        if existing:
+            return [
+                self.repository.get_review_result(item.id) for item in existing
+            ]
         evidence = self.repository.list_evidence(session.id)
         return self._extract_then_review(
             session.source_session_id, session.project_id, evidence

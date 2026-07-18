@@ -71,3 +71,41 @@ Status: complete for the explicitly scoped milestone; manual lifecycle, conflict
 - Not implemented in this milestone: manual accept/edit/reject, conflict creation/resolution, promotion, expiry mutation, archive, CLI review/retry commands, or project-reclassify CLI wiring.
 - OpenSpec task checkboxes remain unchanged until the complete `2.8` and `3.1` through `3.9` behavior is delivered.
 - No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
+
+## Milestone C: manual lifecycle, version history, and reclassification consistency
+
+Status: complete for the explicitly scoped non-CLI milestone.
+
+### RED evidence
+
+- First command: `python -m pytest tests/test_agentretro_knowledge.py -q`.
+- First result: exit 1 during collection with `ModuleNotFoundError: No module named 'agent_retro.application.knowledge'`.
+- Second RED command used the same focused file after conflict, version, expiry, archive, and reclassification tests were added.
+- Second result: `4 passed, 4 failed`; the failures identified the missing lifecycle methods and confirmed that reclassification left pending candidates on the awaiting project.
+
+### GREEN evidence
+
+- Knowledge command: `python -m pytest tests/test_agentretro_knowledge.py -q`.
+- Result after the transaction rollback case was added: `9 passed in 0.85s`.
+- Review, lifecycle, and persistence command: `python -m pytest tests/test_agentretro_review.py tests/test_agentretro_knowledge.py tests/test_agentretro_persistence.py -q`.
+- Result: `61 passed in 2.53s` before the additional rollback-only test.
+- Full command: `python -m pytest -q`.
+- Final result after the rollback-only test: `310 passed in 16.36s`.
+- OpenSpec command: `openspec validate add-agentretro-mvp --strict`.
+- Result: `Change 'add-agentretro-mvp' is valid`.
+- Ruff checks for the new lifecycle service and tests passed; `git diff --check` returned no findings.
+
+### Implemented behavior
+
+- Manual `accept`, `edit`, and `reject` are user-only, pending-only transitions with typed repository operations, original evidence links, and before/after audit hashes.
+- A successful `review_session` is a terminal readback: repeating it does not re-extract, re-review, or create another candidate or knowledge row.
+- Conflict detection leaves the old knowledge active and the new candidate pending. User resolution creates a new version under the same knowledge ID, records superseded knowledge/candidate references, resolves the conflict, and preserves prior versions.
+- Explicit user promotion creates a global-scope version. Expiry creates a stale `TASK_STATE` version. Archive creates an archived version. None of these operations deletes text, evidence, or history.
+- Typed knowledge history returns every version, evidence reference, acceptance actor, superseded reference, and lifecycle audit entry.
+- Reclassification updates the awaiting session and only its pending candidates in one transaction, with a combined before/after audit. An injected audit failure proves that both updates roll back together.
+
+### Scope boundary
+
+- No CLI or model gateway wiring was added in Milestone C, per the milestone instruction.
+- OpenSpec checkboxes remain unchanged because `2.8`, `3.6`, and `3.9` explicitly require CLI surfaces not authorized in this milestone; partially covered task groups were not reported as complete.
+- No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
