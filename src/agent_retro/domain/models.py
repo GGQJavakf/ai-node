@@ -43,6 +43,7 @@ class PurgeStatus(str, Enum):
     """Lifecycle states for sensitive-knowledge purge plans."""
 
     PLANNED = "planned"
+    PURGE_IN_PROGRESS = "purge_in_progress"
     PURGE_INCOMPLETE = "purge_incomplete"
     PURGED = "purged"
 
@@ -291,6 +292,19 @@ class PurgeInspection:
     already_purged: bool
     sync_pending: bool
     copies: tuple[PurgeCopy, ...]
+
+
+@dataclass(frozen=True)
+class PurgeTombstone:
+    """Content-free identity retained after an explicit purge begins."""
+
+    knowledge_id: str
+    actor: str
+    started_at: datetime
+    updated_at: datetime
+    status: PurgeStatus
+    operation_count: int
+    residual_count: int
 
 
 @dataclass(frozen=True)

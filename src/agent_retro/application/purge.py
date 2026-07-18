@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from binascii import Error as Base64Error
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -31,6 +34,18 @@ class KnowledgeSyncPending(PurgeError):
 
 class UnsafePurgeRegistration(PurgeError):
     """A registered path escapes or aliases an allowed local root."""
+
+
+class IncompletePurgeConfirmation(PurgeError):
+    """Apply requires exactly every operation ID and no other value."""
+
+
+class StalePurgePlan(PurgeError):
+    """The current registered manifest no longer matches the supplied plan."""
+
+
+class UnknownPurgePlan(PurgeError):
+    """The supplied plan identity is malformed or cannot be resolved."""
 
 
 @dataclass(frozen=True)
@@ -65,6 +80,70 @@ class PurgeService:
         self.trace_paths = tuple(Path(path) for path in trace_paths)
 
     def plan(self, knowledge_id: str) -> PurgePlan:
+        plan, _, _ = self._current_manifest(knowledge_id)
+        return plan
+
+    def apply(
+        self,
+        plan_id: str,
+        confirmed_operation_ids: frozenset[str],
+        actor: str = "user",
+    ) -> PurgeStatus:
+        knowledge_id = self._knowledge_id_from_plan(plan_id)
+        try:
+            current, copies, marker = self._current_manifest(knowledge_id)
+        except (
+            PurgeKnowledgeNotFound,
+            KnowledgeAlreadyPurged,
+            KnowledgeSyncPending,
+        ) as exc:
+            raise StalePurgePlan("purge plan no longer matches current state") from exc
+        if current.id != plan_id:
+            raise StalePurgePlan("purge plan no longer matches current state")
+        expected = frozenset(operation.id for operation in current.operations)
+        if confirmed_operation_ids != expected:
+            raise IncompletePurgeConfirmation(
+                "every purge operation must be confirmed exactly"
+            )
+
+        now = datetime.now(timezone.utc).isoformat()
+        tombstone = json.dumps(
+            {
+                "knowledge_id": knowledge_id,
+                "actor": actor,
+                "started_at": now,
+                "updated_at": now,
+                "status": PurgeStatus.PURGE_IN_PROGRESS.value,
+                "operation_count": len(current.operations),
+                "residual_count": 0,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        journal_locations = {
+            operation.id: copy.locator
+            for operation, copy in zip(current.operations, copies, strict=True)
+        }
+        database_expected = {
+            copy.locator: copy.expected_hash
+            for copy in copies
+            if copy.location_kind.startswith("sqlite_")
+        }
+        self.repository.begin_purge(
+            current,
+            plan_hash=hashlib.sha256(current.id.encode("utf-8")).hexdigest(),
+            actor=actor,
+            marker=marker,
+            journal_locations=journal_locations,
+            database_expected_hashes=database_expected,
+            tombstone_json=tombstone,
+        )
+        return PurgeStatus.PURGE_IN_PROGRESS
+
+    def _current_manifest(
+        self, knowledge_id: str
+    ) -> tuple[PurgePlan, tuple[_ManifestCopy, ...], bytes]:
         inspection = self.repository.inspect_purge_database(knowledge_id)
         if inspection.already_purged:
             raise KnowledgeAlreadyPurged("knowledge is already purged")
@@ -93,7 +172,12 @@ class PurgeService:
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
-        plan_id = "purge-" + hashlib.sha256(identity).hexdigest()
+        encoded_knowledge = (
+            urlsafe_b64encode(knowledge_id.encode("utf-8")).decode("ascii").rstrip("=")
+        )
+        plan_id = (
+            "purge-v1-" + encoded_knowledge + "-" + hashlib.sha256(identity).hexdigest()
+        )
 
         counts: dict[str, int] = {}
         operations: list[PurgeOperation] = []
@@ -114,12 +198,35 @@ class PurgeService:
                     expected_hash=item.expected_hash,
                 )
             )
-        return PurgePlan(
-            id=plan_id,
-            knowledge_id=knowledge_id,
-            operations=tuple(operations),
-            status=PurgeStatus.PLANNED,
+        return (
+            PurgePlan(
+                id=plan_id,
+                knowledge_id=knowledge_id,
+                operations=tuple(operations),
+                status=PurgeStatus.PLANNED,
+            ),
+            tuple(copies),
+            marker,
         )
+
+    @staticmethod
+    def _knowledge_id_from_plan(plan_id: str) -> str:
+        if not plan_id.startswith("purge-v1-"):
+            raise UnknownPurgePlan("purge plan identity is malformed")
+        encoded_and_digest = plan_id.removeprefix("purge-v1-")
+        try:
+            encoded, digest = encoded_and_digest.rsplit("-", 1)
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError
+            padding = "=" * (-len(encoded) % 4)
+            knowledge_id = urlsafe_b64decode(encoded + padding).decode("utf-8")
+        except (Base64Error, UnicodeDecodeError, ValueError) as exc:
+            raise UnknownPurgePlan("purge plan identity is malformed") from exc
+        if not knowledge_id:
+            raise UnknownPurgePlan("purge plan identity is malformed")
+        return knowledge_id
 
     def _managed_vault_copies(
         self, project_id: str, marker: bytes

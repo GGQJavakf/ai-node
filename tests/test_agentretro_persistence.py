@@ -228,6 +228,7 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
     ]
     assert [item.value for item in PurgeStatus] == [
         "planned",
+        "purge_in_progress",
         "purge_incomplete",
         "purged",
     ]

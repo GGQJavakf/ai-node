@@ -9,17 +9,29 @@ import pytest
 
 from _path import ROOT  # noqa: F401
 from agent_retro.application.purge import (
+    IncompletePurgeConfirmation,
     KnowledgeAlreadyPurged,
     KnowledgeSyncPending,
     PurgeKnowledgeNotFound,
     PurgeService,
+    StalePurgePlan,
 )
+from agent_retro.domain.models import PurgeStatus
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 
 
 MARKER = "agentretro-secret-6c25d4e9"
 KNOWLEDGE_ID = "knowledge-purge-a"
 PROJECT_ID = "project-a"
+
+
+class _FailingPurgeRepository(SQLiteRetroRepository):
+    fail_purge_audit = False
+
+    def _append_audit_record(self, connection, entry):
+        if self.fail_purge_audit and entry.action == "purge_started":
+            raise OSError("injected purge transaction failure")
+        return super()._append_audit_record(connection, entry)
 
 
 def _insert_knowledge(repository: SQLiteRetroRepository) -> None:
@@ -106,6 +118,59 @@ def _insert_knowledge(repository: SQLiteRetroRepository) -> None:
                 now,
             ),
         )
+        connection.execute(
+            "INSERT INTO audit_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "audit-unrelated",
+                "user",
+                "keep",
+                "knowledge",
+                "knowledge-unrelated",
+                "",
+                "",
+                '{"detail":"keep"}',
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO review_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "review-a",
+                "candidate-a",
+                "input-hash",
+                1,
+                "completed",
+                json.dumps({"result": MARKER}),
+                f"error {MARKER}",
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO conflicts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "conflict-a",
+                KNOWLEDGE_ID,
+                "candidate-a",
+                f"reason {MARKER}",
+                f"merge {MARKER}",
+                "open",
+                now,
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO sync_jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "sync-a",
+                PROJECT_ID,
+                "synced",
+                json.dumps({"payload": MARKER}),
+                "redacted",
+                f"error {MARKER}",
+                now,
+                now,
+            ),
+        )
 
 
 @pytest.fixture
@@ -127,6 +192,19 @@ def purge_fixture(tmp_path: Path):
                 PROJECT_ID,
                 "managed-hash",
                 "full-hash",
+                "2026-07-18T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO managed_file_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(managed),
+                PROJECT_ID,
+                "full",
+                f"snapshot {MARKER}".encode(),
+                "managed-hash",
+                "full-hash",
+                "event-a",
                 "2026-07-18T00:00:00+00:00",
             ),
         )
@@ -178,6 +256,27 @@ def _snapshot(
     return rows, files
 
 
+def _table_rows(repository: SQLiteRetroRepository, table: str):
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        return [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
+
+
+def _database_rows(repository: SQLiteRetroRepository):
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.row_factory = sqlite3.Row
+        tables = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+            )
+        ]
+        return {
+            table: [dict(row) for row in connection.execute(f"SELECT * FROM {table}")]
+            for table in tables
+        }
+
+
 def test_plan_is_read_only_complete_redacted_and_deterministic(
     purge_fixture, tmp_path: Path
 ):
@@ -189,12 +288,15 @@ def test_plan_is_read_only_complete_redacted_and_deterministic(
 
     assert first == second
     assert _snapshot(tmp_path, repository) == before
-    assert len(first.operations) == 11
+    assert len(first.operations) == 18
     kinds = {operation.location_kind for operation in first.operations}
     assert {
         "sqlite_knowledge",
         "sqlite_candidate",
         "sqlite_evidence",
+        "sqlite_review",
+        "sqlite_conflict",
+        "sqlite_projection",
         "sqlite_audit",
     } <= kinds
     assert {
@@ -265,3 +367,135 @@ def test_plan_refuses_missing_already_purged_and_sync_pending(purge_fixture):
         )
     with pytest.raises(KnowledgeSyncPending):
         service.plan(KNOWLEDGE_ID)
+
+
+@pytest.mark.parametrize("confirmation", ["missing", "extra", "empty", "wildcard"])
+def test_apply_requires_the_exact_confirmation_set_without_writes(
+    purge_fixture, tmp_path: Path, confirmation: str
+):
+    repository, service, *_ = purge_fixture
+    plan = service.plan(KNOWLEDGE_ID)
+    expected = frozenset(operation.id for operation in plan.operations)
+    supplied = {
+        "missing": frozenset(tuple(expected)[:-1]),
+        "extra": expected | {"unknown-operation"},
+        "empty": frozenset(),
+        "wildcard": frozenset({"*"}),
+    }[confirmation]
+    before = _snapshot(tmp_path, repository)
+
+    with pytest.raises(IncompletePurgeConfirmation):
+        service.apply(plan.id, supplied)
+
+    assert _snapshot(tmp_path, repository) == before
+    assert _table_rows(repository, "purge_jobs") == []
+
+
+@pytest.mark.parametrize("change", ["planned", "new_registered_residual"])
+def test_apply_rebuilds_manifest_and_refuses_stale_state_without_writes(
+    purge_fixture, tmp_path: Path, change: str
+):
+    repository, service, managed, _, unrelated, *_ = purge_fixture
+    plan = service.plan(KNOWLEDGE_ID)
+    confirmations = frozenset(operation.id for operation in plan.operations)
+    if change == "planned":
+        managed.write_text(f"changed {MARKER}\n", encoding="utf-8")
+    else:
+        unrelated.write_text(f"new copy {MARKER}\n", encoding="utf-8")
+    before = _snapshot(tmp_path, repository)
+
+    with pytest.raises(StalePurgePlan):
+        service.apply(plan.id, confirmations)
+
+    assert _snapshot(tmp_path, repository) == before
+    assert _table_rows(repository, "purge_jobs") == []
+
+
+def test_apply_journals_and_scrubs_sqlite_in_one_stage_without_claiming_purged(
+    purge_fixture,
+):
+    repository, service, *_ = purge_fixture
+    plan = service.plan(KNOWLEDGE_ID)
+
+    restarted_service = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+    )
+    status = restarted_service.apply(
+        plan.id,
+        frozenset(operation.id for operation in plan.operations),
+        actor="user-a",
+    )
+
+    assert status is PurgeStatus.PURGE_IN_PROGRESS
+    assert _table_rows(repository, "knowledge") == []
+    for table, fields in {
+        "candidates": ("proposed_text", "review_json"),
+        "evidence": ("excerpt",),
+        "review_attempts": ("result_json", "error"),
+        "conflicts": ("reason", "merge_text"),
+        "sync_jobs": ("plan_json", "error"),
+        "managed_file_snapshots": ("owned_bytes",),
+        "audit_log": ("detail_json",),
+    }.items():
+        for row in _table_rows(repository, table):
+            assert all(MARKER not in str(row[field]) for field in fields)
+    assert any(
+        row["id"] == "audit-unrelated" and row["detail_json"] == '{"detail":"keep"}'
+        for row in _table_rows(repository, "audit_log")
+    )
+    jobs = _table_rows(repository, "purge_jobs")
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "purge_in_progress"
+    tombstone = json.loads(jobs[0]["tombstone_json"])
+    assert set(tombstone) == {
+        "knowledge_id",
+        "actor",
+        "started_at",
+        "updated_at",
+        "status",
+        "operation_count",
+        "residual_count",
+    }
+    assert tombstone["status"] == "purge_in_progress"
+    assert tombstone["operation_count"] == len(plan.operations)
+    assert MARKER not in json.dumps(tombstone)
+    typed_tombstone = repository.get_purge_tombstone(KNOWLEDGE_ID)
+    assert typed_tombstone is not None
+    assert typed_tombstone.status is PurgeStatus.PURGE_IN_PROGRESS
+    for forbidden in ("text", "excerpt", "summary", "content_hash", "filename"):
+        assert not hasattr(typed_tombstone, forbidden)
+    operations = _table_rows(repository, "purge_operations")
+    assert len(operations) == len(plan.operations)
+    assert all(MARKER not in json.dumps(row) for row in operations)
+    assert all(not Path(row["location"]).is_absolute() for row in operations)
+    assert not any(
+        row["action"] == "purge_finished"
+        for row in _table_rows(repository, "audit_log")
+    )
+
+
+def test_sqlite_stage_failure_rolls_back_the_journal_and_every_scrub(purge_fixture):
+    repository, service, *_ = purge_fixture
+    failing = _FailingPurgeRepository(repository.db_path, repository.backup_dir)
+    failing.fail_purge_audit = True
+    failing_service = PurgeService(
+        failing,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+    )
+    plan = failing_service.plan(KNOWLEDGE_ID)
+    before = _database_rows(failing)
+
+    with pytest.raises(OSError, match="injected purge transaction failure"):
+        failing_service.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+
+    assert _database_rows(failing) == before
+    assert failing.get_purge_tombstone(KNOWLEDGE_ID) is None

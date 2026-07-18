@@ -38,6 +38,7 @@ from agent_retro.domain.models import (
     PurgeCopy,
     PurgeInspection,
     PurgeStatus,
+    PurgeTombstone,
     ReviewAttempt,
     ReviewResult,
     ReviewVerdict,
@@ -248,6 +249,21 @@ _SCHEMA_V2 = (
         event_id TEXT NOT NULL,
         updated_at TEXT NOT NULL
     )""",
+)
+
+_PURGE_SQLITE_FIELDS = (
+    ("sqlite_knowledge", "knowledge", "id || ':' || version", "text"),
+    ("sqlite_candidate", "candidates", "id", "proposed_text"),
+    ("sqlite_candidate", "candidates", "id", "review_json"),
+    ("sqlite_evidence", "evidence", "id", "excerpt"),
+    ("sqlite_review", "review_attempts", "id", "result_json"),
+    ("sqlite_review", "review_attempts", "id", "error"),
+    ("sqlite_conflict", "conflicts", "id", "reason"),
+    ("sqlite_conflict", "conflicts", "id", "merge_text"),
+    ("sqlite_projection", "sync_jobs", "id", "plan_json"),
+    ("sqlite_projection", "sync_jobs", "id", "error"),
+    ("sqlite_projection", "managed_file_snapshots", "path", "owned_bytes"),
+    ("sqlite_audit", "audit_log", "id", "detail_json"),
 )
 
 
@@ -2646,41 +2662,7 @@ class SQLiteRetroRepository(RetroRepository):
                 )
 
             marker = knowledge.text.encode("utf-8")
-            copies: list[PurgeCopy] = []
-            fields = (
-                ("sqlite_knowledge", "knowledge", "id || ':' || version", "text"),
-                ("sqlite_candidate", "candidates", "id", "proposed_text"),
-                ("sqlite_candidate", "candidates", "id", "review_json"),
-                ("sqlite_evidence", "evidence", "id", "excerpt"),
-                ("sqlite_review", "review_attempts", "id", "result_json"),
-                ("sqlite_review", "review_attempts", "id", "error"),
-                ("sqlite_conflict", "conflicts", "id", "reason"),
-                ("sqlite_conflict", "conflicts", "id", "merge_text"),
-                ("sqlite_projection", "sync_jobs", "id", "plan_json"),
-                ("sqlite_projection", "sync_jobs", "id", "error"),
-                ("sqlite_projection", "managed_file_snapshots", "path", "owned_bytes"),
-                ("sqlite_audit", "audit_log", "id", "detail_json"),
-            )
-            for kind, table, key_expression, column in fields:
-                rows = connection.execute(
-                    f"SELECT {key_expression} AS record_key, {column} AS content FROM {table} ORDER BY record_key"
-                ).fetchall()
-                for stored in rows:
-                    value = stored["content"]
-                    content = (
-                        bytes(value)
-                        if isinstance(value, bytes)
-                        else str(value).encode("utf-8")
-                    )
-                    if marker in content:
-                        copies.append(
-                            PurgeCopy(
-                                kind,
-                                f"{table}:{stored['record_key']}:{column}",
-                                content,
-                            )
-                        )
-            copies.sort(key=lambda item: (item.location_kind, item.locator))
+            copies = self._purge_database_copies(connection, marker)
             return PurgeInspection(
                 knowledge,
                 purged is not None,
@@ -2689,6 +2671,158 @@ class SQLiteRetroRepository(RetroRepository):
             )
         finally:
             connection.close()
+
+    def begin_purge(
+        self,
+        plan: PurgePlan,
+        *,
+        plan_hash: str,
+        actor: str,
+        marker: bytes,
+        journal_locations: Mapping[str, str],
+        database_expected_hashes: Mapping[str, str],
+        tombstone_json: str,
+    ) -> None:
+        """Journal and scrub SQLite-owned copies in one transaction."""
+
+        with self.transaction() as connection:
+            current_copies = self._purge_database_copies(connection, marker)
+            current_hashes = {
+                item.locator: hashlib.sha256(item.content).hexdigest()
+                for item in current_copies
+            }
+            if current_hashes != dict(database_expected_hashes):
+                raise ValueError("purge database preflight changed")
+
+            now = _now_text()
+            connection.execute(
+                """INSERT INTO purge_jobs(
+                    id, knowledge_id, plan_hash, status, tombstone_json,
+                    residual_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan.id,
+                    plan.knowledge_id,
+                    plan_hash,
+                    PurgeStatus.PURGE_IN_PROGRESS.value,
+                    tombstone_json,
+                    "[]",
+                    now,
+                    now,
+                ),
+            )
+            for operation in plan.operations:
+                connection.execute(
+                    """INSERT INTO purge_operations(
+                        id, purge_job_id, location_kind, location,
+                        expected_hash, status, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        operation.id,
+                        plan.id,
+                        operation.location_kind,
+                        journal_locations[operation.id],
+                        operation.expected_hash,
+                        (
+                            "completed"
+                            if operation.location_kind.startswith("sqlite_")
+                            else "pending"
+                        ),
+                        "",
+                    ),
+                )
+
+            marker_text = marker.decode("utf-8")
+            for _, table, _, column in _PURGE_SQLITE_FIELDS:
+                rows = connection.execute(
+                    f"SELECT rowid AS purge_rowid, {column} AS content FROM {table}"
+                ).fetchall()
+                for row in rows:
+                    value = row["content"]
+                    if isinstance(value, bytes):
+                        replacement: bytes | str = bytes(value).replace(marker, b"")
+                        changed = replacement != bytes(value)
+                    else:
+                        replacement = str(value).replace(marker_text, "")
+                        changed = replacement != str(value)
+                    if changed:
+                        connection.execute(
+                            f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
+                            (replacement, row["purge_rowid"]),
+                        )
+
+            connection.execute(
+                "DELETE FROM knowledge_evidence WHERE knowledge_id = ?",
+                (plan.knowledge_id,),
+            )
+            connection.execute(
+                "DELETE FROM knowledge WHERE id = ?", (plan.knowledge_id,)
+            )
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    actor=actor,
+                    action="purge_started",
+                    entity_type="purge_job",
+                    entity_id=plan.id,
+                    detail={
+                        "operation_count": len(plan.operations),
+                        "status": PurgeStatus.PURGE_IN_PROGRESS.value,
+                    },
+                ),
+            )
+
+    def get_purge_tombstone(self, knowledge_id: str) -> PurgeTombstone | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT tombstone_json FROM purge_jobs
+                WHERE knowledge_id = ? AND tombstone_json != ''
+                ORDER BY updated_at DESC, id DESC LIMIT 1""",
+                (knowledge_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = json.loads(str(row["tombstone_json"]))
+            return PurgeTombstone(
+                knowledge_id=str(payload["knowledge_id"]),
+                actor=str(payload["actor"]),
+                started_at=_datetime(payload["started_at"]),
+                updated_at=_datetime(payload["updated_at"]),
+                status=PurgeStatus(payload["status"]),
+                operation_count=int(payload["operation_count"]),
+                residual_count=int(payload["residual_count"]),
+            )
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _purge_database_copies(
+        connection: sqlite3.Connection, marker: bytes
+    ) -> list[PurgeCopy]:
+        copies: list[PurgeCopy] = []
+        for kind, table, key_expression, column in _PURGE_SQLITE_FIELDS:
+            rows = connection.execute(
+                f"SELECT {key_expression} AS record_key, {column} AS content "
+                f"FROM {table} ORDER BY record_key"
+            ).fetchall()
+            for stored in rows:
+                value = stored["content"]
+                content = (
+                    bytes(value)
+                    if isinstance(value, bytes)
+                    else str(value).encode("utf-8")
+                )
+                if marker in content:
+                    copies.append(
+                        PurgeCopy(
+                            kind,
+                            f"{table}:{stored['record_key']}:{column}",
+                            content,
+                        )
+                    )
+        copies.sort(key=lambda item: (item.location_kind, item.locator))
+        return copies
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None:
         with self.transaction() as connection:

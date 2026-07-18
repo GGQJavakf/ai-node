@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from agent_retro.domain.models import (
     AcceptanceDecision,
@@ -27,6 +27,7 @@ from agent_retro.domain.models import (
     PurgePlan,
     PurgeInspection,
     PurgeStatus,
+    PurgeTombstone,
     ReviewAttempt,
     ReviewResult,
     SyncJob,
@@ -261,6 +262,20 @@ class RetroRepository(Protocol):
     def list_managed_file_states(self, project_id: str) -> list[ManagedFileState]: ...
 
     def inspect_purge_database(self, knowledge_id: str) -> PurgeInspection: ...
+
+    def begin_purge(
+        self,
+        plan: PurgePlan,
+        *,
+        plan_hash: str,
+        actor: str,
+        marker: bytes,
+        journal_locations: Mapping[str, str],
+        database_expected_hashes: Mapping[str, str],
+        tombstone_json: str,
+    ) -> None: ...
+
+    def get_purge_tombstone(self, knowledge_id: str) -> PurgeTombstone | None: ...
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 
