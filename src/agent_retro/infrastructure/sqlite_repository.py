@@ -1553,20 +1553,30 @@ class SQLiteRetroRepository(RetroRepository):
                     f"session is not awaiting classification: {session_id}"
                 )
             internal_session_id = str(row["id"])
-            pending_rows = connection.execute(
+            candidate_rows = connection.execute(
                 """SELECT id, project_id FROM candidates
-                WHERE session_id = ? AND status = ? ORDER BY created_at, id""",
-                (internal_session_id, CandidateStatus.PENDING_REVIEW.value),
+                WHERE session_id = ? ORDER BY created_at, id""",
+                (internal_session_id,),
             ).fetchall()
+            state_rows = connection.execute(
+                "SELECT id, project_id, status FROM candidates WHERE session_id = ?",
+                (internal_session_id,),
+            ).fetchall()
+            pending_rows = [
+                item
+                for item in state_rows
+                if str(item["status"]) == CandidateStatus.PENDING_REVIEW.value
+            ]
             candidate_ids = tuple(str(item["id"]) for item in pending_rows)
             preexisting_knowledge_versions: tuple[tuple[str, int], ...] = ()
             preexisting_conflict_ids: tuple[str, ...] = ()
-            if candidate_ids:
-                placeholders = ",".join("?" for _ in candidate_ids)
+            baseline_ids = tuple(str(item["id"]) for item in candidate_rows)
+            if baseline_ids:
+                placeholders = ",".join("?" for _ in baseline_ids)
                 knowledge_rows = connection.execute(
                     f"""SELECT id, version FROM knowledge
                     WHERE candidate_id IN ({placeholders}) ORDER BY id, version""",
-                    candidate_ids,
+                    baseline_ids,
                 ).fetchall()
                 preexisting_knowledge_versions = tuple(
                     (str(item["id"]), int(item["version"])) for item in knowledge_rows
@@ -1574,7 +1584,7 @@ class SQLiteRetroRepository(RetroRepository):
                 conflict_rows = connection.execute(
                     f"""SELECT id FROM conflicts
                     WHERE candidate_id IN ({placeholders}) ORDER BY id""",
-                    candidate_ids,
+                    baseline_ids,
                 ).fetchall()
                 preexisting_conflict_ids = tuple(
                     str(item["id"]) for item in conflict_rows
@@ -1631,12 +1641,19 @@ class SQLiteRetroRepository(RetroRepository):
                 target_project_id=project_id,
                 mapping_id=mapping_id,
                 pending_candidate_ids=candidate_ids,
+                candidate_states=tuple(
+                    (str(item["id"]), str(item["project_id"]), str(item["status"]))
+                    for item in state_rows
+                ),
                 preexisting_knowledge_versions=preexisting_knowledge_versions,
                 preexisting_conflict_ids=preexisting_conflict_ids,
             )
 
     def rollback_reclassification(
-        self, reclassification: Reclassification, actor: str
+        self,
+        reclassification: Reclassification,
+        actor: str,
+        affected_candidate_ids: Sequence[str] = (),
     ) -> None:
         """Compensate a failed post-reclassification review without erasing attempts."""
 
@@ -1651,7 +1668,11 @@ class SQLiteRetroRepository(RetroRepository):
                 raise ValueError(
                     "session target changed before reclassification rollback"
                 )
-            candidate_ids = reclassification.pending_candidate_ids
+            candidate_ids = tuple(
+                dict.fromkeys(
+                    (*reclassification.pending_candidate_ids, *affected_candidate_ids)
+                )
+            )
             removed_knowledge = 0
             removed_conflicts = 0
             if candidate_ids:
@@ -1690,17 +1711,23 @@ class SQLiteRetroRepository(RetroRepository):
                     removed_conflicts += connection.execute(
                         "DELETE FROM conflicts WHERE id = ?", (conflict_id,)
                     ).rowcount
-                connection.execute(
-                    f"""UPDATE candidates
-                    SET project_id = ?, status = ?, updated_at = ?
-                    WHERE id IN ({placeholders})""",
-                    (
-                        reclassification.previous_project_id,
-                        CandidateStatus.PENDING_REVIEW.value,
-                        _now_text(),
-                        *candidate_ids,
-                    ),
-                )
+                baseline = {
+                    item[0]: (item[1], item[2])
+                    for item in reclassification.candidate_states
+                }
+                for candidate_id in candidate_ids:
+                    project_id, status = baseline.get(
+                        candidate_id,
+                        (
+                            reclassification.previous_project_id,
+                            CandidateStatus.PENDING_REVIEW.value,
+                        ),
+                    )
+                    connection.execute(
+                        """UPDATE candidates SET project_id = ?, status = ?, updated_at = ?
+                        WHERE id = ?""",
+                        (project_id, status, _now_text(), candidate_id),
+                    )
             connection.execute(
                 "UPDATE sessions SET project_id = ? WHERE id = ?",
                 (

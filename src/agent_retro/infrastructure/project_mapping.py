@@ -231,8 +231,12 @@ class ProjectMappingService:
             self.review_stored_evidence(
                 session_id, mapping.obsidian_project, tuple(evidence)
             )
-        except Exception:
-            self.repository.rollback_reclassification(reclassification, actor)
+        except Exception as exc:
+            self.repository.rollback_reclassification(
+                reclassification,
+                actor,
+                affected_candidate_ids=getattr(exc, "candidate_ids", ()),
+            )
             raise
 
     def _validated_project(self, obsidian_project: str) -> str:

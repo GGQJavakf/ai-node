@@ -63,9 +63,7 @@ def evidence_data(
     }
 
 
-def redacted_result(
-    result: ReviewResult, redact: Callable[[str], str]
-) -> ReviewResult:
+def redacted_result(result: ReviewResult, redact: Callable[[str], str]) -> ReviewResult:
     return ReviewResult(
         verdict=result.verdict,
         confidence=result.confidence,

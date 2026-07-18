@@ -155,7 +155,10 @@ class RetroRepository(Protocol):
     ) -> Reclassification: ...
 
     def rollback_reclassification(
-        self, reclassification: Reclassification, actor: str
+        self,
+        reclassification: Reclassification,
+        actor: str,
+        affected_candidate_ids: Sequence[str] = (),
     ) -> None: ...
 
     def save_projection_event(

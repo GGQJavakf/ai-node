@@ -1037,6 +1037,80 @@ def test_reclassify_second_phase_failure_rolls_back_all_candidates_and_retries(
     assert len(reviewer.calls) == 5
 
 
+def test_reclassify_rolls_back_candidates_created_only_in_failed_second_phase(
+    tmp_path,
+):
+    awaiting = "awaiting:unknown"
+    repository, _ = _repository_with_evidence(tmp_path, project_id=awaiting)
+    mapping = _save_review_mapping(repository)
+
+    class PhasedExtractor:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, input_json: str, *, timeout: int):
+            self.calls += 1
+            if self.calls == 1:
+                return ()
+            return (
+                _extracted(text="Accepted only after classification."),
+                _extracted(text="Fails only after classification."),
+            )
+
+    reviewer = _SequenceReviewer(
+        [
+            _review(),
+            RuntimeError("second-phase review unavailable"),
+            _review(),
+            _review(),
+            _review(),
+        ]
+    )
+    service = _service(repository, PhasedExtractor(), reviewer)
+    mapping_service = ProjectMappingService(
+        repository,
+        vault_root=tmp_path / "vault",
+        review_stored_evidence=service.review_stored_evidence,
+    )
+
+    with pytest.raises(ReviewUnavailableError, match="retry"):
+        mapping_service.reclassify("source-session-1", mapping.id)
+
+    session = repository.find_session_by_source_id("source-session-1")
+    candidates = repository.candidates_for_session("source-session-1")
+    assert session is not None and session.project_id == awaiting
+    assert len(candidates) == 2
+    assert all(item.project_id == awaiting for item in candidates)
+    assert all(item.status is CandidateStatus.PENDING_REVIEW for item in candidates)
+    assert all(
+        repository.knowledge_for_candidate(item.id) is None for item in candidates
+    )
+    assert (
+        sum(
+            len(repository.review_attempts_for_candidate(item.id))
+            for item in candidates
+        )
+        == 2
+    )
+    assert (
+        sum(
+            len(repository.list_audit_entries(action="review_saved", entity_id=item.id))
+            for item in candidates
+        )
+        == 1
+    )
+
+    mapping_service.reclassify("source-session-1", mapping.id)
+
+    converged = repository.candidates_for_session("source-session-1")
+    assert all(item.project_id == "project-1" for item in converged)
+    assert all(item.status is CandidateStatus.AUTO_ACCEPTED for item in converged)
+    assert all(
+        repository.knowledge_for_candidate(item.id) is not None for item in converged
+    )
+    assert len(reviewer.calls) == 5
+
+
 def test_retry_session_only_calls_model_for_pending_model_dependent_candidates(
     tmp_path,
 ):

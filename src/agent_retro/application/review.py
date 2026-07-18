@@ -110,6 +110,10 @@ class ReviewGateway(Protocol):
 class ReviewUnavailableError(RuntimeError):
     """Stored candidates remain pending and can be retried safely."""
 
+    def __init__(self, message: str, *, candidate_ids: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.candidate_ids = tuple(candidate_ids)
+
 
 def threshold_passes(kind: KnowledgeType, confidence: float) -> bool:
     """Apply the fixed conservative acceptance floor for one knowledge type."""
@@ -232,14 +236,16 @@ class ReviewService:
         evidence: Sequence[Evidence],
     ) -> list[ReviewResult]:
         pending = self.repository.pending_model_candidates_for_session(session_id)
-        results = (
-            [self.retry_candidate(item.id) for item in pending]
+        candidates = (
+            tuple(pending)
             if pending
-            else self._extract_then_review(session_id, project_id, evidence)
+            else self._extract_candidates(session_id, project_id, evidence)
         )
+        results = [self.retry_candidate(item.id) for item in candidates]
         if any(result is None for result in results):
             raise ReviewUnavailableError(
-                "model review failed; retry is available for stored candidates"
+                "model review failed; retry is available for stored candidates",
+                candidate_ids=tuple(item.id for item in candidates),
             )
         return [result for result in results if result is not None]
 
@@ -302,6 +308,15 @@ class ReviewService:
         project_id: str,
         evidence: Sequence[Evidence],
     ) -> list[ReviewResult | None]:
+        candidates = self._extract_candidates(session_id, project_id, evidence)
+        return [self.retry_candidate(candidate.id) for candidate in candidates]
+
+    def _extract_candidates(
+        self,
+        session_id: str,
+        project_id: str,
+        evidence: Sequence[Evidence],
+    ) -> tuple[Candidate, ...]:
         extraction_input = canonical_extraction_input(evidence, self.redact)
         try:
             extracted = self.extractor.extract(
@@ -316,7 +331,7 @@ class ReviewService:
             for item in extracted
         )
         self.repository.save_candidates(candidates)
-        return [self.retry_candidate(candidate.id) for candidate in candidates]
+        return candidates
 
     def _candidate_from_extraction(
         self,

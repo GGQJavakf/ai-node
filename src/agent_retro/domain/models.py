@@ -192,6 +192,7 @@ class Reclassification:
     target_project_id: str
     mapping_id: str
     pending_candidate_ids: tuple[str, ...]
+    candidate_states: tuple[tuple[str, str, str], ...]
     preexisting_knowledge_versions: tuple[tuple[str, int], ...]
     preexisting_conflict_ids: tuple[str, ...]
 

@@ -32,6 +32,14 @@ Status: complete for the explicitly scoped milestone; Task 4 as a whole remains 
 - No OpenSpec task was marked complete because `2.8` and `3.1` through `3.9` require the remaining milestones.
 - No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
 
+## Task 4 follow-up: second-phase candidate compensation
+
+- A real `ReviewService` plus temporary SQLite regression covers awaiting extraction returning no candidates, target extraction creating two candidates, the first accepting and the second failing review.
+- Reclassification snapshots every preexisting candidate state and the complete knowledge/conflict baseline. Review failure carries the exact IDs handled by that invocation, so rollback restores only prior pending candidates and explicitly affected second-phase candidates without using a time window or a session-wide difference.
+- Rollback restores preexisting state, moves newly created affected candidates to the previous project as pending, removes only knowledge/conflict absent from the baseline, and retains attempts/audits. Reclassification then converges through canonical-input reuse/retry.
+- RED reproduced the two target-project candidates left after rollback. GREEN: target `3 passed`, focused `131 passed`, full `341 passed`; OpenSpec strict and diff checks passed.
+- Changed AgentRetro files, including formatting-only `review_contracts.py`, pass Ruff format/check. Repository-wide Ruff still reports preexisting unrelated debt: 66 files would reformat and 13 legacy lint errors.
+
 ## Milestone B: persisted review orchestration and idempotent retry
 
 Status: complete for the explicitly scoped milestone; manual lifecycle, conflicts, and CLI work remain incomplete.
