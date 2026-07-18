@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from _path import ROOT  # noqa: F401
+from agent_retro.application.bootstrap import build_purge_service
 from agent_retro.application.purge import (
     IncompletePurgeConfirmation,
     KnowledgeAlreadyPurged,
@@ -34,6 +35,7 @@ from agent_retro.application.sync import (
 )
 from agent_retro.domain.models import ProjectionStatus, PurgeStatus
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
+from agent_retro.infrastructure.settings import load_retro_settings
 from agent_retro.presentation import cli as retro_cli
 
 
@@ -1434,3 +1436,57 @@ def test_purge_preserves_unrelated_entity_with_identical_text(purge_fixture):
         if row["id"] == "candidate-unrelated-same-text"
     )
     assert unrelated["proposed_text"] == MARKER
+
+
+def test_recovery_keeps_log_identity_after_an_earlier_registered_file_is_deleted(
+    purge_fixture,
+):
+    repository, fixture_service, _, _, _, existing_log, existing_trace = purge_fixture
+    state_dir = repository.db_path.parent
+    existing_log.write_text("unrelated log\n", encoding="utf-8")
+    existing_trace.write_text("{}", encoding="utf-8")
+    log_root = state_dir / "logs"
+    first = log_root / "a-first.log"
+    second = log_root / "b-second.log"
+    first.write_text(MARKER, encoding="utf-8")
+    second.write_text(f"keep {MARKER}\n", encoding="utf-8")
+    settings = load_retro_settings(
+        home=state_dir.parent,
+        env={
+            "AGENTRETRO_HOME": str(state_dir),
+            "AGENTRETRO_OBSIDIAN_ROOT": str(fixture_service.vault_root),
+        },
+    )
+    interrupted = build_purge_service(settings, repository)
+
+    def fail_second_log_replace(source: Path, target: Path) -> None:
+        if target == second.resolve():
+            raise OSError("injected later registered log failure")
+        source.replace(target)
+
+    interrupted._replace = fail_second_log_replace
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+    assert not first.exists()
+    assert MARKER.encode() in second.read_bytes()
+    journal = repository.get_purge_journal(KNOWLEDGE_ID)
+    assert journal is not None
+    failed_log = next(
+        operation
+        for operation in journal.operations
+        if operation.location_kind == "agentretro_log" and operation.status == "failed"
+    )
+    assert failed_log.locator.startswith("registered-")
+    assert len(failed_log.locator) == len("registered-") + 64
+    assert first.name not in failed_log.locator
+    assert second.name not in failed_log.locator
+    assert str(state_dir) not in failed_log.locator
+
+    restarted = build_purge_service(settings, repository)
+    assert restarted.recover(KNOWLEDGE_ID) is PurgeStatus.PURGED
+    assert MARKER.encode() not in second.read_bytes()

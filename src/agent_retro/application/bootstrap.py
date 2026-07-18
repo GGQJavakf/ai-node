@@ -49,6 +49,8 @@ def build_purge_service(
         backup_roots={"agentretro_backup": settings.backup_dir},
         log_paths=_registered_state_files(settings.state_dir / "logs"),
         trace_paths=_registered_state_files(settings.state_dir / "traces"),
+        log_root=settings.state_dir / "logs",
+        trace_root=settings.state_dir / "traces",
         completed_projection=completed_projection,
     )
 

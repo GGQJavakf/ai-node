@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import unicodedata
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
 from dataclasses import dataclass
@@ -111,6 +112,8 @@ class PurgeService:
         backup_roots: Mapping[str, Path] | None = None,
         log_paths: Sequence[Path] = (),
         trace_paths: Sequence[Path] = (),
+        log_root: Path | None = None,
+        trace_root: Path | None = None,
         replace: Callable[[Path, Path], object] = os.replace,
         completed_projection: Callable[[str, str, str], object] | None = None,
     ) -> None:
@@ -121,6 +124,8 @@ class PurgeService:
         }
         self.log_paths = tuple(Path(path) for path in log_paths)
         self.trace_paths = tuple(Path(path) for path in trace_paths)
+        self.log_root = self._configured_explicit_root(log_root, self.log_paths)
+        self.trace_root = self._configured_explicit_root(trace_root, self.trace_paths)
         self._replace = replace
         self._completed_projection = completed_projection
         self.projection_result: PurgeProjectionResult | None = None
@@ -347,6 +352,8 @@ class PurgeService:
             raise ValueError("purge recovery payload is invalid")
 
         target = self._journal_target(operation)
+        if target is None:
+            return
         if not target.exists():
             return
         before = target.read_bytes()
@@ -374,7 +381,7 @@ class PurgeService:
             raise ValueError("purge recovery result is invalid")
         self._atomic_write(target, after)
 
-    def _journal_target(self, operation: PurgeJournalOperation) -> Path:
+    def _journal_target(self, operation: PurgeJournalOperation) -> Path | None:
         relative = Path(operation.locator)
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError("purge recovery locator is invalid")
@@ -389,19 +396,11 @@ class PurgeService:
             )
             target = root / relative
         elif operation.location_kind in {"agentretro_log", "model_trace"}:
-            paths = (
-                self.log_paths
-                if operation.location_kind == "agentretro_log"
-                else self.trace_paths
+            if not _is_registered_identity(operation.locator):
+                raise ValueError("purge recovery locator is invalid")
+            return self._registered_identity_map(operation.location_kind).get(
+                operation.locator
             )
-            try:
-                index = int(operation.locator.removeprefix("registered-")) - 1
-                target = sorted(paths, key=str)[index]
-            except (IndexError, ValueError) as exc:
-                raise ValueError("purge recovery locator is invalid") from exc
-            if target.is_symlink():
-                raise ValueError("purge recovery target is a symlink")
-            return target.resolve() if target.exists() else target
         else:
             raise ValueError("purge recovery kind is invalid")
 
@@ -461,14 +460,9 @@ class PurgeService:
                         target.read_bytes(), journal.marker_fingerprints
                     ):
                         kinds.add(kind)
-        for kind, paths in (
-            ("agentretro_log", self.log_paths),
-            ("model_trace", self.trace_paths),
-        ):
-            for target in paths:
-                if target.is_symlink():
-                    raise ValueError("registered recovery file is a symlink")
-                if target.exists() and _has_any_fingerprint(
+        for kind in ("agentretro_log", "model_trace"):
+            for target in self._registered_files(kind):
+                if _has_any_fingerprint(
                     target.read_bytes(), journal.marker_fingerprints
                 ):
                     kinds.add(kind)
@@ -767,6 +761,21 @@ class PurgeService:
                 target,
                 copy.location_kind,
             )
+        if copy.location_kind in {"agentretro_log", "model_trace"}:
+            root = self._explicit_root(copy.location_kind)
+            if root is None:
+                raise UnsafePurgeRegistration("registered purge root is unavailable")
+            resolved = self._validated_child(
+                self._validated_root(root, copy.location_kind),
+                target,
+                copy.location_kind,
+            )
+            if (
+                self._registered_identity(copy.location_kind, root, resolved)
+                != copy.locator
+            ):
+                raise UnsafePurgeRegistration("registered purge file identity changed")
+            return resolved
         allowed = {
             path.resolve(strict=True)
             for path in self.log_paths + self.trace_paths
@@ -851,26 +860,100 @@ class PurgeService:
                             )
                         )
 
-        explicit = (
-            ("agentretro_log", self.log_paths),
-            ("model_trace", self.trace_paths),
-        )
-        for kind, paths in explicit:
-            for index, path in enumerate(sorted(paths, key=str), start=1):
-                if path.is_symlink():
-                    raise UnsafePurgeRegistration(f"{kind} path must not be a symlink")
-                if not path.exists():
-                    continue
-                resolved = path.resolve(strict=True)
+        for kind in ("agentretro_log", "model_trace"):
+            root = self._explicit_root(kind)
+            if root is None:
+                continue
+            for resolved in self._registered_files(kind):
                 if resolved in seen:
                     continue
                 content = resolved.read_bytes()
                 if _contains_any(content, markers):
                     seen.add(resolved)
                     copies.append(
-                        _ManifestCopy(kind, f"registered-{index}", content, resolved)
+                        _ManifestCopy(
+                            kind,
+                            self._registered_identity(kind, root, resolved),
+                            content,
+                            resolved,
+                        )
                     )
         return copies
+
+    @staticmethod
+    def _configured_explicit_root(
+        configured: Path | None, paths: Sequence[Path]
+    ) -> Path | None:
+        if configured is not None:
+            root = Path(configured)
+        elif not paths:
+            return None
+        else:
+            parents = {Path(path).parent.resolve() for path in paths}
+            if len(parents) != 1:
+                raise UnsafePurgeRegistration(
+                    "registered purge paths require one explicit root"
+                )
+            root = parents.pop()
+        resolved_root = root.resolve()
+        for path in paths:
+            try:
+                Path(path).resolve().relative_to(resolved_root)
+            except ValueError as exc:
+                raise UnsafePurgeRegistration(
+                    "registered purge path escapes its configured root"
+                ) from exc
+        return root
+
+    def _explicit_root(self, kind: str) -> Path | None:
+        return self.log_root if kind == "agentretro_log" else self.trace_root
+
+    def _registered_files(self, kind: str) -> tuple[Path, ...]:
+        root_value = self._explicit_root(kind)
+        if root_value is None:
+            return ()
+        root = self._validated_root(root_value, kind)
+        if not root.exists():
+            return ()
+        files: list[Path] = []
+        for directory, dirnames, filenames in os.walk(root, followlinks=False):
+            directory_path = Path(directory)
+            for name in dirnames:
+                if (directory_path / name).is_symlink():
+                    raise UnsafePurgeRegistration(
+                        f"{kind} registration contains a symlink"
+                    )
+            dirnames[:] = sorted(dirnames)
+            for name in sorted(filenames):
+                target = directory_path / name
+                if target.is_symlink():
+                    raise UnsafePurgeRegistration(
+                        f"{kind} registration contains a symlink"
+                    )
+                files.append(self._validated_child(root, target, kind))
+        return tuple(files)
+
+    def _registered_identity_map(self, kind: str) -> dict[str, Path]:
+        root = self._explicit_root(kind)
+        if root is None:
+            return {}
+        identities: dict[str, Path] = {}
+        for target in self._registered_files(kind):
+            identity = self._registered_identity(kind, root, target)
+            if identity in identities:
+                raise UnsafePurgeRegistration("registered purge identity collision")
+            identities[identity] = target
+        return identities
+
+    def _registered_identity(self, kind: str, root_value: Path, target: Path) -> str:
+        root = self._validated_root(root_value, kind)
+        resolved = self._validated_child(root, target, kind)
+        relative = resolved.relative_to(root).as_posix()
+        normalized = unicodedata.normalize("NFC", relative)
+        if os.name == "nt":
+            normalized = normalized.casefold()
+        digest = hashlib.sha256((kind + "\0" + normalized).encode("utf-8")).hexdigest()
+        return "registered-" + digest
 
     @staticmethod
     def _validated_root(root_value: Path, label: str) -> Path:
@@ -955,6 +1038,15 @@ def _has_any_fingerprint(
 
 def _contains_any(content: bytes, markers: Sequence[bytes]) -> bool:
     return any(marker in content for marker in markers)
+
+
+def _is_registered_identity(locator: str) -> bool:
+    digest = locator.removeprefix("registered-")
+    return (
+        locator.startswith("registered-")
+        and len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+    )
 
 
 def _remove_markers(content: bytes, markers: Sequence[bytes]) -> bytes:
