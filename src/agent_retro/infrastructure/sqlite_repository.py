@@ -24,13 +24,16 @@ from agent_retro.domain.models import (
     Knowledge,
     KnowledgeConflict,
     KnowledgeType,
+    NormalizedEvent,
     NormalizedSession,
     ProjectMapping,
+    ProjectionStatus,
     PurgePlan,
     PurgeStatus,
     ReviewAttempt,
     ReviewResult,
     ReviewVerdict,
+    SourceLocator,
     SyncJob,
 )
 
@@ -50,11 +53,26 @@ _SCHEMA_V1 = (
         captured_at TEXT NOT NULL,
         UNIQUE(source_session_id, source_hash)
     )""",
+    """CREATE TABLE session_events (
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        locator_session_id TEXT NOT NULL,
+        locator_event_id TEXT NOT NULL,
+        locator_source_path TEXT NOT NULL,
+        locator_content_hash TEXT NOT NULL,
+        PRIMARY KEY(session_id, id),
+        UNIQUE(session_id, ordinal)
+    )""",
     """CREATE TABLE evidence (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES sessions(id),
         kind TEXT NOT NULL,
+        locator_session_id TEXT NOT NULL,
         event_id TEXT NOT NULL,
+        locator_source_path TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         excerpt TEXT NOT NULL,
         UNIQUE(session_id, event_id, content_hash)
@@ -394,7 +412,16 @@ class SQLiteRetroRepository(RetroRepository):
                 "AND source_hash = ?",
                 (source_session_id, source_hash),
             ).fetchone()
-            return None if row is None else _session_from_row(row)
+            if row is None:
+                return None
+            event_rows = connection.execute(
+                "SELECT * FROM session_events WHERE session_id = ? "
+                "ORDER BY ordinal",
+                (row["id"],),
+            ).fetchall()
+            return _session_from_row(
+                row, tuple(_event_from_row(event_row) for event_row in event_rows)
+            )
         finally:
             connection.close()
 
@@ -418,18 +445,40 @@ class SQLiteRetroRepository(RetroRepository):
                     _now_text(),
                 ),
             )
+            for ordinal, event in enumerate(session.events):
+                connection.execute(
+                    """INSERT INTO session_events(
+                        session_id, id, kind, content, ordinal,
+                        locator_session_id, locator_event_id,
+                        locator_source_path, locator_content_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session.id,
+                        event.id,
+                        event.kind,
+                        event.content,
+                        ordinal,
+                        event.locator.session_id,
+                        event.locator.event_id,
+                        event.locator.source_path,
+                        event.locator.content_hash,
+                    ),
+                )
             for item in evidence:
                 if item.session_id != session.id:
                     raise ValueError("evidence session_id does not match session")
                 connection.execute(
                     """INSERT INTO evidence(
-                        id, session_id, kind, event_id, content_hash, excerpt
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        id, session_id, kind, locator_session_id, event_id,
+                        locator_source_path, content_hash, excerpt
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         item.id,
                         item.session_id,
                         item.kind,
+                        item.locator.session_id,
                         item.locator.event_id,
+                        item.locator.source_path,
                         item.locator.content_hash,
                         item.excerpt,
                     ),
@@ -444,6 +493,17 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"evidence_count": len(evidence)},
                 ),
             )
+
+    def list_evidence(self, session_id: str) -> list[Evidence]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM evidence WHERE session_id = ? ORDER BY rowid",
+                (session_id,),
+            ).fetchall()
+            return [_evidence_from_row(row) for row in rows]
+        finally:
+            connection.close()
 
     def save_candidates(self, candidates: Sequence[Candidate]) -> None:
         with self.transaction() as connection:
@@ -945,7 +1005,7 @@ class SQLiteRetroRepository(RetroRepository):
                         cause,
                         cause_entity_id,
                         input_hash,
-                        "pending",
+                        ProjectionStatus.SYNC_PENDING.value,
                         "",
                         now,
                         now,
@@ -1134,7 +1194,9 @@ def _require_row(cursor: sqlite3.Cursor, entity_type: str, entity_id: str) -> No
         raise KeyError(f"{entity_type} not found: {entity_id}")
 
 
-def _session_from_row(row: sqlite3.Row) -> NormalizedSession:
+def _session_from_row(
+    row: sqlite3.Row, events: tuple[NormalizedEvent, ...]
+) -> NormalizedSession:
     return NormalizedSession(
         id=str(row["id"]),
         source_session_id=str(row["source_session_id"]),
@@ -1143,7 +1205,36 @@ def _session_from_row(row: sqlite3.Row) -> NormalizedSession:
         project_id=str(row["project_id"]),
         completed=str(row["status"]) == "completed",
         completed_at=_datetime(row["completed_at"]),
-        events=(),
+        events=events,
+    )
+
+
+def _event_from_row(row: sqlite3.Row) -> NormalizedEvent:
+    return NormalizedEvent(
+        id=str(row["id"]),
+        kind=str(row["kind"]),
+        content=str(row["content"]),
+        locator=SourceLocator(
+            session_id=str(row["locator_session_id"]),
+            event_id=str(row["locator_event_id"]),
+            source_path=str(row["locator_source_path"]),
+            content_hash=str(row["locator_content_hash"]),
+        ),
+    )
+
+
+def _evidence_from_row(row: sqlite3.Row) -> Evidence:
+    return Evidence(
+        id=str(row["id"]),
+        session_id=str(row["session_id"]),
+        kind=str(row["kind"]),
+        locator=SourceLocator(
+            session_id=str(row["locator_session_id"]),
+            event_id=str(row["event_id"]),
+            source_path=str(row["locator_source_path"]),
+            content_hash=str(row["content_hash"]),
+        ),
+        excerpt=str(row["excerpt"]),
     )
 
 

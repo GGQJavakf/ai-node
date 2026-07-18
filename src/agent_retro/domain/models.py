@@ -47,11 +47,19 @@ class PurgeStatus(str, Enum):
     PURGED = "purged"
 
 
+class ProjectionStatus(str, Enum):
+    """Lifecycle states for Obsidian projection work."""
+
+    SYNCED = "synced"
+    SYNC_PENDING = "sync_pending"
+    ROLLBACK_REQUIRED = "rollback_required"
+
+
 @dataclass(frozen=True)
 class SourceLocator:
     session_id: str
     event_id: str
-    source_path: Path
+    source_path: str
     content_hash: str
 
 

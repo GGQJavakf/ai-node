@@ -4,6 +4,7 @@ import sys
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -22,6 +23,7 @@ from agent_retro.domain.models import (
     NormalizedEvent,
     NormalizedSession,
     ProjectMapping,
+    ProjectionStatus,
     PurgeOperation,
     PurgePlan,
     PurgeStatus,
@@ -37,6 +39,20 @@ from agent_retro.infrastructure.settings import load_retro_settings
 NOW = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
 
 
+def _event() -> NormalizedEvent:
+    return NormalizedEvent(
+        id="normalized-event-1",
+        kind="assistant",
+        content="Full event content is persisted but never audited.",
+        locator=SourceLocator(
+            session_id="source-session-locator",
+            event_id="source-event-17",
+            source_path="sessions/2026/source-session.jsonl",
+            content_hash="event-content-hash-1",
+        ),
+    )
+
+
 def _session() -> NormalizedSession:
     return NormalizedSession(
         id="session-1",
@@ -46,7 +62,7 @@ def _session() -> NormalizedSession:
         project_id="project-1",
         completed=True,
         completed_at=NOW,
-        events=(),
+        events=(_event(),),
     )
 
 
@@ -56,9 +72,9 @@ def _evidence() -> Evidence:
         session_id="session-1",
         kind="user_instruction",
         locator=SourceLocator(
-            session_id="codex-session-1",
+            session_id="evidence-source-session",
             event_id="event-1",
-            source_path=Path("sessions/2026/session-1.jsonl"),
+            source_path="sessions/2026/session-1.jsonl",
             content_hash="evidence-hash-1",
         ),
         excerpt="Keep persistence isolated.",
@@ -198,6 +214,8 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
     for model, names in expected_fields.items():
         assert tuple(field.name for field in fields(model)) == names
 
+    assert get_type_hints(SourceLocator)["source_path"] is str
+    assert isinstance(_evidence().locator.source_path, str)
     assert [item.value for item in ReviewVerdict] == ["ACCEPT", "EDIT", "REJECT"]
     assert [item.value for item in CandidateStatus] == [
         "pending_review",
@@ -215,6 +233,14 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
     assert SyncJob("s", "p", "running", "{}", Path("b")).error == ""
 
 
+def test_projection_status_contract():
+    assert [item.value for item in ProjectionStatus] == [
+        "synced",
+        "sync_pending",
+        "rollback_required",
+    ]
+
+
 def test_repository_creates_schema_version_one(tmp_path):
     repo = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
 
@@ -223,6 +249,7 @@ def test_repository_creates_schema_version_one(tmp_path):
     assert repo.schema_version() == 1
     assert set(repo.table_names()) >= {
         "sessions",
+        "session_events",
         "evidence",
         "candidates",
         "review_attempts",
@@ -238,6 +265,39 @@ def test_repository_creates_schema_version_one(tmp_path):
     }
     with repo.transaction() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        evidence_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(evidence)")
+        }
+    assert {"locator_session_id", "locator_source_path"} <= evidence_columns
+
+
+def test_capture_round_trips_nonempty_session_events_without_auditing_content(
+    tmp_path,
+):
+    repo = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
+    repo.migrate()
+    session = _session()
+
+    repo.save_capture(session, [_evidence()])
+
+    assert repo.find_session(session.source_session_id, session.source_hash) == session
+    capture_audit = _rows(
+        repo.db_path,
+        "SELECT detail_json FROM audit_log WHERE action = 'capture_saved'",
+    )[0][0]
+    assert session.events[0].content not in capture_audit
+
+
+def test_capture_round_trips_complete_evidence_locators_without_derivation(tmp_path):
+    repo = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
+    repo.migrate()
+    session = _session()
+    evidence = _evidence()
+    assert evidence.locator.session_id != session.id
+
+    repo.save_capture(session, [evidence])
+
+    assert repo.list_evidence(session.id) == [evidence]
 
 
 def test_failed_migration_restores_database(tmp_path, monkeypatch):
@@ -635,6 +695,12 @@ def test_mapping_projection_and_managed_file_state_lifecycle(tmp_path):
 
     assert event_id == "projection-1"
     assert duplicate_id == "projection-1"
+    projection = _rows(
+        repo.db_path,
+        "SELECT status FROM projection_events WHERE id = ?",
+        (event_id,),
+    )[0]
+    assert projection["status"] == ProjectionStatus.SYNC_PENDING.value
     assert repo.list_project_mappings() == []
     saved_mapping = repo.list_project_mappings(active_only=False)[0]
     assert saved_mapping == ProjectMapping(
