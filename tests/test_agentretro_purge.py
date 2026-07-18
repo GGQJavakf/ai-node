@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from agent_retro.application.purge import (
     PurgeKnowledgeNotFound,
     PurgeService,
     StalePurgePlan,
+    UnsafePurgeRegistration,
 )
 from agent_retro.domain.models import PurgeStatus
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
@@ -430,7 +432,7 @@ def test_apply_journals_and_scrubs_sqlite_in_one_stage_without_claiming_purged(
         actor="user-a",
     )
 
-    assert status is PurgeStatus.PURGE_IN_PROGRESS
+    assert status is PurgeStatus.PURGED
     assert _table_rows(repository, "knowledge") == []
     for table, fields in {
         "candidates": ("proposed_text", "review_json"),
@@ -449,7 +451,7 @@ def test_apply_journals_and_scrubs_sqlite_in_one_stage_without_claiming_purged(
     )
     jobs = _table_rows(repository, "purge_jobs")
     assert len(jobs) == 1
-    assert jobs[0]["status"] == "purge_in_progress"
+    assert jobs[0]["status"] == "purged"
     tombstone = json.loads(jobs[0]["tombstone_json"])
     assert set(tombstone) == {
         "knowledge_id",
@@ -460,22 +462,121 @@ def test_apply_journals_and_scrubs_sqlite_in_one_stage_without_claiming_purged(
         "operation_count",
         "residual_count",
     }
-    assert tombstone["status"] == "purge_in_progress"
+    assert tombstone["status"] == "purged"
     assert tombstone["operation_count"] == len(plan.operations)
     assert MARKER not in json.dumps(tombstone)
     typed_tombstone = repository.get_purge_tombstone(KNOWLEDGE_ID)
     assert typed_tombstone is not None
-    assert typed_tombstone.status is PurgeStatus.PURGE_IN_PROGRESS
+    assert typed_tombstone.status is PurgeStatus.PURGED
     for forbidden in ("text", "excerpt", "summary", "content_hash", "filename"):
         assert not hasattr(typed_tombstone, forbidden)
     operations = _table_rows(repository, "purge_operations")
     assert len(operations) == len(plan.operations)
     assert all(MARKER not in json.dumps(row) for row in operations)
-    assert all(not Path(row["location"]).is_absolute() for row in operations)
+    assert all(row["location"] == "" for row in operations)
+    assert all(row["expected_hash"] == "" for row in operations)
+    assert all(row["status"] == "completed" for row in operations)
+    for path in service.log_paths + service.trace_paths:
+        assert MARKER.encode() not in path.read_bytes()
+    for root in service.backup_roots.values():
+        for path in root.rglob("*"):
+            if path.is_file():
+                assert MARKER.encode() not in path.read_bytes()
+    for state in repository.list_managed_file_states(PROJECT_ID):
+        assert MARKER.encode() not in state.path.read_bytes()
     assert not any(
         row["action"] == "purge_finished"
         for row in _table_rows(repository, "audit_log")
     )
+    success = [
+        row
+        for row in _table_rows(repository, "audit_log")
+        if row["action"] == "purge_succeeded"
+    ]
+    assert len(success) == 1
+    assert MARKER not in success[0]["detail_json"]
+    assert MARKER.encode() not in repository.db_path.read_bytes()
+
+
+def test_apply_time_new_registered_residual_prevents_success(purge_fixture):
+    repository, service, _, _, unrelated, *_ = purge_fixture
+    created = False
+
+    def replace_with_new_residual(source: Path, target: Path) -> None:
+        nonlocal created
+        source.replace(target)
+        if not created:
+            created = True
+            unrelated.write_text(f"late {MARKER}", encoding="utf-8")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=replace_with_new_residual,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+
+    status = interrupted.apply(
+        plan.id, frozenset(operation.id for operation in plan.operations)
+    )
+
+    assert status is PurgeStatus.PURGE_INCOMPLETE
+    assert _table_rows(repository, "purge_jobs")[0]["status"] == "purge_incomplete"
+    assert not any(
+        row["action"] == "purge_succeeded"
+        for row in _table_rows(repository, "audit_log")
+    )
+    assert MARKER not in _table_rows(repository, "purge_jobs")[0]["residual_json"]
+
+
+def test_atomic_file_failure_marks_incomplete_without_success(purge_fixture):
+    repository, service, *_ = purge_fixture
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected atomic replace failure")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+
+    status = interrupted.apply(
+        plan.id, frozenset(operation.id for operation in plan.operations)
+    )
+
+    assert status is PurgeStatus.PURGE_INCOMPLETE
+    assert any(
+        row["status"] == "failed" for row in _table_rows(repository, "purge_operations")
+    )
+    assert not any(
+        row["action"] == "purge_succeeded"
+        for row in _table_rows(repository, "audit_log")
+    )
+
+
+def test_registered_backup_symlink_is_rejected_without_following_it(purge_fixture):
+    _, service, *_ = purge_fixture
+    root = service.backup_roots["sync_backup"]
+    outside = root.parent.parent / "outside-marker.txt"
+    outside.write_text(MARKER, encoding="utf-8")
+    link = root / "escape.txt"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+
+    with pytest.raises(UnsafePurgeRegistration):
+        service.plan(KNOWLEDGE_ID)
+
+    assert outside.read_text(encoding="utf-8") == MARKER
 
 
 def test_sqlite_stage_failure_rolls_back_the_journal_and_every_scrub(purge_fixture):

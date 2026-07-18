@@ -34,6 +34,7 @@ from agent_retro.domain.models import (
     ManagedFileUpdate,
     ProjectionEvent,
     ProjectionStatus,
+    PurgeOperation,
     PurgePlan,
     PurgeCopy,
     PurgeInspection,
@@ -2686,6 +2687,7 @@ class SQLiteRetroRepository(RetroRepository):
         """Journal and scrub SQLite-owned copies in one transaction."""
 
         with self.transaction() as connection:
+            connection.execute("PRAGMA secure_delete = ON")
             current_copies = self._purge_database_copies(connection, marker)
             current_hashes = {
                 item.locator: hashlib.sha256(item.content).hexdigest()
@@ -2795,6 +2797,131 @@ class SQLiteRetroRepository(RetroRepository):
             )
         finally:
             connection.close()
+
+    def mark_purge_operation(
+        self, operation_id: str, status: str, error: str = ""
+    ) -> None:
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE purge_operations SET status = ?, error = ? WHERE id = ?",
+                (status, error, operation_id),
+            )
+            _require_row(cursor, "purge operation", operation_id)
+
+    def purge_database_residual_kinds(self, marker: bytes) -> tuple[str, ...]:
+        connection = self._connect()
+        try:
+            return tuple(
+                sorted(
+                    {
+                        item.location_kind
+                        for item in self._purge_database_copies(connection, marker)
+                    }
+                )
+            )
+        finally:
+            connection.close()
+
+    def finish_purge_incomplete(
+        self,
+        plan_id: str,
+        *,
+        tombstone_json: str,
+        residual_kinds: Sequence[str],
+        residual_operations: Sequence[tuple[PurgeOperation, str]],
+        actor: str,
+    ) -> None:
+        safe_kinds = tuple(sorted(set(str(item) for item in residual_kinds)))
+        residual_count = int(json.loads(tombstone_json)["residual_count"])
+        with self.transaction() as connection:
+            for operation, locator in residual_operations:
+                connection.execute(
+                    """INSERT INTO purge_operations(
+                        id, purge_job_id, location_kind, location,
+                        expected_hash, status, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO NOTHING""",
+                    (
+                        operation.id,
+                        plan_id,
+                        operation.location_kind,
+                        locator,
+                        operation.expected_hash,
+                        "pending",
+                        "",
+                    ),
+                )
+            cursor = connection.execute(
+                """UPDATE purge_jobs SET status = ?, tombstone_json = ?,
+                    residual_json = ?, updated_at = ? WHERE id = ?""",
+                (
+                    PurgeStatus.PURGE_INCOMPLETE.value,
+                    tombstone_json,
+                    json.dumps(safe_kinds, separators=(",", ":")),
+                    _now_text(),
+                    plan_id,
+                ),
+            )
+            _require_row(cursor, "purge plan", plan_id)
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    actor=actor,
+                    action="purge_incomplete",
+                    entity_type="purge_job",
+                    entity_id=plan_id,
+                    detail={
+                        "residual_count": residual_count,
+                        "residual_kinds": safe_kinds,
+                        "status": PurgeStatus.PURGE_INCOMPLETE.value,
+                    },
+                ),
+            )
+
+    def complete_purge(
+        self,
+        plan_id: str,
+        *,
+        tombstone_json: str,
+        kind_counts: Mapping[str, int],
+        actor: str,
+    ) -> None:
+        safe_counts = {
+            str(kind): int(count) for kind, count in sorted(kind_counts.items())
+        }
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE purge_jobs SET plan_hash = '', status = ?,
+                    tombstone_json = ?, residual_json = '[]', updated_at = ?
+                    WHERE id = ?""",
+                (
+                    PurgeStatus.PURGED.value,
+                    tombstone_json,
+                    _now_text(),
+                    plan_id,
+                ),
+            )
+            _require_row(cursor, "purge plan", plan_id)
+            connection.execute(
+                """UPDATE purge_operations
+                SET location = '', expected_hash = '', status = 'completed', error = ''
+                WHERE purge_job_id = ?""",
+                (plan_id,),
+            )
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    actor=actor,
+                    action="purge_succeeded",
+                    entity_type="purge_job",
+                    entity_id=plan_id,
+                    detail={
+                        "kind_counts": safe_counts,
+                        "operation_count": sum(safe_counts.values()),
+                        "status": PurgeStatus.PURGED.value,
+                    },
+                ),
+            )
 
     @staticmethod
     def _purge_database_copies(

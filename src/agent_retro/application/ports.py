@@ -24,6 +24,7 @@ from agent_retro.domain.models import (
     ManagedFileSnapshot,
     ManagedFileUpdate,
     Reclassification,
+    PurgeOperation,
     PurgePlan,
     PurgeInspection,
     PurgeStatus,
@@ -276,6 +277,31 @@ class RetroRepository(Protocol):
     ) -> None: ...
 
     def get_purge_tombstone(self, knowledge_id: str) -> PurgeTombstone | None: ...
+
+    def mark_purge_operation(
+        self, operation_id: str, status: str, error: str = ""
+    ) -> None: ...
+
+    def purge_database_residual_kinds(self, marker: bytes) -> tuple[str, ...]: ...
+
+    def finish_purge_incomplete(
+        self,
+        plan_id: str,
+        *,
+        tombstone_json: str,
+        residual_kinds: Sequence[str],
+        residual_operations: Sequence[tuple[PurgeOperation, str]],
+        actor: str,
+    ) -> None: ...
+
+    def complete_purge(
+        self,
+        plan_id: str,
+        *,
+        tombstone_json: str,
+        kind_counts: Mapping[str, int],
+        actor: str,
+    ) -> None: ...
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 
