@@ -1157,21 +1157,22 @@ TodoAgent CLI
                 return True
 
             # 尝试作为 Markdown 渲染
+            markdown = Markdown(response)
+            output = self.console.file
+            encoding = getattr(output, "encoding", None) or "utf-8"
             try:
-                markdown = Markdown(response)
-                self.console.print(markdown)
+                rendered = "".join(
+                    segment.text for segment in self.console.render(markdown)
+                )
+                rendered.encode(encoding, errors="strict")
             except UnicodeEncodeError:
-                # Rich retains a failed render; discard it before the raw retry.
-                self.console._buffer.clear()
-                encoding = sys.stdout.encoding or "utf-8"
                 safe_response = response.encode(
                     encoding, errors="replace"
                 ).decode(encoding, errors="replace")
-                sys.stdout.write(safe_response + "\n")
-                sys.stdout.flush()
-            except Exception:
-                # 如果不是 Markdown，直接打印
-                self.console.print(response)
+                output.write(safe_response + "\n")
+                output.flush()
+            else:
+                self.console.print(markdown)
 
         return True
 

@@ -4,10 +4,12 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from _path import SRC  # noqa: F401
+from ai_todo_assistant.presentation.cli import TodoCLI
 
 
 _RETRO_ENTRY = (
@@ -15,6 +17,43 @@ _RETRO_ENTRY = (
     "from agent_retro.presentation.cli import main; "
     "raise SystemExit(main(sys.argv[1:]))"
 )
+
+
+class _StrictTextFile:
+    def __init__(self, encoding: str = "gbk") -> None:
+        self.encoding = encoding
+        self.writes: list[str] = []
+        self.flush_count = 0
+
+    def write(self, value: str) -> None:
+        value.encode(self.encoding, errors="strict")
+        self.writes.append(value)
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+
+class _RenderingConsole:
+    def __init__(
+        self,
+        *,
+        rendered_text: str = "",
+        render_error: Exception | None = None,
+    ) -> None:
+        self.file = _StrictTextFile()
+        self.rendered_text = rendered_text
+        self.render_error = render_error
+        self.render_calls = 0
+        self.printed: list[object] = []
+
+    def render(self, renderable):
+        self.render_calls += 1
+        if self.render_error is not None:
+            raise self.render_error
+        return (SimpleNamespace(text=self.rendered_text),)
+
+    def print(self, value: object) -> None:
+        self.printed.append(value)
 
 
 def _isolated_environment(tmp_path: Path, encoding: str) -> dict[str, str]:
@@ -104,3 +143,31 @@ def test_existing_ai_todo_noninteractive_help_remains_gbk_safe(
     assert b"UnicodeEncodeError" not in combined
     combined.decode("gbk", errors="strict")
     assert "日常主命令".encode("gbk") in combined
+
+
+def test_ai_todo_display_response_uses_one_console_file_encoding_fallback() -> None:
+    console = _RenderingConsole(rendered_text="📖 帮助")
+    cli = object.__new__(TodoCLI)
+    cli.console = console
+
+    assert cli._display_response("📖 帮助") is True
+
+    assert console.render_calls == 1
+    assert console.printed == []
+    assert console.file.writes == ["? 帮助\n"]
+    assert console.file.flush_count == 1
+
+
+def test_ai_todo_display_response_propagates_non_encoding_render_errors() -> None:
+    error = RuntimeError("render failed")
+    console = _RenderingConsole(render_error=error)
+    cli = object.__new__(TodoCLI)
+    cli.console = console
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        cli._display_response("plain help")
+
+    assert console.render_calls == 1
+    assert console.printed == []
+    assert console.file.writes == []
+    assert console.file.flush_count == 0

@@ -12,11 +12,13 @@ from _path import ROOT  # noqa: F401
 from agent_retro.application.review import ReviewService
 from agent_retro.domain.models import (
     CandidateStatus,
+    KnowledgeType,
     ProjectMapping,
     ReviewResult,
     ReviewVerdict,
 )
 from agent_retro.infrastructure.llm_review import ExtractedCandidate
+from agent_retro.infrastructure.obsidian import parse_aggregate_entries
 from agent_retro.infrastructure.redaction import Redactor
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 from agent_retro.presentation import cli as retro_cli
@@ -227,8 +229,13 @@ def run_e2e_flow(
     assert len(evidence_ids) == 5
     managed_root = vault / "项目" / PROJECT_ID / "AgentRetro"
     managed_root.mkdir(parents=True)
+    baselines: dict[str, bytes] = {}
+    baseline_hashes: dict[str, str] = {}
     for name in ("规则.md", "经验.md", "任务状态.md"):
-        (managed_root / name).write_text("# safe pre-sync baseline\n", encoding="utf-8")
+        target = managed_root / name
+        target.write_text("# safe pre-sync baseline\n", encoding="utf-8")
+        baselines[name] = target.read_bytes()
+        baseline_hashes[name] = hashlib.sha256(baselines[name]).hexdigest()
 
     trace: list[str] = []
 
@@ -252,12 +259,54 @@ def run_e2e_flow(
     )
     review_output = capsys.readouterr().out
     review_payload = json.loads(review_output)
-    assert review_payload["data"]["projections"][0]["status"] == "synced"
+    projections = review_payload["data"]["projections"]
+    assert len(projections) == 1
+    projection = projections[0]
+    assert projection["status"] == "synced"
+    assert projection["warning"] == ""
+    assert projection["reason"] == ""
 
     accepted = repository.list_candidates(CandidateStatus.AUTO_ACCEPTED)
     assert len(accepted) == 3
-    for name in ("规则.md", "经验.md", "任务状态.md"):
-        assert (managed_root / name).is_file()
+    knowledge = {
+        item.knowledge_type: repository.knowledge_for_candidate(item.id)
+        for item in accepted
+    }
+    expected = {
+        "规则.md": (KnowledgeType.RULE, RULE_TEXT, (evidence_ids[0],)),
+        "经验.md": (
+            KnowledgeType.LESSON,
+            LESSON_TEXT,
+            evidence_ids[1:4],
+        ),
+        "任务状态.md": (KnowledgeType.TASK_STATE, TASK_TEXT, (evidence_ids[0],)),
+    }
+    projected_targets: dict[str, str] = {}
+    for name, (kind, text, expected_evidence) in expected.items():
+        target = managed_root / name
+        after = target.read_bytes()
+        item = knowledge[kind]
+        assert item is not None
+        assert after != baselines[name]
+        assert hashlib.sha256(after).hexdigest() != baseline_hashes[name]
+        assert parse_aggregate_entries(after) == {item.id: text}
+        decoded = after.decode("utf-8")
+        assert decoded.count(f"### {item.id}") == 1
+        assert decoded.count(f"- ID: {item.id}") == 1
+        assert tuple(sorted(item.evidence_ids)) == tuple(sorted(expected_evidence))
+        for evidence_id in expected_evidence:
+            assert evidence_id in decoded
+        snapshot = repository.get_managed_file_snapshot(target)
+        assert snapshot is not None
+        assert snapshot.snapshot_kind == "full"
+        assert snapshot.owned_bytes == after
+        assert snapshot.event_id == projection["event_id"]
+        projected_targets[name] = projection["status"]
+    assert projected_targets == {
+        "规则.md": "synced",
+        "经验.md": "synced",
+        "任务状态.md": "synced",
+    }
 
     assert (
         retro_cli.main(
