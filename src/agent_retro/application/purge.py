@@ -15,6 +15,7 @@ from typing import Callable, Mapping, Sequence
 
 from agent_retro.application.ports import RetroRepository
 from agent_retro.domain.models import (
+    ProjectionStatus,
     PurgeJournal,
     PurgeJournalOperation,
     PurgeOperation,
@@ -77,6 +78,17 @@ class PurgeRecoveryNotIncomplete(PurgeError):
 
 
 @dataclass(frozen=True)
+class PurgeProjectionResult:
+    """Path-free projection result retained by the initiating purge command."""
+
+    event_id: str
+    status: ProjectionStatus
+    warning: str = ""
+    recovery_command: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class _ManifestCopy:
     location_kind: str
     locator: str
@@ -100,6 +112,7 @@ class PurgeService:
         log_paths: Sequence[Path] = (),
         trace_paths: Sequence[Path] = (),
         replace: Callable[[Path, Path], object] = os.replace,
+        completed_projection: Callable[[str, str, str], object] | None = None,
     ) -> None:
         self.repository = repository
         self.vault_root = None if vault_root is None else Path(vault_root)
@@ -109,6 +122,8 @@ class PurgeService:
         self.log_paths = tuple(Path(path) for path in log_paths)
         self.trace_paths = tuple(Path(path) for path in trace_paths)
         self._replace = replace
+        self._completed_projection = completed_projection
+        self.projection_result: PurgeProjectionResult | None = None
 
     def plan(self, knowledge_id: str) -> PurgePlan:
         plan, _, _, _ = self._current_manifest(knowledge_id)
@@ -120,6 +135,7 @@ class PurgeService:
         confirmed_operation_ids: frozenset[str],
         actor: str = "user",
     ) -> PurgeStatus:
+        self.projection_result = None
         knowledge_id = self._knowledge_id_from_plan(plan_id)
         try:
             current, copies, marker, project_id = self._current_manifest(knowledge_id)
@@ -212,6 +228,7 @@ class PurgeService:
         )
 
     def recover(self, knowledge_id: str, actor: str = "user") -> PurgeStatus:
+        self.projection_result = None
         journal = self.repository.get_purge_journal(knowledge_id)
         if journal is None:
             raise PurgeRecoveryNotFound("purge recovery journal was not found")
@@ -274,7 +291,35 @@ class PurgeService:
             kind_counts=counts,
             actor=actor,
         )
+        self._project_completed(journal.knowledge_id, journal.project_id)
         return PurgeStatus.PURGED
+
+    def _project_completed(self, knowledge_id: str, project_id: str) -> None:
+        if self._completed_projection is None:
+            return
+        try:
+            result = self._completed_projection(
+                "sensitive_purge", knowledge_id, project_id
+            )
+            status = getattr(result, "status")
+            if not isinstance(status, ProjectionStatus):
+                status = ProjectionStatus(str(status))
+            self.projection_result = PurgeProjectionResult(
+                event_id=_safe_projection_token(getattr(result, "event_id", "")),
+                status=status,
+                warning=_safe_projection_warning(getattr(result, "warning", "")),
+                recovery_command=_safe_projection_command(
+                    getattr(result, "recovery_command", ""), status
+                ),
+                reason=_safe_projection_reason(getattr(result, "reason", ""), status),
+            )
+        except Exception:
+            self.projection_result = PurgeProjectionResult(
+                event_id="",
+                status=ProjectionStatus.SYNC_PENDING,
+                recovery_command="retro doctor --repair-sync",
+                reason="projection_failed",
+            )
 
     def _recover_operation(self, operation: PurgeJournalOperation) -> None:
         try:
@@ -563,6 +608,7 @@ class PurgeService:
             kind_counts=counts,
             actor=actor,
         )
+        self._project_completed(plan.knowledge_id, project_id)
         return PurgeStatus.PURGED
 
     @staticmethod
@@ -844,3 +890,40 @@ def _has_sha256_window(content: bytes, expected_hash: str, length: int) -> bool:
         hashlib.sha256(content[offset : offset + length]).hexdigest() == expected_hash
         for offset in range(len(content) - length + 1)
     )
+
+
+def _safe_projection_token(value: object) -> str:
+    token = str(value)
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    if 0 < len(token) <= 128 and all(character in allowed for character in token):
+        return token
+    return ""
+
+
+def _safe_projection_warning(value: object) -> str:
+    warning = str(value)
+    return (
+        warning
+        if warning in {"", "RETRO_SYNC_PENDING", "RETRO_ROLLBACK_REQUIRED"}
+        else "RETRO_SYNC_PENDING"
+    )
+
+
+def _safe_projection_command(value: object, status: ProjectionStatus) -> str:
+    command = str(value)
+    if command == "retro doctor --repair-sync":
+        return command
+    prefix = "retro sync retry "
+    if command.startswith(prefix) and _safe_projection_token(command[len(prefix) :]):
+        return command
+    return "" if status is ProjectionStatus.SYNCED else "retro doctor --repair-sync"
+
+
+def _safe_projection_reason(value: object, status: ProjectionStatus) -> str:
+    reason = str(value)
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789_"
+    if not reason:
+        return ""
+    if len(reason) <= 64 and all(character in allowed for character in reason):
+        return reason
+    return "" if status is ProjectionStatus.SYNCED else "projection_pending"

@@ -31,7 +31,7 @@
 - [x] 3.7 Implement conflict detection, old-item-active behavior, merge suggestions, explicit merge resolution, and superseded-version history.
 - [x] 3.8 Implement project-to-global promotion, stale task-state handling, and ordinary archive without physical deletion.
 - [x] 3.9 Implement `retro review retry --candidate/--session` with immutable attempt records, fresh model review, idempotent lifecycle transitions, and no duplicate accepted knowledge.
-- [ ] 3.10 Implement `retro kb purge plan/apply` so an immutable plan enumerates every AgentRetro-owned SQLite, vault, backup, log, and index copy; require plan ID plus exact operation confirmation; create only a content-free tombstone; and leave `purge_incomplete` with residual locations if any cleanup fails.
+- [x] 3.10 Implement `retro kb purge plan/apply` so an immutable plan enumerates every AgentRetro-owned SQLite, vault, backup, log, and index copy; require plan ID plus exact operation confirmation; create only a content-free tombstone; and leave `purge_incomplete` with residual locations if any cleanup fails.
 - [ ] 3.11 Add tests whose names or metadata reference every knowledge-review scenario `KR-01` through `KR-24`, and record the scenario-to-test mapping in verification evidence.
 
 ## 4. Obsidian Projection and Recovery
@@ -45,7 +45,7 @@
 - [x] 4.7 Implement external managed-content hash detection and `retro sync reconcile` choices without silent bidirectional overwrite.
 - [x] 4.8 Implement preview-only semantic merge planning with target hashes, complete diffs, conflicts, and destructive-operation disclosure.
 - [x] 4.9 Implement explicit merge apply through the journaled write protocol, rejecting stale plans and requiring exact confirmation for delete, rename, move, or unresolved conflict.
-- [ ] 4.10 Integrate sensitive purge with journaled vault and backup cleanup so retention never recreates sensitive content, and verify a residual scan before marking the purge complete.
+- [x] 4.10 Integrate sensitive purge with journaled vault and backup cleanup so retention never recreates sensitive content, and verify a residual scan before marking the purge complete.
 - [ ] 4.11 Add tests whose names or metadata reference every Obsidian synchronization scenario `OS-01` through `OS-24`, and record the scenario-to-test mapping in verification evidence.
 
 ## 5. Briefing, Diagnostics, and Codex Integration

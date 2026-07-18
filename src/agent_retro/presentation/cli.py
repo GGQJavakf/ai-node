@@ -12,6 +12,7 @@ from typing import Mapping
 
 from agent_retro.application.bootstrap import (
     build_doctor_service,
+    build_purge_service,
     build_projection_coordinator,
     build_retro_repository,
 )
@@ -28,10 +29,23 @@ from agent_retro.application.merge import (
     StalePlanError,
 )
 from agent_retro.application.merge_planner import MergePlanner
+from agent_retro.application.purge import (
+    IncompletePurgeConfirmation,
+    KnowledgeAlreadyPurged,
+    KnowledgeSyncPending,
+    PurgeAlreadyComplete,
+    PurgeBlockedError,
+    PurgeError,
+    PurgeKnowledgeNotFound,
+    PurgeRecoveryNotFound,
+    PurgeRecoveryNotIncomplete,
+    StalePurgePlan,
+    UnknownPurgePlan,
+)
 from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.application.capture import CaptureResult, CaptureService
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
-from agent_retro.domain.models import CandidateStatus, KnowledgeType
+from agent_retro.domain.models import CandidateStatus, KnowledgeType, PurgeStatus
 from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     effective_codex_home,
@@ -180,6 +194,23 @@ def build_parser() -> argparse.ArgumentParser:
         dest="confirmed_operations",
     )
 
+    knowledge = commands.add_parser("knowledge", help="管理已接受知识")
+    knowledge_commands = knowledge.add_subparsers(
+        dest="knowledge_command", required=True
+    )
+    purge = knowledge_commands.add_parser("purge", help="显式清除敏感知识")
+    purge.add_argument("knowledge_id")
+    purge_mode = purge.add_mutually_exclusive_group(required=True)
+    purge_mode.add_argument("--plan", action="store_true", dest="purge_plan")
+    purge_mode.add_argument("--apply-plan", dest="purge_plan_id")
+    purge_mode.add_argument("--recover", action="store_true", dest="purge_recover")
+    purge.add_argument(
+        "--confirm-operation",
+        action="append",
+        default=[],
+        dest="confirmed_operations",
+    )
+
     brief = commands.add_parser("brief", help="生成任务范围内的本地知识简报")
     brief.add_argument("task")
     brief.add_argument("--project", required=True, dest="project_id")
@@ -289,6 +320,40 @@ def main(
                     )
                     + "\n"
                 )
+            return 2
+        except PurgeError as exc:
+            code = _purge_error_code(exc)
+            recovery_command = getattr(
+                exc,
+                "recovery_command",
+                (
+                    "retro knowledge purge <id> --plan"
+                    if isinstance(
+                        exc,
+                        (
+                            IncompletePurgeConfirmation,
+                            KnowledgeAlreadyPurged,
+                            KnowledgeSyncPending,
+                            PurgeKnowledgeNotFound,
+                            StalePurgePlan,
+                            UnknownPurgePlan,
+                        ),
+                    )
+                    else "retro knowledge purge <id> --recover"
+                ),
+            )
+            data = {"recovery_command": recovery_command}
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": code,
+                        "message": "Sensitive purge command failed safely.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
             return 2
         except ConfirmationRequiredError as exc:
             data = {
@@ -477,6 +542,15 @@ def _run_command(
         return 0
 
     coordinator = build_projection_coordinator(settings, repository)
+    if args.command == "knowledge":
+        return _run_purge_command(
+            args,
+            build_purge_service(
+                settings,
+                repository,
+                completed_projection=coordinator.after_commit,
+            ),
+        )
     resolver = ProjectResolver(repository.list_project_mappings())
     if args.command == "sync":
         if args.sync_command == "retry":
@@ -647,6 +721,97 @@ def _run_command(
     else:
         sys.stdout.write(safe_text(json_text(data)) + "\n")
     return 0
+
+
+def _run_purge_command(args: argparse.Namespace, service) -> int:
+    if args.confirmed_operations and not args.purge_plan_id:
+        raise IncompletePurgeConfirmation(
+            "confirm-operation is valid only with apply-plan"
+        )
+
+    if args.purge_plan:
+        plan = service.plan(args.knowledge_id)
+        data = {
+            "plan_id": plan.id,
+            "purge_status": plan.status.value,
+            "projection_status": "not_started",
+            "operations": [
+                {"id": operation.id, "kind": operation.location_kind}
+                for operation in plan.operations
+            ],
+        }
+        code = "RETRO_PURGE_PLANNED"
+        message = "Read-only sensitive purge plan created."
+        exit_code = 0
+    else:
+        if args.purge_recover:
+            purge_status = service.recover(args.knowledge_id, actor="user")
+            code = "RETRO_PURGE_RECOVERED"
+            message = "Sensitive purge recovery completed."
+        else:
+            current = service.plan(args.knowledge_id)
+            if current.id != args.purge_plan_id:
+                raise StalePurgePlan("purge plan no longer matches current state")
+            purge_status = service.apply(
+                args.purge_plan_id,
+                frozenset(args.confirmed_operations),
+                actor="user",
+            )
+            code = "RETRO_PURGE_APPLIED"
+            message = "Confirmed sensitive purge completed."
+        projection = service.projection_result
+        data = {
+            "plan_id": args.purge_plan_id or "",
+            "purge_status": purge_status.value,
+            "projection_status": (
+                projection.status.value if projection is not None else "not_started"
+            ),
+            "event_id": projection.event_id if projection is not None else "",
+            "reason": projection.reason if projection is not None else "",
+            "recovery_command": (
+                projection.recovery_command if projection is not None else ""
+            ),
+        }
+        exit_code = 0 if purge_status is PurgeStatus.PURGED else 2
+        if exit_code:
+            code = "RETRO_PURGE_INCOMPLETE"
+            message = "Sensitive purge remains incomplete."
+
+    if args.json_output:
+        write_json(
+            {
+                "status": "ok" if exit_code == 0 else "error",
+                "code": code,
+                "message": message,
+                "data": data,
+            }
+        )
+    else:
+        output = sys.stdout if exit_code == 0 else sys.stderr
+        output.write(safe_text(json_text(data)) + "\n")
+    return exit_code
+
+
+def _purge_error_code(exc: PurgeError) -> str:
+    if isinstance(exc, IncompletePurgeConfirmation):
+        return "RETRO_PURGE_CONFIRMATION_REQUIRED"
+    if isinstance(exc, (StalePurgePlan, UnknownPurgePlan)):
+        return "RETRO_PURGE_PLAN_STALE"
+    if isinstance(exc, PurgeBlockedError):
+        return "RETRO_PURGE_BLOCKED"
+    if isinstance(exc, PurgeRecoveryNotFound):
+        return "RETRO_PURGE_RECOVERY_NOT_FOUND"
+    if isinstance(exc, PurgeAlreadyComplete):
+        return "RETRO_PURGE_ALREADY_COMPLETE"
+    if isinstance(exc, PurgeRecoveryNotIncomplete):
+        return "RETRO_PURGE_RECOVERY_NOT_INCOMPLETE"
+    if isinstance(exc, PurgeKnowledgeNotFound):
+        return "RETRO_PURGE_KNOWLEDGE_NOT_FOUND"
+    if isinstance(exc, KnowledgeAlreadyPurged):
+        return "RETRO_PURGE_ALREADY_COMPLETE"
+    if isinstance(exc, KnowledgeSyncPending):
+        return "RETRO_PURGE_SYNC_PENDING"
+    return "RETRO_PURGE_FAILED"
 
 
 def _write_capture_result(result: CaptureResult, json_output: bool) -> None:

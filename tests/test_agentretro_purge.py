@@ -17,6 +17,7 @@ from agent_retro.application.purge import (
     PurgeAlreadyComplete,
     PurgeBlockedError,
     PurgeKnowledgeNotFound,
+    PurgeProjectionResult,
     PurgeRecoveryNotFound,
     PurgeRecoveryNotIncomplete,
     PurgeService,
@@ -25,9 +26,15 @@ from agent_retro.application.purge import (
 )
 from agent_retro.application.brief import BriefRequest, BriefService
 from agent_retro.application.merge import MergeService
-from agent_retro.application.sync import ProjectionCoordinator, SyncService
-from agent_retro.domain.models import PurgeStatus
+from agent_retro.application.sync import (
+    ProjectionCoordinator,
+    ProjectionPersistenceError,
+    ProjectionResult,
+    SyncService,
+)
+from agent_retro.domain.models import ProjectionStatus, PurgeStatus
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
+from agent_retro.presentation import cli as retro_cli
 
 
 MARKER = "agentretro-secret-6c25d4e9"
@@ -792,11 +799,314 @@ def test_incomplete_purge_blocks_sync_reconcile_and_merge_entrypoints(
         separators=(",", ":"),
         sort_keys=True,
     )
-    monkeypatch.setattr(
-        merge, "_get_job", lambda _: SimpleNamespace(plan_json=payload)
-    )
+    monkeypatch.setattr(merge, "_get_job", lambda _: SimpleNamespace(plan_json=payload))
     with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
         merge.reconcile(conflict_id, "manual_edit", actor="user")
+
+
+def test_completed_purge_projects_once_after_commit_and_excludes_item(purge_fixture):
+    repository, service, *_ = purge_fixture
+    calls: list[tuple[str, str, str]] = []
+
+    def project(cause: str, entity_id: str, project_id: str) -> ProjectionResult:
+        calls.append((cause, entity_id, project_id))
+        assert KNOWLEDGE_ID not in {
+            item.id for item in repository.list_project_knowledge(PROJECT_ID)
+        }
+        event_id = repository.save_current_projection_event(
+            project_id, cause, entity_id
+        )
+        repository.finish_projection_event(event_id, ProjectionStatus.SYNCED)
+        return ProjectionResult(event_id, ProjectionStatus.SYNCED)
+
+    projecting = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        completed_projection=project,
+    )
+    plan = projecting.plan(KNOWLEDGE_ID)
+
+    assert (
+        projecting.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGED
+    )
+    assert calls == [("sensitive_purge", KNOWLEDGE_ID, PROJECT_ID)]
+    assert projecting.projection_result == PurgeProjectionResult(
+        repository.list_projection_events(PROJECT_ID)[0].id,
+        ProjectionStatus.SYNCED,
+    )
+    event = repository.list_projection_events(PROJECT_ID)[0]
+    assert event.cause == "sensitive_purge"
+    assert event.cause_entity_id == KNOWLEDGE_ID
+    assert MARKER not in json.dumps(event.__dict__, default=str)
+
+
+def test_projection_failure_keeps_purge_authoritative_and_reports_retry(
+    purge_fixture,
+):
+    repository, service, *_ = purge_fixture
+
+    def fail_projection(
+        cause: str, entity_id: str, project_id: str
+    ) -> ProjectionResult:
+        error = ProjectionPersistenceError(str(service.vault_root))
+        error.recovery_command = str(service.vault_root)
+        raise error
+
+    projecting = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        completed_projection=fail_projection,
+    )
+    plan = projecting.plan(KNOWLEDGE_ID)
+
+    assert (
+        projecting.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGED
+    )
+    assert KNOWLEDGE_ID not in {
+        item.id for item in repository.list_project_knowledge(PROJECT_ID)
+    }
+    assert repository.get_purge_tombstone(KNOWLEDGE_ID).status is PurgeStatus.PURGED
+    assert projecting.projection_result is not None
+    assert projecting.projection_result.status is ProjectionStatus.SYNC_PENDING
+    assert projecting.projection_result.reason == "projection_failed"
+    assert projecting.projection_result.recovery_command == "retro doctor --repair-sync"
+    assert MARKER.encode() not in repository.db_path.read_bytes()
+
+
+def test_recover_success_triggers_the_same_idempotent_projection(purge_fixture):
+    repository, service, *_ = purge_fixture
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected cleanup failure")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+
+    def project(cause: str, entity_id: str, project_id: str) -> ProjectionResult:
+        event_id = repository.save_current_projection_event(
+            project_id, cause, entity_id
+        )
+        repository.finish_projection_event(event_id, ProjectionStatus.SYNCED)
+        return ProjectionResult(event_id, ProjectionStatus.SYNCED)
+
+    restarted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        completed_projection=project,
+    )
+    assert restarted.recover(KNOWLEDGE_ID) is PurgeStatus.PURGED
+    events = repository.list_projection_events(PROJECT_ID)
+    assert len(events) == 1
+    assert events[0].cause == "sensitive_purge"
+    assert restarted.projection_result is not None
+    assert restarted.projection_result.event_id == events[0].id
+
+
+def test_purge_parser_requires_one_explicit_mutually_exclusive_mode():
+    parser = retro_cli.build_parser()
+
+    planned = parser.parse_args(["knowledge", "purge", KNOWLEDGE_ID, "--plan"])
+    assert planned.purge_plan
+    applied = parser.parse_args(
+        [
+            "knowledge",
+            "purge",
+            KNOWLEDGE_ID,
+            "--apply-plan",
+            "purge-plan-id",
+            "--confirm-operation",
+            "operation-a",
+            "--confirm-operation",
+            "operation-b",
+        ]
+    )
+    assert applied.purge_plan_id == "purge-plan-id"
+    assert applied.confirmed_operations == ["operation-a", "operation-b"]
+    assert parser.parse_args(
+        ["knowledge", "purge", KNOWLEDGE_ID, "--recover"]
+    ).purge_recover
+    with pytest.raises(SystemExit):
+        parser.parse_args(["knowledge", "purge", KNOWLEDGE_ID])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["knowledge", "purge", KNOWLEDGE_ID, "--plan", "--recover"])
+
+
+def test_cli_plan_is_zero_write_and_emits_only_redacted_operations(
+    purge_fixture, tmp_path: Path, capsys
+):
+    repository, service, *_ = purge_fixture
+    before = _snapshot(tmp_path, repository)
+    env = {
+        "AGENTRETRO_HOME": str(repository.db_path.parent),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(service.vault_root),
+    }
+
+    assert (
+        retro_cli.main(
+            ["--json", "knowledge", "purge", KNOWLEDGE_ID, "--plan"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["code"] == "RETRO_PURGE_PLANNED"
+    assert payload["data"]["purge_status"] == "planned"
+    assert payload["data"]["projection_status"] == "not_started"
+    assert payload["data"]["operations"]
+    assert all(set(item) == {"id", "kind"} for item in payload["data"]["operations"])
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert MARKER not in serialized
+    assert str(tmp_path) not in serialized
+    assert "expected_hash" not in serialized
+    assert "locator" not in serialized
+    assert _snapshot(tmp_path, repository) == before
+
+
+def test_cli_apply_requires_confirmations_then_projects_in_the_same_command(
+    purge_fixture, tmp_path: Path, capsys
+):
+    repository, service, *_ = purge_fixture
+    env = {
+        "AGENTRETRO_HOME": str(repository.db_path.parent),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(service.vault_root),
+    }
+    assert (
+        retro_cli.main(
+            ["--json", "knowledge", "purge", KNOWLEDGE_ID, "--plan"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    planned = json.loads(capsys.readouterr().out)["data"]
+
+    assert (
+        retro_cli.main(
+            [
+                "--json",
+                "knowledge",
+                "purge",
+                KNOWLEDGE_ID,
+                "--apply-plan",
+                planned["plan_id"],
+            ],
+            home=tmp_path,
+            env=env,
+        )
+        == 2
+    )
+    refused = json.loads(capsys.readouterr().out)
+    assert refused["code"] == "RETRO_PURGE_CONFIRMATION_REQUIRED"
+    assert refused["data"]["recovery_command"] == ("retro knowledge purge <id> --plan")
+
+    command = [
+        "--json",
+        "knowledge",
+        "purge",
+        KNOWLEDGE_ID,
+        "--apply-plan",
+        planned["plan_id"],
+    ]
+    for operation in planned["operations"]:
+        command.extend(["--confirm-operation", operation["id"]])
+    assert retro_cli.main(command, home=tmp_path, env=env) == 0
+    applied = json.loads(capsys.readouterr().out)
+
+    assert applied["code"] == "RETRO_PURGE_APPLIED"
+    assert applied["data"]["purge_status"] == "purged"
+    assert applied["data"]["projection_status"] in {
+        "synced",
+        "sync_pending",
+    }
+    readback = SQLiteRetroRepository(repository.db_path, repository.backup_dir)
+    events = readback.list_projection_events(PROJECT_ID)
+    assert len(events) == 1
+    assert events[0].cause == "sensitive_purge"
+    assert events[0].cause_entity_id == KNOWLEDGE_ID
+    serialized = json.dumps(applied, ensure_ascii=False)
+    assert MARKER not in serialized
+    assert str(tmp_path) not in serialized
+    assert "expected_hash" not in serialized
+    assert "locator" not in serialized
+
+
+def test_cli_recover_resumes_registered_state_and_projects(
+    purge_fixture, tmp_path: Path, capsys
+):
+    repository, service, *_ = purge_fixture
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected cleanup failure")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots={"agentretro_backup": repository.backup_dir},
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+    env = {
+        "AGENTRETRO_HOME": str(repository.db_path.parent),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(service.vault_root),
+    }
+
+    assert (
+        retro_cli.main(
+            ["--json", "knowledge", "purge", KNOWLEDGE_ID, "--recover"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    recovered = json.loads(capsys.readouterr().out)
+    assert recovered["code"] == "RETRO_PURGE_RECOVERED"
+    assert recovered["data"]["purge_status"] == "purged"
+    assert recovered["data"]["projection_status"] in {
+        "synced",
+        "sync_pending",
+    }
+    assert len(repository.list_projection_events(PROJECT_ID)) == 1
+    serialized = json.dumps(recovered, ensure_ascii=False)
+    assert MARKER not in serialized
+    assert str(tmp_path) not in serialized
 
 
 def test_sqlite_stage_failure_rolls_back_the_journal_and_every_scrub(purge_fixture):
