@@ -2,7 +2,7 @@
 
 - [x] 1.1 Add failing tests and then the minimal `agent_retro` package plus `retro` console entry point, proving `ai-todo` remains independently importable and runnable.
 - [x] 1.2 Define AgentRetro configuration loading under `<user-home>/.agentretro/` with path containment, defaults, environment overrides, and isolated test directories.
-- [ ] 1.3 Implement the SQLite schema, repositories, versioned migrations, pre-migration backup, migration rollback, and lifecycle audit records with migration failure tests.
+- [x] 1.3 Implement the SQLite schema, repositories, versioned migrations, pre-migration backup, migration rollback, and lifecycle audit records with migration failure tests.
 - [x] 1.4 Implement the read-only legacy model configuration adapter and tests proving credentials are never serialized, logged, or persisted.
 - [x] 1.5 Add stable Chinese human output, stable English `--json` envelopes, and Unicode-safe Windows console rendering for AgentRetro commands.
 - [x] 1.6 Implement validated, configurable safety limits with defaults for session discovery count and deadline, maximum session size, model-call deadline, local brief-render deadline, and brief budget.
