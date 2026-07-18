@@ -63,12 +63,24 @@ class KnowledgeService:
         valid_until: datetime | None = None,
     ) -> Knowledge:
         candidate = self._pending_user_candidate(candidate_id, actor)
+        if not text.strip():
+            raise CandidateLifecycleError("edited knowledge text must be non-empty")
         selected_type = knowledge_type or candidate.knowledge_type
         selected_valid_until = (
             valid_until
             if valid_until is not None
             else self._default_valid_until(selected_type)
         )
+        if selected_valid_until is not None:
+            if selected_type is not KnowledgeType.TASK_STATE:
+                raise CandidateLifecycleError(
+                    "valid_until is only allowed for TASK_STATE knowledge"
+                )
+            if (
+                selected_valid_until.tzinfo is None
+                or selected_valid_until.utcoffset() is None
+            ):
+                raise CandidateLifecycleError("valid_until must be timezone-aware")
         return self.repository.accept_candidate(
             candidate.id,
             text,

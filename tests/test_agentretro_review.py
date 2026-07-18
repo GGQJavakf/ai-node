@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from _path import ROOT  # noqa: F401
+from agent_retro.application.capture import CaptureService
 from agent_retro.application.review import (
     ReviewService,
     ReviewUnavailableError,
@@ -20,12 +21,15 @@ from agent_retro.domain.models import (
     CandidateStatus,
     Evidence,
     KnowledgeType,
+    KnowledgeConflict,
     NormalizedSession,
+    ProjectMapping,
     ReviewAttempt,
     ReviewResult,
     ReviewVerdict,
     SourceLocator,
 )
+from agent_retro.infrastructure.codex_sessions import CodexSessionSource
 from agent_retro.infrastructure.llm_review import (
     ExtractedCandidate,
     LLMExtractionGateway,
@@ -34,6 +38,10 @@ from agent_retro.infrastructure.llm_review import (
     StructuredModelResponseError,
 )
 from agent_retro.infrastructure.redaction import Redactor
+from agent_retro.infrastructure.project_mapping import (
+    ProjectMappingService,
+    ProjectResolver,
+)
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 
 
@@ -205,6 +213,189 @@ def test_gate_blockers_are_returned_in_stable_policy_order():
     )
 
 
+def _synthetic_codex_event(kind: str, index: int, text: str) -> dict[str, object]:
+    timestamp = f"2026-07-18T08:00:0{index}Z"
+    if kind == "user":
+        return {
+            "version": 1,
+            "type": "event_msg",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "user_message",
+                "id": f"event-{index}",
+                "message": text,
+            },
+        }
+    if kind == "assistant":
+        return {
+            "version": 1,
+            "type": "response_item",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "message",
+                "id": f"event-{index}",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        }
+    if kind == "command":
+        return {
+            "version": 1,
+            "type": "response_item",
+            "timestamp": timestamp,
+            "payload": {
+                "type": "function_call_output",
+                "id": f"event-{index}",
+                "call_id": f"call-{index}",
+                "output": text,
+            },
+        }
+    raise ValueError(f"unsupported synthetic Codex event kind: {kind}")
+
+
+def _captured_real_vocabulary(tmp_path, events):
+    codex_home = tmp_path / "codex-home"
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    path = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "07"
+        / "18"
+        / "rollout-2026-07-18T08-00-00-11111111-1111-1111-1111-111111111111.jsonl"
+    )
+    path.parent.mkdir(parents=True)
+    records = [
+        {
+            "version": 1,
+            "type": "session_meta",
+            "timestamp": "2026-07-18T08:00:00Z",
+            "payload": {"id": "real-vocabulary", "cwd": str(project_root)},
+        }
+    ]
+    records.extend(
+        _synthetic_codex_event(kind, index, text)
+        for index, (kind, text) in enumerate(events, start=1)
+    )
+    records.append(
+        {
+            "version": 1,
+            "type": "event_msg",
+            "timestamp": "2026-07-18T08:00:09Z",
+            "payload": {"type": "task_complete", "id": "complete-1"},
+        }
+    )
+    path.write_text(
+        "\n".join(json.dumps(item) for item in records) + "\n", encoding="utf-8"
+    )
+    repository = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
+    repository.migrate()
+    CaptureService(
+        CodexSessionSource(codex_home),
+        repository,
+        Redactor(),
+        ProjectResolver(
+            [
+                ProjectMapping(
+                    id="mapping-1",
+                    git_root=project_root,
+                    remote_identity="",
+                    obsidian_project="project-1",
+                )
+            ]
+        ),
+    ).capture_session("real-vocabulary")
+    session = repository.find_session_by_source_id("real-vocabulary")
+    assert session is not None
+    return repository, repository.list_evidence(session.id)
+
+
+@pytest.mark.parametrize(
+    ("knowledge_type", "events", "normalized_text"),
+    [
+        (
+            "RULE",
+            [("user", "Requirement: Always run the focused test first.")],
+            "Always run the focused test first.",
+        ),
+        (
+            "LESSON",
+            [
+                ("user", "Failure: the focused test failed with an assertion error."),
+                ("assistant", "Correction: changed the typed repository boundary."),
+                ("command", "Verification: focused tests passed with exit code 0."),
+            ],
+            "Keep failure, correction, and verification evidence separate.",
+        ),
+    ],
+)
+def test_real_codex_capture_vocabulary_can_auto_accept_grounded_knowledge(
+    tmp_path, knowledge_type, events, normalized_text
+):
+    repository, evidence = _captured_real_vocabulary(tmp_path, events)
+    extractor = _Extractor(
+        (
+            ExtractedCandidate(
+                knowledge_type=knowledge_type,
+                proposed_text=normalized_text,
+                evidence_ids=[item.id for item in evidence],
+                confidence=0.99,
+            ),
+        )
+    )
+    result = replace(_review(), normalized_text=normalized_text)
+
+    _service(repository, extractor, _Reviewer(result)).review_session("real-vocabulary")
+
+    assert [item.kind for item in evidence] == [kind for kind, _ in events]
+    accepted = repository.list_candidates(CandidateStatus.AUTO_ACCEPTED)
+    assert len(accepted) == 1
+    assert accepted[0].knowledge_type is KnowledgeType(knowledge_type)
+
+
+def test_real_lesson_markers_must_be_explicit_and_on_distinct_evidence():
+    evidence = [
+        _evidence(
+            "combined",
+            kind="user",
+            excerpt="Failure occurred. Correction applied. Verification passed.",
+        ),
+        _evidence("assistant", kind="assistant", excerpt="Implementation details."),
+        _evidence("command", kind="command", excerpt="Process output."),
+    ]
+    candidate = _candidate(
+        KnowledgeType.LESSON,
+        evidence_ids=tuple(item.id for item in evidence),
+        text="Keep evidence separate.",
+    )
+
+    result = evaluate_gates(candidate, _review(), evidence)
+
+    assert "lesson_verification" in result.blockers
+
+
+def test_real_assistant_evidence_is_not_rule_authority():
+    result = evaluate_gates(_candidate(), _review(), [_evidence(kind="assistant")])
+
+    assert "rule_authority" in result.blockers
+
+
+def test_semantic_lesson_evidence_kinds_remain_supported():
+    evidence = [
+        _evidence("failure", kind="failure"),
+        _evidence("correction", kind="correction"),
+        _evidence("verification", kind="verification"),
+    ]
+    candidate = _candidate(
+        KnowledgeType.LESSON,
+        evidence_ids=tuple(item.id for item in evidence),
+        text="Preserve verified corrections as lessons.",
+    )
+
+    assert evaluate_gates(candidate, _review(), evidence).allowed is True
+
+
 class _RecordingClient:
     def __init__(self) -> None:
         self.calls: list[tuple[dict, bool, int]] = []
@@ -291,17 +482,15 @@ class _Reviewer:
 
     def review(self, input_json: str, *, timeout: int):
         if self.repository is not None:
-            assert self.repository.list_candidates(
-                CandidateStatus.PENDING_REVIEW
-            )
+            assert self.repository.list_candidates(CandidateStatus.PENDING_REVIEW)
         self.calls.append((input_json, timeout))
         return self.result
 
 
-def _repository_with_evidence(tmp_path, evidence: Evidence | None = None):
-    repository = SQLiteRetroRepository(
-        tmp_path / "retro.db", tmp_path / "backups"
-    )
+def _repository_with_evidence(
+    tmp_path, evidence: Evidence | None = None, *, project_id: str = "project-1"
+):
+    repository = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
     repository.migrate()
     item = evidence or _evidence()
     repository.save_capture(
@@ -310,7 +499,7 @@ def _repository_with_evidence(tmp_path, evidence: Evidence | None = None):
             source_session_id="source-session-1",
             source_path=tmp_path / "source-session-1.jsonl",
             source_hash="b" * 64,
-            project_id="project-1",
+            project_id=project_id,
             completed=True,
             completed_at=NOW,
             events=(),
@@ -384,6 +573,42 @@ def test_completed_review_retry_reuses_result_without_new_request_or_knowledge(
     assert len(repository.knowledge_versions_for_candidate(candidate.id)) == 1
 
 
+def test_pending_candidate_selection_does_not_hide_obsolete_completed_attempt(
+    tmp_path,
+):
+    repository, _ = _repository_with_evidence(tmp_path)
+    candidate = _candidate()
+    repository.save_candidates([candidate])
+    attempt = repository.begin_review_attempt(
+        ReviewAttempt(
+            id="attempt-obsolete",
+            candidate_id=candidate.id,
+            input_hash="obsolete-project-input",
+            status="running",
+            result_json="",
+            error="",
+        )
+    )
+    repository.finish_review_attempt(
+        attempt.id,
+        "completed",
+        result_json=json.dumps(
+            {
+                "confidence": 0.99,
+                "conflict_with": None,
+                "duplicate_of": None,
+                "normalized_text": "Old project result.",
+                "reason": "Old project input.",
+                "verdict": "ACCEPT",
+            }
+        ),
+    )
+
+    assert repository.pending_model_candidates_for_session("source-session-1") == [
+        candidate
+    ]
+
+
 class _FailingReviewer:
     def __init__(self, error: Exception) -> None:
         self.error: Exception | None = error
@@ -440,9 +665,7 @@ def test_review_stored_evidence_redacts_inputs_and_reuses_pending_extraction(
     service = _service(repository, extractor, reviewer)
 
     with pytest.raises(ReviewUnavailableError, match="retry"):
-        service.review_stored_evidence(
-            "source-session-1", "project-1", [supplied]
-        )
+        service.review_stored_evidence("source-session-1", "project-1", [supplied])
 
     candidate = repository.list_candidates(CandidateStatus.PENDING_REVIEW)[0]
     assert "SECRET_VALUE" not in candidate.proposed_text
@@ -471,9 +694,7 @@ def test_non_acceptable_review_result_is_saved_but_candidate_stays_pending(
     tmp_path, evidence, result
 ):
     repository, _ = _repository_with_evidence(tmp_path, evidence)
-    service = _service(
-        repository, _Extractor((_extracted(),)), _Reviewer(result)
-    )
+    service = _service(repository, _Extractor((_extracted(),)), _Reviewer(result))
 
     assert service.review_session("source-session-1") == [result]
 
@@ -485,13 +706,49 @@ def test_non_acceptable_review_result_is_saved_but_candidate_stays_pending(
     )
 
 
+@pytest.mark.parametrize(
+    ("evidence", "result", "threshold_passed", "blockers"),
+    [
+        (_evidence(), _review(), True, []),
+        (_evidence(), replace(_review(), confidence=0.969), False, []),
+        (
+            _evidence(),
+            replace(_review(), verdict=ReviewVerdict.REJECT),
+            True,
+            [],
+        ),
+        (_evidence(kind="assistant"), _review(), True, ["rule_authority"]),
+    ],
+    ids=["accepted", "below-threshold", "rejected", "blocked"],
+)
+def test_every_model_review_persists_complete_ordered_decision_audit(
+    tmp_path, evidence, result, threshold_passed, blockers
+):
+    repository, _ = _repository_with_evidence(tmp_path, evidence)
+    service = _service(repository, _Extractor((_extracted(),)), _Reviewer(result))
+
+    service.review_session("source-session-1")
+
+    candidate = repository.candidates_for_session("source-session-1")[0]
+    entries = repository.list_audit_entries(
+        action="review_saved", entity_id=candidate.id
+    )
+    assert len(entries) == 1
+    assert entries[0].actor == "model-review"
+    assert json.loads(entries[0].detail_json) == {
+        "blockers": blockers,
+        "evidence_ids": ["evidence-1"],
+        "threshold": 0.97,
+        "threshold_passed": threshold_passed,
+        "verdict": result.verdict.value,
+    }
+
+
 def test_auto_acceptance_audit_records_threshold_gates_actor_and_evidence(
     tmp_path,
 ):
     repository, _ = _repository_with_evidence(tmp_path)
-    service = _service(
-        repository, _Extractor((_extracted(),)), _Reviewer(_review())
-    )
+    service = _service(repository, _Extractor((_extracted(),)), _Reviewer(_review()))
 
     service.review_session("source-session-1")
 
@@ -509,6 +766,7 @@ def test_auto_acceptance_audit_records_threshold_gates_actor_and_evidence(
         "candidate_id": candidate.id,
         "evidence_ids": ["evidence-1"],
         "threshold": 0.97,
+        "threshold_passed": True,
         "verdict": "ACCEPT",
     }
 
@@ -530,6 +788,68 @@ def test_auto_accepted_task_state_defaults_to_fourteen_day_validity(tmp_path):
     assert knowledge.valid_until == NOW + timedelta(days=14)
 
 
+def _repository_with_active_rule_and_pending_candidate(tmp_path):
+    repository, _ = _repository_with_evidence(tmp_path)
+    active_candidate = replace(_candidate(), id="candidate-active")
+    repository.save_candidates([active_candidate])
+    active = repository.accept_candidate(
+        active_candidate.id,
+        active_candidate.proposed_text,
+        actor="user",
+        confidence=0.99,
+    )
+    pending = replace(
+        _candidate(text="Use a corrected typed boundary."),
+        id="candidate-conflict",
+    )
+    repository.save_candidates([pending])
+    return repository, active, pending
+
+
+def test_valid_model_conflict_is_redacted_deterministic_and_idempotent(tmp_path):
+    repository, active, pending = _repository_with_active_rule_and_pending_candidate(
+        tmp_path
+    )
+    result = _review(conflict_with=active.id)
+    result = replace(
+        result,
+        normalized_text="Use the corrected boundary; api_key=must-not-persist",
+    )
+    service = _service(repository, _Extractor(()), _Reviewer(result))
+
+    first = service.retry_candidate(pending.id)
+    second = service.retry_candidate(pending.id)
+
+    assert first == second
+    assert repository.get_candidate(pending.id).status is CandidateStatus.PENDING_REVIEW
+    assert repository.list_active_knowledge("project-1", NOW) == [active]
+    entries = repository.list_audit_entries(action="conflict_saved", entity_id=None)
+    assert len(entries) == 1
+    conflict = repository.get_conflict(entries[0].entity_id)
+    assert conflict is not None
+    assert conflict.active_knowledge_id == active.id
+    assert conflict.candidate_id == pending.id
+    assert "must-not-persist" not in conflict.merge_text
+    assert "[REDACTED]" in conflict.merge_text
+
+
+def test_hallucinated_conflict_id_is_only_an_audited_blocker(tmp_path):
+    repository, _, pending = _repository_with_active_rule_and_pending_candidate(
+        tmp_path
+    )
+    result = _review(conflict_with="knowledge-does-not-exist")
+    service = _service(repository, _Extractor(()), _Reviewer(result))
+
+    assert service.retry_candidate(pending.id) == result
+
+    assert repository.get_candidate(pending.id).status is CandidateStatus.PENDING_REVIEW
+    assert repository.list_audit_entries(action="conflict_saved") == []
+    decision = repository.list_audit_entries(
+        action="review_saved", entity_id=pending.id
+    )[0]
+    assert json.loads(decision.detail_json)["blockers"] == ["conflict"]
+
+
 class _SequenceReviewer:
     def __init__(self, outcomes) -> None:
         self.outcomes = list(outcomes)
@@ -543,14 +863,186 @@ class _SequenceReviewer:
         return outcome
 
 
+def _save_review_mapping(repository):
+    mapping = ProjectMapping(
+        id="mapping-1",
+        git_root=Path("D:/projects/example"),
+        remote_identity="example.invalid/team/repo",
+        obsidian_project="project-1",
+    )
+    repository.save_project_mapping(mapping, actor="user")
+    return mapping
+
+
+def test_reclassify_reviews_new_project_then_auto_accepts_with_terminal_reuse(
+    tmp_path,
+):
+    repository, evidence = _repository_with_evidence(
+        tmp_path, project_id="awaiting:unknown"
+    )
+    mapping = _save_review_mapping(repository)
+    reviewer = _SequenceReviewer([_review(), _review()])
+    service = _service(repository, _Extractor((_extracted(),)), reviewer)
+    mapping_service = ProjectMappingService(
+        repository,
+        vault_root=tmp_path / "vault",
+        review_stored_evidence=service.review_stored_evidence,
+    )
+
+    mapping_service.reclassify("source-session-1", mapping.id)
+
+    session = repository.find_session_by_source_id("source-session-1")
+    assert session is not None and session.project_id == "project-1"
+    candidate = repository.candidates_for_session("source-session-1")[0]
+    assert candidate.project_id == "project-1"
+    assert candidate.status is CandidateStatus.AUTO_ACCEPTED
+    assert repository.knowledge_for_candidate(candidate.id) is not None
+    assert len(reviewer.calls) == 2
+    decisions = repository.list_audit_entries(
+        action="review_saved", entity_id=candidate.id
+    )
+    assert [json.loads(item.detail_json)["blockers"] for item in decisions] == [
+        ["unknown_project"],
+        [],
+    ]
+    assert service.review_session("source-session-1") == [_review()]
+    assert service.retry_candidate(candidate.id) == _review()
+    assert len(reviewer.calls) == 2
+    assert (
+        len(
+            repository.list_audit_entries(action="review_saved", entity_id=candidate.id)
+        )
+        == 2
+    )
+    assert not (tmp_path / "source-session-1.jsonl").exists()
+    assert evidence
+
+
+def test_reclassification_rollback_preserves_preexisting_candidate_conflict(tmp_path):
+    awaiting = "awaiting:unknown"
+    repository, _ = _repository_with_evidence(tmp_path, project_id=awaiting)
+    active_candidate = replace(_candidate(project_id=awaiting), id="candidate-active")
+    pending = replace(
+        _candidate(project_id=awaiting, text="Conflicting pending rule."),
+        id="candidate-pending",
+    )
+    repository.save_candidates([active_candidate, pending])
+    active = repository.accept_candidate(
+        active_candidate.id,
+        active_candidate.proposed_text,
+        actor="user",
+        confidence=0.99,
+    )
+    existing = repository.create_conflict(
+        KnowledgeConflict(
+            id="conflict-preexisting",
+            active_knowledge_id=active.id,
+            candidate_id=pending.id,
+            reason="Preexisting conflict.",
+            merge_text="Preexisting merge text.",
+            status="open",
+        )
+    )
+    mapping = _save_review_mapping(repository)
+    calls = 0
+
+    def fail_second_phase(session_id, project_id, evidence):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ReviewUnavailableError("retry")
+
+    mapping_service = ProjectMappingService(
+        repository,
+        vault_root=tmp_path / "vault",
+        review_stored_evidence=fail_second_phase,
+    )
+
+    with pytest.raises(ReviewUnavailableError, match="retry"):
+        mapping_service.reclassify("source-session-1", mapping.id)
+
+    assert repository.get_conflict(existing.id) == existing
+    assert repository.get_candidate(pending.id).project_id == awaiting
+
+
+def test_reclassify_second_phase_failure_rolls_back_all_candidates_and_retries(
+    tmp_path,
+):
+    awaiting = "awaiting:unknown"
+    repository, _ = _repository_with_evidence(tmp_path, project_id=awaiting)
+    mapping = _save_review_mapping(repository)
+    reviewer = _SequenceReviewer(
+        [
+            _review(),
+            _review(),
+            _review(),
+            RuntimeError("second phase unavailable"),
+            _review(),
+        ]
+    )
+    service = _service(
+        repository,
+        _Extractor(
+            (
+                _extracted(text="First typed rule."),
+                _extracted(text="Second typed rule."),
+            )
+        ),
+        reviewer,
+    )
+    mapping_service = ProjectMappingService(
+        repository,
+        vault_root=tmp_path / "vault",
+        review_stored_evidence=service.review_stored_evidence,
+    )
+
+    with pytest.raises(ReviewUnavailableError, match="retry"):
+        mapping_service.reclassify("source-session-1", mapping.id)
+
+    session = repository.find_session_by_source_id("source-session-1")
+    assert session is not None and session.project_id == awaiting
+    rolled_back = repository.candidates_for_session("source-session-1")
+    assert len(rolled_back) == 2
+    assert all(item.project_id == awaiting for item in rolled_back)
+    assert all(item.status is CandidateStatus.PENDING_REVIEW for item in rolled_back)
+    assert all(
+        repository.knowledge_for_candidate(item.id) is None for item in rolled_back
+    )
+    assert len(reviewer.calls) == 4
+    attempts = [
+        attempt
+        for candidate in rolled_back
+        for attempt in repository.review_attempts_for_candidate(candidate.id)
+    ]
+    assert [item.status for item in attempts].count("completed") == 3
+    assert [item.status for item in attempts].count("failed") == 1
+    assert repository.list_audit_entries(
+        action="session_reclassification_rolled_back",
+        entity_id=session.id,
+    )
+    assert not (tmp_path / "source-session-1.jsonl").exists()
+
+    mapping_service.reclassify("source-session-1", mapping.id)
+
+    accepted = repository.candidates_for_session("source-session-1")
+    assert all(item.project_id == "project-1" for item in accepted)
+    assert all(item.status is CandidateStatus.AUTO_ACCEPTED for item in accepted)
+    assert all(
+        repository.knowledge_for_candidate(item.id) is not None for item in accepted
+    )
+    assert len(reviewer.calls) == 5
+    assert service.review_session("source-session-1") == [
+        repository.get_review_result(item.id) for item in accepted
+    ]
+    assert len(reviewer.calls) == 5
+
+
 def test_retry_session_only_calls_model_for_pending_model_dependent_candidates(
     tmp_path,
 ):
     repository, _ = _repository_with_evidence(tmp_path)
     low = replace(_review(), confidence=0.969)
-    reviewer = _SequenceReviewer(
-        [RuntimeError("temporary"), low, _review()]
-    )
+    reviewer = _SequenceReviewer([RuntimeError("temporary"), low, _review()])
     service = _service(
         repository,
         _Extractor(
@@ -565,7 +1057,7 @@ def test_retry_session_only_calls_model_for_pending_model_dependent_candidates(
     assert service.review_session("source-session-1") == [None, low]
     assert len(repository.list_candidates(CandidateStatus.PENDING_REVIEW)) == 2
 
-    assert service.retry_session("source-session-1") == [_review()]
+    assert service.retry_session("source-session-1") == [_review(), low]
     assert len(reviewer.calls) == 3
     assert len(repository.list_candidates(CandidateStatus.AUTO_ACCEPTED)) == 1
     remaining = repository.list_candidates(CandidateStatus.PENDING_REVIEW)

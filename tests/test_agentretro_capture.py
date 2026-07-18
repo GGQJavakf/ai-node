@@ -950,14 +950,20 @@ def test_reclassify_reviews_stored_redacted_evidence_before_repository_update(
 
     mapping_service.reclassify("session-completed", mapping.id, actor="tester")
 
-    assert len(reviewed) == 1
+    assert len(reviewed) == 2
     assert reviewed[0][0] == "session-completed"
     assert reviewed[0][1].startswith("awaiting:")
     assert reviewed[0][1] == reviewed[0][3]
     assert reviewed[0][2]
     assert reviewed[0][3].startswith("awaiting:")
+    assert reviewed[1][0] == "session-completed"
+    assert reviewed[1][1] == "Projects/Example"
+    assert reviewed[1][3] == "Projects/Example"
+    assert reviewed[1][2] == reviewed[0][2]
     assert all(
-        ("TOKEN" + "_FOR_REDACTION_TEST") not in item.excerpt for item in reviewed[0][2]
+        ("TOKEN" + "_FOR_REDACTION_TEST") not in item.excerpt
+        for review in reviewed
+        for item in review[2]
     )
     persisted = repo.find_session_by_source_id("session-completed")
     assert persisted is not None

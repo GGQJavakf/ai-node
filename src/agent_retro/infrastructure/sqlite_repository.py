@@ -28,6 +28,7 @@ from agent_retro.domain.models import (
     NormalizedEvent,
     NormalizedSession,
     ProjectMapping,
+    Reclassification,
     ProjectionStatus,
     PurgePlan,
     PurgeStatus,
@@ -341,9 +342,7 @@ class SQLiteRetroRepository(RetroRepository):
         else:
             connection.close()
 
-    def _apply_migration(
-        self, connection: sqlite3.Connection, version: int
-    ) -> None:
+    def _apply_migration(self, connection: sqlite3.Connection, version: int) -> None:
         if version != 1:
             raise ValueError(f"unsupported schema migration: {version}")
         for statement in _SCHEMA_V1:
@@ -416,8 +415,7 @@ class SQLiteRetroRepository(RetroRepository):
             if row is None:
                 return None
             event_rows = connection.execute(
-                "SELECT * FROM session_events WHERE session_id = ? "
-                "ORDER BY ordinal",
+                "SELECT * FROM session_events WHERE session_id = ? ORDER BY ordinal",
                 (row["id"],),
             ).fetchall()
             return _session_from_row(
@@ -445,8 +443,7 @@ class SQLiteRetroRepository(RetroRepository):
             if row is None:
                 return None
             event_rows = connection.execute(
-                "SELECT * FROM session_events WHERE session_id = ? "
-                "ORDER BY ordinal",
+                "SELECT * FROM session_events WHERE session_id = ? ORDER BY ordinal",
                 (row["id"],),
             ).fetchall()
             return _session_from_row(
@@ -564,7 +561,10 @@ class SQLiteRetroRepository(RetroRepository):
                 connection.executemany(
                     "INSERT INTO candidate_evidence(candidate_id, evidence_id) "
                     "VALUES (?, ?)",
-                    ((candidate.id, evidence_id) for evidence_id in candidate.evidence_ids),
+                    (
+                        (candidate.id, evidence_id)
+                        for evidence_id in candidate.evidence_ids
+                    ),
                 )
             ids = [candidate.id for candidate in candidates]
             self._append_audit_record(
@@ -615,16 +615,13 @@ class SQLiteRetroRepository(RetroRepository):
             "WHERE candidate_id = ? ORDER BY evidence_id",
             (candidate_id,),
         ).fetchall()
-        return _candidate_from_row(
-            row, tuple(str(item[0]) for item in evidence_rows)
-        )
+        return _candidate_from_row(row, tuple(str(item[0]) for item in evidence_rows))
 
     def list_candidates(self, status: CandidateStatus) -> list[Candidate]:
         connection = self._connect()
         try:
             rows = connection.execute(
-                "SELECT id FROM candidates WHERE status = ? "
-                "ORDER BY created_at, id",
+                "SELECT id FROM candidates WHERE status = ? ORDER BY created_at, id",
                 (status.value,),
             ).fetchall()
             return [
@@ -636,9 +633,7 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
-    def pending_model_candidates_for_session(
-        self, session_id: str
-    ) -> list[Candidate]:
+    def pending_model_candidates_for_session(self, session_id: str) -> list[Candidate]:
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -646,10 +641,6 @@ class SQLiteRetroRepository(RetroRepository):
                 JOIN sessions s ON s.id = c.session_id
                 WHERE (s.id = ? OR s.source_session_id = ?)
                   AND c.status = ?
-                  AND NOT EXISTS (
-                    SELECT 1 FROM review_attempts a
-                    WHERE a.candidate_id = c.id AND a.status = 'completed'
-                  )
                 ORDER BY c.created_at, c.id""",
                 (session_id, session_id, CandidateStatus.PENDING_REVIEW.value),
             ).fetchall()
@@ -694,7 +685,12 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
-    def save_review(self, candidate_id: str, result: ReviewResult) -> None:
+    def save_review(
+        self,
+        candidate_id: str,
+        result: ReviewResult,
+        decision: AcceptanceDecision,
+    ) -> None:
         with self.transaction() as connection:
             existing = connection.execute(
                 "SELECT review_json FROM candidates WHERE id = ?",
@@ -702,21 +698,37 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if existing is None:
                 raise KeyError(f"candidate not found: {candidate_id}")
-            if _review_from_json(str(existing[0])) == result:
+            existing_result = _review_from_json(str(existing[0]))
+            decision_hash = _hash_value({"result": result, "decision": decision})
+            if existing_result != result:
+                cursor = connection.execute(
+                    "UPDATE candidates SET review_json = ?, updated_at = ? WHERE id = ?",
+                    (_review_to_json(result), _now_text(), candidate_id),
+                )
+                _require_row(cursor, "candidate", candidate_id)
+            existing_audit = connection.execute(
+                """SELECT 1 FROM audit_log
+                WHERE action = 'review_saved' AND entity_id = ? AND after_hash = ?
+                LIMIT 1""",
+                (candidate_id, decision_hash),
+            ).fetchone()
+            if existing_audit is not None:
                 return
-            cursor = connection.execute(
-                "UPDATE candidates SET review_json = ?, updated_at = ? WHERE id = ?",
-                (_review_to_json(result), _now_text(), candidate_id),
-            )
-            _require_row(cursor, "candidate", candidate_id)
             self._append_audit_record(
                 connection,
                 self._audit_entry(
                     action="review_saved",
                     entity_type="candidate",
                     entity_id=candidate_id,
-                    after_hash=_hash_value(asdict(result)),
-                    detail={"verdict": result.verdict.value},
+                    after_hash=decision_hash,
+                    actor=decision.actor,
+                    detail={
+                        "threshold": decision.threshold,
+                        "threshold_passed": decision.threshold_passed,
+                        "blockers": list(decision.blockers),
+                        "verdict": decision.verdict.value,
+                        "evidence_ids": list(decision.evidence_ids),
+                    },
                 ),
             )
 
@@ -822,9 +834,7 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
-    def review_attempts_for_candidate(
-        self, candidate_id: str
-    ) -> list[ReviewAttempt]:
+    def review_attempts_for_candidate(self, candidate_id: str) -> list[ReviewAttempt]:
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -940,6 +950,7 @@ class SQLiteRetroRepository(RetroRepository):
                 audit_detail.update(
                     {
                         "threshold": decision.threshold,
+                        "threshold_passed": decision.threshold_passed,
                         "blockers": list(decision.blockers),
                         "verdict": decision.verdict.value,
                         "evidence_ids": list(decision.evidence_ids),
@@ -994,14 +1005,11 @@ class SQLiteRetroRepository(RetroRepository):
         versions = self.knowledge_versions_for_candidate(candidate_id)
         return versions[-1] if versions else None
 
-    def knowledge_versions_for_candidate(
-        self, candidate_id: str
-    ) -> list[Knowledge]:
+    def knowledge_versions_for_candidate(self, candidate_id: str) -> list[Knowledge]:
         connection = self._connect()
         try:
             rows = connection.execute(
-                "SELECT * FROM knowledge WHERE candidate_id = ? "
-                "ORDER BY version",
+                "SELECT * FROM knowledge WHERE candidate_id = ? ORDER BY version",
                 (candidate_id,),
             ).fetchall()
             return [self._knowledge_from_row(connection, row) for row in rows]
@@ -1019,9 +1027,7 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
-    def list_active_knowledge(
-        self, project_id: str, at: datetime
-    ) -> list[Knowledge]:
+    def list_active_knowledge(self, project_id: str, at: datetime) -> list[Knowledge]:
         connection = self._connect()
         try:
             rows = connection.execute(
@@ -1053,9 +1059,7 @@ class SQLiteRetroRepository(RetroRepository):
         for audit_row in audit_rows:
             detail = json.loads(str(audit_row["detail_json"]))
             if detail.get("knowledge_version") == int(row["version"]):
-                supersedes = tuple(
-                    str(item) for item in detail.get("supersedes", ())
-                )
+                supersedes = tuple(str(item) for item in detail.get("supersedes", ()))
         return Knowledge(
             id=str(row["id"]),
             version=int(row["version"]),
@@ -1133,8 +1137,7 @@ class SQLiteRetroRepository(RetroRepository):
         evidence_ids: tuple[str, ...] | None = None,
     ) -> Knowledge:
         connection.execute(
-            "UPDATE knowledge SET status = 'superseded' "
-            "WHERE id = ? AND version = ?",
+            "UPDATE knowledge SET status = 'superseded' WHERE id = ? AND version = ?",
             (current.id, current.version),
         )
         created = Knowledge(
@@ -1146,9 +1149,7 @@ class SQLiteRetroRepository(RetroRepository):
             scope=scope or current.scope,
             text=text if text is not None else current.text,
             status=status,
-            confidence=(
-                current.confidence if confidence is None else confidence
-            ),
+            confidence=(current.confidence if confidence is None else confidence),
             accepted_by=actor,
             evidence_ids=(
                 current.evidence_ids if evidence_ids is None else evidence_ids
@@ -1215,13 +1216,22 @@ class SQLiteRetroRepository(RetroRepository):
 
     def create_conflict(self, conflict: KnowledgeConflict) -> KnowledgeConflict:
         with self.transaction() as connection:
-            active = self._latest_knowledge(
-                connection, conflict.active_knowledge_id
-            )
+            existing_row = connection.execute(
+                "SELECT * FROM conflicts WHERE id = ?", (conflict.id,)
+            ).fetchone()
+            if existing_row is not None:
+                existing = _conflict_from_row(existing_row)
+                if (
+                    existing.active_knowledge_id == conflict.active_knowledge_id
+                    and existing.candidate_id == conflict.candidate_id
+                    and existing.reason == conflict.reason
+                    and existing.merge_text == conflict.merge_text
+                ):
+                    return existing
+                raise ValueError(f"conflict identity collision: {conflict.id}")
+            active = self._latest_knowledge(connection, conflict.active_knowledge_id)
             if active is None:
-                raise ValueError(
-                    f"knowledge not found: {conflict.active_knowledge_id}"
-                )
+                raise ValueError(f"knowledge not found: {conflict.active_knowledge_id}")
             if active.status != "active":
                 raise ValueError(
                     f"knowledge {active.id} must be active for conflict detection"
@@ -1254,9 +1264,7 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
-    def resolve_conflict(
-        self, conflict_id: str, text: str, actor: str
-    ) -> Knowledge:
+    def resolve_conflict(self, conflict_id: str, text: str, actor: str) -> Knowledge:
         if actor != "user":
             raise ValueError("conflict resolution actor must be user")
         with self.transaction() as connection:
@@ -1268,9 +1276,7 @@ class SQLiteRetroRepository(RetroRepository):
             conflict = _conflict_from_row(row)
             if conflict.status != "open":
                 raise ValueError(f"conflict {conflict_id} must be open")
-            active = self._latest_knowledge(
-                connection, conflict.active_knowledge_id
-            )
+            active = self._latest_knowledge(connection, conflict.active_knowledge_id)
             if active is None or active.status != "active":
                 raise ValueError(
                     f"knowledge {conflict.active_knowledge_id} must be active"
@@ -1472,9 +1478,7 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
 
-    def list_project_mappings(
-        self, active_only: bool = True
-    ) -> list[ProjectMapping]:
+    def list_project_mappings(self, active_only: bool = True) -> list[ProjectMapping]:
         connection = self._connect()
         try:
             sql = "SELECT * FROM project_mappings"
@@ -1500,8 +1504,7 @@ class SQLiteRetroRepository(RetroRepository):
     def deactivate_project_mapping(self, mapping_id: str, actor: str) -> None:
         with self.transaction() as connection:
             cursor = connection.execute(
-                "UPDATE project_mappings SET active = 0, updated_at = ? "
-                "WHERE id = ?",
+                "UPDATE project_mappings SET active = 0, updated_at = ? WHERE id = ?",
                 (_now_text(), mapping_id),
             )
             _require_row(cursor, "project mapping", mapping_id)
@@ -1523,7 +1526,7 @@ class SQLiteRetroRepository(RetroRepository):
         project_id: str,
         mapping_id: str,
         actor: str,
-    ) -> str:
+    ) -> Reclassification:
         """Assign an awaiting session after its stored evidence was reviewed."""
 
         with self.transaction() as connection:
@@ -1535,9 +1538,7 @@ class SQLiteRetroRepository(RetroRepository):
             if mapping is None:
                 raise ValueError(f"project mapping not found: {mapping_id}")
             if str(mapping["obsidian_project"]) != project_id:
-                raise ValueError(
-                    f"project mapping target mismatch: {mapping_id}"
-                )
+                raise ValueError(f"project mapping target mismatch: {mapping_id}")
             row = connection.execute(
                 "SELECT id, project_id FROM sessions "
                 "WHERE source_session_id = ? OR id = ? "
@@ -1557,6 +1558,27 @@ class SQLiteRetroRepository(RetroRepository):
                 WHERE session_id = ? AND status = ? ORDER BY created_at, id""",
                 (internal_session_id, CandidateStatus.PENDING_REVIEW.value),
             ).fetchall()
+            candidate_ids = tuple(str(item["id"]) for item in pending_rows)
+            preexisting_knowledge_versions: tuple[tuple[str, int], ...] = ()
+            preexisting_conflict_ids: tuple[str, ...] = ()
+            if candidate_ids:
+                placeholders = ",".join("?" for _ in candidate_ids)
+                knowledge_rows = connection.execute(
+                    f"""SELECT id, version FROM knowledge
+                    WHERE candidate_id IN ({placeholders}) ORDER BY id, version""",
+                    candidate_ids,
+                ).fetchall()
+                preexisting_knowledge_versions = tuple(
+                    (str(item["id"]), int(item["version"])) for item in knowledge_rows
+                )
+                conflict_rows = connection.execute(
+                    f"""SELECT id FROM conflicts
+                    WHERE candidate_id IN ({placeholders}) ORDER BY id""",
+                    candidate_ids,
+                ).fetchall()
+                preexisting_conflict_ids = tuple(
+                    str(item["id"]) for item in conflict_rows
+                )
             before_state = {
                 "project_id": before_project,
                 "pending_candidates": [
@@ -1603,7 +1625,110 @@ class SQLiteRetroRepository(RetroRepository):
                     },
                 ),
             )
-            return internal_session_id
+            return Reclassification(
+                session_id=internal_session_id,
+                previous_project_id=before_project,
+                target_project_id=project_id,
+                mapping_id=mapping_id,
+                pending_candidate_ids=candidate_ids,
+                preexisting_knowledge_versions=preexisting_knowledge_versions,
+                preexisting_conflict_ids=preexisting_conflict_ids,
+            )
+
+    def rollback_reclassification(
+        self, reclassification: Reclassification, actor: str
+    ) -> None:
+        """Compensate a failed post-reclassification review without erasing attempts."""
+
+        with self.transaction() as connection:
+            session = connection.execute(
+                "SELECT project_id FROM sessions WHERE id = ?",
+                (reclassification.session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError(f"session not found: {reclassification.session_id}")
+            if str(session["project_id"]) != reclassification.target_project_id:
+                raise ValueError(
+                    "session target changed before reclassification rollback"
+                )
+            candidate_ids = reclassification.pending_candidate_ids
+            removed_knowledge = 0
+            removed_conflicts = 0
+            if candidate_ids:
+                placeholders = ",".join("?" for _ in candidate_ids)
+                knowledge_rows = connection.execute(
+                    f"""SELECT id, version FROM knowledge
+                    WHERE candidate_id IN ({placeholders})""",
+                    candidate_ids,
+                ).fetchall()
+                preexisting_knowledge = set(
+                    reclassification.preexisting_knowledge_versions
+                )
+                for row in knowledge_rows:
+                    identity = (str(row["id"]), int(row["version"]))
+                    if identity in preexisting_knowledge:
+                        continue
+                    connection.execute(
+                        "DELETE FROM knowledge_evidence "
+                        "WHERE knowledge_id = ? AND knowledge_version = ?",
+                        (str(row["id"]), int(row["version"])),
+                    )
+                    removed_knowledge += connection.execute(
+                        "DELETE FROM knowledge WHERE id = ? AND version = ?",
+                        identity,
+                    ).rowcount
+                conflict_rows = connection.execute(
+                    f"""SELECT id FROM conflicts
+                    WHERE candidate_id IN ({placeholders})""",
+                    candidate_ids,
+                ).fetchall()
+                preexisting_conflicts = set(reclassification.preexisting_conflict_ids)
+                for row in conflict_rows:
+                    conflict_id = str(row["id"])
+                    if conflict_id in preexisting_conflicts:
+                        continue
+                    removed_conflicts += connection.execute(
+                        "DELETE FROM conflicts WHERE id = ?", (conflict_id,)
+                    ).rowcount
+                connection.execute(
+                    f"""UPDATE candidates
+                    SET project_id = ?, status = ?, updated_at = ?
+                    WHERE id IN ({placeholders})""",
+                    (
+                        reclassification.previous_project_id,
+                        CandidateStatus.PENDING_REVIEW.value,
+                        _now_text(),
+                        *candidate_ids,
+                    ),
+                )
+            connection.execute(
+                "UPDATE sessions SET project_id = ? WHERE id = ?",
+                (
+                    reclassification.previous_project_id,
+                    reclassification.session_id,
+                ),
+            )
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    actor=actor,
+                    action="session_reclassification_rolled_back",
+                    entity_type="session",
+                    entity_id=reclassification.session_id,
+                    before_hash=_hash_value(
+                        {"project_id": reclassification.target_project_id}
+                    ),
+                    after_hash=_hash_value(
+                        {"project_id": reclassification.previous_project_id}
+                    ),
+                    detail={
+                        "mapping_id": reclassification.mapping_id,
+                        "pending_candidate_count": len(candidate_ids),
+                        "removed_knowledge_count": removed_knowledge,
+                        "removed_conflict_count": removed_conflicts,
+                    },
+                ),
+            )
 
     def save_projection_event(
         self,
@@ -1682,9 +1807,7 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
 
-    def save_purge_plan(
-        self, plan: PurgePlan, plan_hash: str, actor: str
-    ) -> None:
+    def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None:
         with self.transaction() as connection:
             connection.execute(
                 """INSERT INTO purge_jobs(
@@ -1889,9 +2012,7 @@ def _evidence_from_row(row: sqlite3.Row) -> Evidence:
     )
 
 
-def _candidate_from_row(
-    row: sqlite3.Row, evidence_ids: tuple[str, ...]
-) -> Candidate:
+def _candidate_from_row(row: sqlite3.Row, evidence_ids: tuple[str, ...]) -> Candidate:
     return Candidate(
         id=str(row["id"]),
         knowledge_type=KnowledgeType(row["knowledge_type"]),

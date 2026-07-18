@@ -9,6 +9,7 @@ from _path import ROOT  # noqa: F401
 from agent_retro.application.knowledge import KnowledgeService
 from agent_retro.application.review import ReviewService
 from agent_retro.domain.models import (
+    AcceptanceDecision,
     Candidate,
     CandidateStatus,
     Evidence,
@@ -81,6 +82,14 @@ def _seed_repository(state_home, *, project_id="project-1", with_candidate=True)
                 normalized_text="只使用 typed repository。",
                 duplicate_of=None,
                 conflict_with=None,
+            ),
+            AcceptanceDecision(
+                actor="model-review",
+                threshold=0.97,
+                threshold_passed=False,
+                blockers=(),
+                verdict=ReviewVerdict.EDIT,
+                evidence_ids=(evidence.id,),
             ),
         )
     return repository

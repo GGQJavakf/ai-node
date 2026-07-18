@@ -9,6 +9,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol, Sequence
 from uuid import uuid4
 
+from agent_retro.application.knowledge import (
+    CandidateLifecycleError,
+    KnowledgeService,
+)
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.review_contracts import (
     canonical_extraction_input,
@@ -42,6 +46,7 @@ _AUTHORITY_KINDS = frozenset(
         "developer_message",
         "project_rule",
         "system_message",
+        "user",
         "user_instruction",
         "user_message",
     }
@@ -61,6 +66,22 @@ _SPECULATION_MARKERS = (
     "推测",
     "猜测",
 )
+_REAL_CAPTURE_KINDS = frozenset({"user", "assistant", "command"})
+_LESSON_TEXT_PATTERNS = {
+    "failure": re.compile(
+        r"\b(?:failure|failed|error|exception|broken)\b|失败|报错|错误|异常|未通过",
+        re.IGNORECASE,
+    ),
+    "correction": re.compile(
+        r"\b(?:correction|corrected|fixed|repaired|replaced)\b|修复|更正|纠正|改为|替换",
+        re.IGNORECASE,
+    ),
+    "verification": re.compile(
+        r"\b(?:verification|verified|validated|confirmed|passed|exit code 0)\b|"
+        r"验证|测试通过|已确认|校验通过",
+        re.IGNORECASE,
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -129,11 +150,10 @@ def evaluate_gates(
         and not evidence_kinds.intersection(_AUTHORITY_KINDS)
     ):
         blockers.append("rule_authority")
-    if candidate.knowledge_type is KnowledgeType.LESSON and not {
-        "failure",
-        "correction",
-        "verification",
-    } <= evidence_kinds:
+    if (
+        candidate.knowledge_type is KnowledgeType.LESSON
+        and not _has_distinct_lesson_evidence(evidence)
+    ):
         blockers.append("lesson_verification")
 
     result = tuple(blockers)
@@ -145,6 +165,23 @@ def _is_speculative(candidate: Candidate, evidence: Sequence[Evidence]) -> bool:
         return True
     normalized = f" {candidate.proposed_text.casefold()} "
     return any(marker in normalized for marker in _SPECULATION_MARKERS)
+
+
+def _has_distinct_lesson_evidence(evidence: Sequence[Evidence]) -> bool:
+    matches: dict[str, set[str]] = {name: set() for name in _LESSON_TEXT_PATTERNS}
+    for item in evidence:
+        kind = item.kind.casefold()
+        for name, pattern in _LESSON_TEXT_PATTERNS.items():
+            if kind == name or (
+                kind in _REAL_CAPTURE_KINDS and pattern.search(item.excerpt)
+            ):
+                matches[name].add(item.id)
+    return any(
+        len({failure, correction, verification}) == 3
+        for failure in matches["failure"]
+        for correction in matches["correction"]
+        for verification in matches["verification"]
+    )
 
 
 class ReviewService:
@@ -182,9 +219,7 @@ class ReviewService:
         if pending:
             return [self.retry_candidate(item.id) for item in pending]
         if existing:
-            return [
-                self.repository.get_review_result(item.id) for item in existing
-            ]
+            return [self.repository.get_review_result(item.id) for item in existing]
         evidence = self.repository.list_evidence(session.id)
         return self._extract_then_review(
             session.source_session_id, session.project_id, evidence
@@ -277,9 +312,7 @@ class ReviewService:
                 f"model extraction failed; retry is available ({safe_error(exc)})"
             ) from exc
         candidates = tuple(
-            self._candidate_from_extraction(
-                session_id, project_id, item, evidence
-            )
+            self._candidate_from_extraction(session_id, project_id, item, evidence)
             for item in extracted
         )
         self.repository.save_candidates(candidates)
@@ -301,8 +334,7 @@ class ReviewService:
             [session_id, project_id, item.knowledge_type, text, evidence_ids]
         )
         return Candidate(
-            id="candidate-"
-            + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24],
+            id="candidate-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24],
             knowledge_type=KnowledgeType(item.knowledge_type),
             project_id=project_id,
             scope="project",
@@ -318,11 +350,33 @@ class ReviewService:
         evidence: Sequence[Evidence],
         result: ReviewResult,
     ) -> None:
-        self.repository.save_review(candidate.id, result)
         gates = evaluate_gates(candidate, result, evidence)
+        threshold = _THRESHOLDS[candidate.knowledge_type]
+        threshold_passed = threshold_passes(candidate.knowledge_type, result.confidence)
+        decision = AcceptanceDecision(
+            actor="model-review",
+            threshold=threshold,
+            threshold_passed=threshold_passed,
+            blockers=gates.blockers,
+            verdict=result.verdict,
+            evidence_ids=candidate.evidence_ids,
+        )
+        self.repository.save_review(candidate.id, result, decision)
+        if result.conflict_with is not None:
+            try:
+                KnowledgeService(self.repository).detect_conflict(
+                    result.conflict_with,
+                    candidate.id,
+                    reason=result.reason,
+                    merge_text=result.normalized_text,
+                )
+            except CandidateLifecycleError:
+                # A model-supplied ID is advisory; deterministic gates and audit
+                # retain the blocker even when no valid active item exists.
+                pass
         if (
             result.verdict is not ReviewVerdict.ACCEPT
-            or not threshold_passes(candidate.knowledge_type, result.confidence)
+            or not threshold_passed
             or not gates.allowed
         ):
             return
@@ -338,10 +392,5 @@ class ReviewService:
             confidence=result.confidence,
             candidate_status=CandidateStatus.AUTO_ACCEPTED,
             valid_until=valid_until,
-            decision=AcceptanceDecision(
-                threshold=_THRESHOLDS[candidate.knowledge_type],
-                blockers=gates.blockers,
-                verdict=result.verdict,
-                evidence_ids=candidate.evidence_ids,
-            ),
+            decision=decision,
         )

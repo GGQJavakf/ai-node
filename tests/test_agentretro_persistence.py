@@ -13,6 +13,7 @@ from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 from agent_retro.infrastructure import sqlite_repository as sqlite_repository_module
 from agent_retro.application.bootstrap import build_retro_repository
 from agent_retro.domain.models import (
+    AcceptanceDecision,
     AuditEntry,
     Candidate,
     CandidateStatus,
@@ -499,7 +500,9 @@ def test_migration_backup_checkpoints_wal_before_copy(tmp_path, monkeypatch):
         assert Path(f"{db_path}-wal").exists()
         return 1
 
-    monkeypatch.setattr(repo, "schema_version", schema_version_after_uncheckpointed_write)
+    monkeypatch.setattr(
+        repo, "schema_version", schema_version_after_uncheckpointed_write
+    )
     monkeypatch.setattr(
         repo,
         "_apply_migration",
@@ -527,7 +530,17 @@ def test_transaction_commits_on_success_and_rolls_back_on_exception(tmp_path):
         with repo.transaction() as connection:
             connection.execute(
                 "INSERT INTO audit_log VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("rolled-back", "test", "rollback", "test", "2", "", "", "{}", NOW.isoformat()),
+                (
+                    "rolled-back",
+                    "test",
+                    "rollback",
+                    "test",
+                    "2",
+                    "",
+                    "",
+                    "{}",
+                    NOW.isoformat(),
+                ),
             )
             raise RuntimeError("rollback")
 
@@ -551,7 +564,9 @@ def test_audit_failure_rolls_back_the_lifecycle_mutation(tmp_path, monkeypatch):
     assert repo.list_project_mappings(active_only=False) == []
 
 
-def test_bootstrap_uses_agentretro_settings_and_migrates_the_isolated_database(tmp_path):
+def test_bootstrap_uses_agentretro_settings_and_migrates_the_isolated_database(
+    tmp_path,
+):
     settings = load_retro_settings(home=tmp_path, env={})
 
     repo = build_retro_repository(settings)
@@ -578,7 +593,18 @@ def test_capture_candidates_review_and_acceptance_round_trip_with_audit(tmp_path
         duplicate_of=None,
         conflict_with=None,
     )
-    repo.save_review(candidate.id, result)
+    repo.save_review(
+        candidate.id,
+        result,
+        AcceptanceDecision(
+            actor="model-review",
+            threshold=0.97,
+            threshold_passed=True,
+            blockers=(),
+            verdict=result.verdict,
+            evidence_ids=candidate.evidence_ids,
+        ),
+    )
     attempt = repo.begin_review_attempt(
         ReviewAttempt(
             id="attempt-1",
@@ -618,7 +644,9 @@ def test_capture_candidates_review_and_acceptance_round_trip_with_audit(tmp_path
     )
     assert knowledge.candidate_id == candidate.id
     assert knowledge.evidence_ids == (evidence.id,)
-    assert repo.list_active_knowledge("project-1", NOW + timedelta(days=1)) == [knowledge]
+    assert repo.list_active_knowledge("project-1", NOW + timedelta(days=1)) == [
+        knowledge
+    ]
     actions = {
         row["action"] for row in _rows(repo.db_path, "SELECT action FROM audit_log")
     }
@@ -657,8 +685,15 @@ def test_conflict_and_sync_lifecycle_are_persisted_and_audited(tmp_path):
     )
     repo.finish_sync("sync-1", status="completed")
 
-    assert _rows(repo.db_path, "SELECT status FROM conflicts WHERE id = 'conflict-1'")[0][0] == "open"
-    sync = _rows(repo.db_path, "SELECT status, error FROM sync_jobs WHERE id = 'sync-1'")[0]
+    assert (
+        _rows(repo.db_path, "SELECT status FROM conflicts WHERE id = 'conflict-1'")[0][
+            0
+        ]
+        == "open"
+    )
+    sync = _rows(
+        repo.db_path, "SELECT status, error FROM sync_jobs WHERE id = 'sync-1'"
+    )[0]
     assert tuple(sync) == ("completed", "")
     actions = [row[0] for row in _rows(repo.db_path, "SELECT action FROM audit_log")]
     assert "conflict_saved" in actions
@@ -796,10 +831,13 @@ def test_accept_candidate_is_strictly_idempotent_for_identical_input(tmp_path):
     )
 
     assert second == first
-    assert _rows(
-        repo.db_path,
-        "SELECT COUNT(*) FROM audit_log WHERE action = 'candidate_accepted'",
-    )[0][0] == audit_count
+    assert (
+        _rows(
+            repo.db_path,
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'candidate_accepted'",
+        )[0][0]
+        == audit_count
+    )
 
 
 @pytest.mark.parametrize(

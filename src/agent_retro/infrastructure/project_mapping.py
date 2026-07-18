@@ -221,12 +221,19 @@ class ProjectMappingService:
             )
         evidence = self.repository.list_evidence(session.id)
         self.review_stored_evidence(session_id, session.project_id, tuple(evidence))
-        self.repository.reclassify_session(
+        reclassification = self.repository.reclassify_session(
             session_id,
             mapping.obsidian_project,
             mapping.id,
             actor,
         )
+        try:
+            self.review_stored_evidence(
+                session_id, mapping.obsidian_project, tuple(evidence)
+            )
+        except Exception:
+            self.repository.rollback_reclassification(reclassification, actor)
+            raise
 
     def _validated_project(self, obsidian_project: str) -> str:
         if self.vault_root is None:

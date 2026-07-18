@@ -18,6 +18,7 @@ from agent_retro.domain.models import (
     KnowledgeType,
     NormalizedSession,
     ProjectMapping,
+    Reclassification,
     PurgePlan,
     PurgeStatus,
     ReviewAttempt,
@@ -62,7 +63,12 @@ class RetroRepository(Protocol):
 
     def evidence_for_candidate(self, candidate_id: str) -> list[Evidence]: ...
 
-    def save_review(self, candidate_id: str, result: ReviewResult) -> None: ...
+    def save_review(
+        self,
+        candidate_id: str,
+        result: ReviewResult,
+        decision: AcceptanceDecision,
+    ) -> None: ...
 
     def get_review_result(self, candidate_id: str) -> ReviewResult | None: ...
 
@@ -130,13 +136,9 @@ class RetroRepository(Protocol):
 
     def begin_sync(self, job: SyncJob) -> None: ...
 
-    def finish_sync(
-        self, job_id: str, status: str, error: str = ""
-    ) -> None: ...
+    def finish_sync(self, job_id: str, status: str, error: str = "") -> None: ...
 
-    def save_project_mapping(
-        self, mapping: ProjectMapping, actor: str
-    ) -> None: ...
+    def save_project_mapping(self, mapping: ProjectMapping, actor: str) -> None: ...
 
     def list_project_mappings(
         self, active_only: bool = True
@@ -150,7 +152,11 @@ class RetroRepository(Protocol):
         project_id: str,
         mapping_id: str,
         actor: str,
-    ) -> str: ...
+    ) -> Reclassification: ...
+
+    def rollback_reclassification(
+        self, reclassification: Reclassification, actor: str
+    ) -> None: ...
 
     def save_projection_event(
         self,
@@ -169,9 +175,7 @@ class RetroRepository(Protocol):
         full_hash: str,
     ) -> None: ...
 
-    def save_purge_plan(
-        self, plan: PurgePlan, plan_hash: str, actor: str
-    ) -> None: ...
+    def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 
     def finish_purge(
         self,

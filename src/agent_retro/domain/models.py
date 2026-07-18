@@ -128,7 +128,9 @@ class ReviewAttempt:
 class AcceptanceDecision:
     """Typed automatic-acceptance facts persisted in the audit record."""
 
+    actor: str
     threshold: float
+    threshold_passed: bool
     blockers: tuple[str, ...]
     verdict: ReviewVerdict
     evidence_ids: tuple[str, ...]
@@ -179,6 +181,19 @@ class ProjectMapping:
     remote_identity: str
     obsidian_project: str
     active: bool = True
+
+
+@dataclass(frozen=True)
+class Reclassification:
+    """Typed compensation snapshot for a two-phase project reclassification."""
+
+    session_id: str
+    previous_project_id: str
+    target_project_id: str
+    mapping_id: str
+    pending_candidate_ids: tuple[str, ...]
+    preexisting_knowledge_versions: tuple[tuple[str, int], ...]
+    preexisting_conflict_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)

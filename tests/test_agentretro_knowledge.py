@@ -143,6 +143,43 @@ def test_manual_edit_can_change_text_type_scope_and_validity_before_acceptance(
     assert audit[0].before_hash and audit[0].after_hash
 
 
+@pytest.mark.parametrize("text", ["", "   "])
+def test_manual_edit_rejects_empty_text_and_keeps_candidate_pending(tmp_path, text):
+    repository = _repository(tmp_path, [_candidate()])
+
+    with pytest.raises(CandidateLifecycleError, match="non-empty"):
+        _knowledge_service(repository).edit("candidate-1", text=text, actor="user")
+
+    assert (
+        repository.get_candidate("candidate-1").status is CandidateStatus.PENDING_REVIEW
+    )
+
+
+def test_manual_edit_valid_until_is_timezone_aware_and_task_state_only(tmp_path):
+    repository = _repository(tmp_path, [_candidate()])
+    service = _knowledge_service(repository)
+
+    with pytest.raises(CandidateLifecycleError, match="TASK_STATE"):
+        service.edit(
+            "candidate-1",
+            text="Rule text.",
+            valid_until=NOW + timedelta(days=1),
+            actor="user",
+        )
+    with pytest.raises(CandidateLifecycleError, match="timezone-aware"):
+        service.edit(
+            "candidate-1",
+            text="Task state text.",
+            knowledge_type=KnowledgeType.TASK_STATE,
+            valid_until=datetime(2026, 7, 19, 9, 0),
+            actor="user",
+        )
+
+    assert (
+        repository.get_candidate("candidate-1").status is CandidateStatus.PENDING_REVIEW
+    )
+
+
 def test_manual_reject_stays_out_of_active_knowledge_and_retains_audit(tmp_path):
     repository = _repository(tmp_path, [_candidate()])
     service = _knowledge_service(repository)

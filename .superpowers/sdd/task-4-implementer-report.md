@@ -146,3 +146,44 @@ Status: complete for OpenSpec tasks `2.8` and `3.1` through `3.9`; purge and sce
 - OpenSpec tasks `2.8` and `3.1` through `3.9` are marked complete. Tasks `3.10` and `3.11` remain open.
 - Tests use injected or monkeypatched gateways and temporary SQLite repositories; no real model request or user session path was used.
 - No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
+
+## Milestone D review remediation: real evidence, complete audit, atomic recovery, and conflicts
+
+Status: all four independent-review Important findings and the requested manual-edit validation are resolved.
+
+### RED evidence
+
+- Real capture vocabulary: the synthetic Codex JSONL cross-layer test produced real `user`, `assistant`, and `command` evidence, but both grounded RULE and LESSON candidates remained pending (`2 failed, 2 passed`).
+- Decision audit: accepted, below-threshold, rejected, and blocked reviews were persisted with actor `system` and without threshold, threshold-pass, ordered blockers, or evidence facts (`5 failed`).
+- Conflict application: a valid active-knowledge `conflict_with` created no conflict record, while the hallucinated-ID negative control already stayed pending (`1 failed, 1 passed`).
+- Manual edit validation: empty text and invalid `valid_until` combinations were accepted (`3 failed`).
+- Reclassification: an obsolete completed attempt hid a pending candidate, target-project review did not run, and a second-phase failure did not roll back (`3 failed`).
+- Compensation review: a same-result target review lost its second decision audit and rollback deleted a preexisting conflict (`2 failed`).
+
+### GREEN evidence
+
+- Review-focused vocabulary and gate slice: `13 passed`.
+- Decision-audit slice: `5 passed`.
+- Conflict and lifecycle slices: `3 passed` and `4 passed`.
+- Reclassification, rollback-difference, and decision-idempotence slices: `3 passed`.
+- Cross-layer focused command: `python -m pytest tests/test_agentretro_review.py tests/test_agentretro_capture.py tests/test_agentretro_knowledge.py tests/test_agentretro_cli.py tests/test_agentretro_persistence.py -q`.
+- Focused result: `130 passed in 8.58s`.
+- Full command: `python -m pytest -q`.
+- Full result: `340 passed in 15.19s`.
+- Ruff formatting and lint checks passed for all eleven changed Python files.
+- `openspec validate add-agentretro-mvp --strict` returned `Change 'add-agentretro-mvp' is valid`; `git diff --check` returned no findings.
+
+### Remediated behavior
+
+- RULE authority accepts real captured `user` evidence while preserving independent model review and speculation gates. LESSON grounding recognizes explicit failure, correction, and verification semantics across three distinct real evidence items and retains support for semantic evidence kinds.
+- Every completed model review writes a typed decision audit with actor, threshold, threshold result, ordered blockers, verdict, and evidence IDs. Result-plus-decision hashing preserves distinct old/new-project decisions while preventing terminal replay duplicates.
+- Pending selection no longer treats any completed attempt as globally terminal; `ReviewService` alone decides reuse from the current canonical input hash.
+- Reclassification now performs stored-evidence review before classification, transactionally changes the session and pending candidates, then reviews and gates against the target project. A second-phase failure uses a typed compensation snapshot to restore awaiting state and remove only second-phase knowledge/conflict differences while retaining immutable review attempts and preexisting entities.
+- Valid model conflicts create one deterministic open record using the redacted normalized text; terminal replay is idempotent. Hallucinated or incompatible knowledge IDs remain audited blockers and do not crash review.
+- Manual edit rejects blank text, restricts `valid_until` to `TASK_STATE`, and requires timezone-aware values.
+
+### Scope boundary
+
+- OpenSpec completion remains `2.8` and `3.1` through `3.9`; `3.10` and `3.11` remain open.
+- Tests use temporary synthetic Codex capture data and injected gateways. They do not call a real model, read a real user session path, or reread source JSONL during reclassification.
+- No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
