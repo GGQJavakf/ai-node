@@ -20,7 +20,7 @@ def build_projection_coordinator(
 ) -> ProjectionCoordinator:
     """Compose bounded filesystem services without performing a write."""
 
-    vault = settings.obsidian_root or settings.state_dir / "unconfigured-obsidian"
+    vault = settings.obsidian_root
     return ProjectionCoordinator(
         repository,
         ObsidianProjection(vault, settings.backup_dir),

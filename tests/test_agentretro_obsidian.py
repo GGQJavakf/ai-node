@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import subprocess
+import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +26,7 @@ from agent_retro.domain.models import (
     ReviewVerdict,
     SourceLocator,
 )
+from agent_retro.domain.projection import projection_input_hash
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
     ObsidianProjection,
@@ -117,6 +122,30 @@ class KnowledgeRepository(SQLiteRetroRepository):
 
     def list_project_knowledge(self, project_id: str) -> list[Knowledge]:
         return [item for item in self.items if item.project_id == project_id]
+
+    def projection_fence_matches(
+        self, event_id: str, expected_input_hash: str
+    ) -> bool:
+        events = self.list_projection_events("NPKI")
+        return (
+            bool(events)
+            and events[-1].id == event_id
+            and projection_input_hash(self.items) == expected_input_hash
+        )
+
+    def complete_sync(
+        self,
+        event_id: str,
+        project_id: str,
+        file_states,
+        expected_input_hash: str,
+    ) -> None:
+        if not self.projection_fence_matches(event_id, expected_input_hash):
+            raise RuntimeError("projection superseded")
+        for path, managed_hash, full_hash in file_states:
+            self.save_managed_file_state(project_id, path, managed_hash, full_hash)
+        self.finish_sync(event_id, ProjectionStatus.SYNCED.value)
+        self.finish_projection_event(event_id, ProjectionStatus.SYNCED)
 
 
 def _coordinator(
@@ -727,3 +756,241 @@ def test_same_batch_updates_summary_and_index_only_inside_valid_markers(
     )
     assert any(path.read_bytes() == index_before for path in backup_dir.rglob("项目索引.md"))
     assert event is not None and event.status is ProjectionStatus.SYNCED
+
+
+def test_unconfigured_vault_never_uses_preexisting_placeholder_directory(
+    tmp_path: Path, capsys
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".agentretro"
+    placeholder = state / "unconfigured-obsidian"
+    placeholder.mkdir(parents=True)
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+
+    assert main(["--json", "review", "accept", "candidate-rule"], home=home, env={}) == 0
+    output = capsys.readouterr().out
+    event = repository.list_projection_events("NPKI")[0]
+
+    assert list(placeholder.rglob("*")) == []
+    assert event.status is ProjectionStatus.SYNC_PENDING
+    assert event.error == "vault_not_configured"
+    assert "vault_not_configured" in output
+    configured = tmp_path / "configured-vault"
+    configured.mkdir()
+    assert main(
+        ["--json", "sync", "retry", event.id],
+        home=home,
+        env={"AGENTRETRO_OBSIDIAN_ROOT": str(configured)},
+    ) == 0
+    capsys.readouterr()
+    assert repository.get_projection_event(event.id).status is ProjectionStatus.SYNCED
+    assert (configured / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
+
+
+def test_projection_exception_details_never_reach_persistence_audit_or_output(
+    tmp_path: Path,
+) -> None:
+    secret = "PRIVATE-C:/users/name/secret-token"
+
+    class ExplodingProjection(ObsidianProjection):
+        def plan(self, *args, **kwargs):
+            raise OSError(secret)
+
+    repository, coordinator = _coordinator(
+        tmp_path, [_knowledge("rule", KnowledgeType.RULE)]
+    )
+    coordinator = ProjectionCoordinator(
+        repository,
+        ExplodingProjection(tmp_path / "vault", tmp_path / "backups"),
+        coordinator.sync,
+    )
+
+    result = coordinator.after_commit("accept", "rule", "NPKI")
+    event = repository.get_projection_event(result.event_id)
+    audits = repository.list_audit_entries(entity_id=result.event_id)
+    serialized = json.dumps(
+        {
+            "result": result.__dict__,
+            "event": event.__dict__,
+            "audits": [entry.__dict__ for entry in audits],
+        },
+        default=str,
+        ensure_ascii=False,
+    )
+
+    assert secret not in serialized
+    assert event.error == "planning_failed"
+    assert result.reason == "planning_failed"
+
+
+def test_older_paused_projection_cannot_overwrite_newer_committed_knowledge(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _repository(tmp_path)
+    _seed_pending_candidate(repository, "candidate-old")
+    old = repository.accept_candidate("candidate-old", "旧知识", "user", 0.98)
+    evidence = repository.list_evidence("session-1")[0]
+    repository.save_candidates(
+        [
+            Candidate(
+                "candidate-new",
+                KnowledgeType.RULE,
+                "NPKI",
+                "project",
+                "新知识",
+                (evidence.id,),
+                CandidateStatus.PENDING_REVIEW,
+                0.99,
+            )
+        ]
+    )
+    first_replace_entered = threading.Event()
+    release_first_replace = threading.Event()
+    replace_count = 0
+
+    def pausing_replace(source: Path, target: Path) -> None:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 1:
+            first_replace_entered.set()
+            assert release_first_replace.wait(5)
+        os.replace(source, target)
+
+    projection = ObsidianProjection(vault, tmp_path / "backups")
+    coordinator = ProjectionCoordinator(
+        repository,
+        projection,
+        SyncService(
+            repository, vault, tmp_path / "backups", replace=pausing_replace
+        ),
+    )
+    results: dict[str, object] = {}
+    old_thread = threading.Thread(
+        target=lambda: results.setdefault(
+            "old", coordinator.after_commit("accept", old.id, "NPKI")
+        )
+    )
+    old_thread.start()
+    assert first_replace_entered.wait(5)
+    new = repository.accept_candidate("candidate-new", "新知识", "user", 0.99)
+    new_thread = threading.Thread(
+        target=lambda: results.setdefault(
+            "new", coordinator.after_commit("accept", new.id, "NPKI")
+        )
+    )
+    new_thread.start()
+    release_first_replace.set()
+    old_thread.join(10)
+    new_thread.join(10)
+
+    content = (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").read_text(
+        encoding="utf-8"
+    )
+    assert "新知识" in content and "旧知识" in content
+    assert results["old"].status is ProjectionStatus.SYNC_PENDING
+    assert results["old"].reason == "projection_superseded"
+    assert results["new"].status is ProjectionStatus.SYNCED
+    log = (vault / "项目" / "NPKI" / "AgentRetro" / "变更日志.md").read_text(
+        encoding="utf-8"
+    )
+    assert log.count(results["new"].event_id) == 1
+    assert results["old"].event_id not in log
+
+
+def test_project_file_lock_serializes_processes_and_auto_releases_on_exit(
+    tmp_path: Path,
+) -> None:
+    if os.name != "nt":
+        pytest.skip("Windows msvcrt lock contract")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _repository(tmp_path)
+    _seed_pending_candidate(repository)
+    knowledge = repository.accept_candidate(
+        "candidate-rule", "跨进程锁知识", "user", 0.98
+    )
+    key = hashlib.sha256(b"NPKI").hexdigest()
+    lock_root = (tmp_path / "backups").parent / ".projection-locks"
+    lock_root.mkdir()
+    lock_path = lock_root / f"{key}.lock"
+    script = (
+        "import msvcrt,sys,time\n"
+        "p=sys.argv[1]\n"
+        "f=open(p,'a+b')\n"
+        "f.seek(0,2)\n"
+        "f.write(b'0') if f.tell()==0 else None\n"
+        "f.flush(); f.seek(0)\n"
+        "msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)\n"
+        "print('locked',flush=True)\n"
+        "time.sleep(0.8)\n"
+        "sys.exit(0)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(lock_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None and child.stdout.readline().strip() == "locked"
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        SyncService(repository, vault, tmp_path / "backups"),
+    )
+
+    result = coordinator.after_commit("accept", knowledge.id, "NPKI")
+    child.wait(timeout=5)
+
+    assert child.returncode == 0
+    assert result.status is ProjectionStatus.SYNCED
+    assert lock_path.exists()
+    assert (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
+
+
+@pytest.mark.parametrize("boundary", ["marker", "symlink"])
+def test_boundary_private_details_are_reduced_to_stable_reason(
+    tmp_path: Path, boundary: str
+) -> None:
+    secret = "PRIVATE-USER-PATH"
+    repository, coordinator = _coordinator(
+        tmp_path, [_knowledge("rule", KnowledgeType.RULE)]
+    )
+    vault = tmp_path / "vault"
+    if boundary == "marker":
+        summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+        summary.parent.mkdir(parents=True)
+        summary.write_text(
+            f"<!-- agentretro:summary:start project={secret} -->\n"
+            "old\n<!-- agentretro:summary:end -->\n",
+            encoding="utf-8",
+        )
+    else:
+        (vault / "项目").mkdir()
+        try:
+            os.symlink(
+                tmp_path / secret,
+                vault / "项目" / "NPKI",
+                target_is_directory=True,
+            )
+        except OSError:
+            pytest.skip("symlink creation unavailable")
+
+    result = coordinator.after_commit("accept", "rule", "NPKI")
+    event = repository.get_projection_event(result.event_id)
+    audits = repository.list_audit_entries(entity_id=result.event_id)
+    serialized = json.dumps(
+        [result.__dict__, event.__dict__, [entry.__dict__ for entry in audits]],
+        default=str,
+        ensure_ascii=False,
+    )
+
+    assert result.reason == "planning_failed"
+    assert event.error == "planning_failed"
+    assert secret not in serialized

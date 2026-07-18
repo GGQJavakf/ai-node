@@ -183,6 +183,7 @@ def _run_command(
             "projection_status": result.status.value,
             "warning": result.warning,
             "recovery_command": result.recovery_command,
+            "reason": result.reason,
         }
         if args.json_output:
             write_json(

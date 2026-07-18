@@ -40,6 +40,7 @@ from agent_retro.domain.models import (
     SourceLocator,
     SyncJob,
 )
+from agent_retro.domain.projection import ProjectionFenceError, projection_input_hash
 
 
 _SCHEMA_VERSION = 1
@@ -1486,10 +1487,15 @@ class SQLiteRetroRepository(RetroRepository):
         event_id: str,
         project_id: str,
         file_states: Sequence[tuple[Path, str, str]],
+        expected_input_hash: str,
     ) -> None:
         """Atomically publish post-write hashes and finish both journal records."""
 
         with self.transaction() as connection:
+            if not self._projection_fence_matches(
+                connection, event_id, expected_input_hash
+            ):
+                raise ProjectionFenceError("projection event is no longer current")
             for path, managed_hash, full_hash in file_states:
                 connection.execute(
                     """INSERT INTO managed_file_state(
@@ -1522,6 +1528,49 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"project_id": project_id, "file_count": len(file_states)},
                 ),
             )
+
+    def projection_fence_matches(
+        self, event_id: str, expected_input_hash: str
+    ) -> bool:
+        connection = self._connect()
+        try:
+            return self._projection_fence_matches(
+                connection, event_id, expected_input_hash
+            )
+        finally:
+            connection.close()
+
+    def _projection_fence_matches(
+        self,
+        connection: sqlite3.Connection,
+        event_id: str,
+        expected_input_hash: str,
+    ) -> bool:
+        event = connection.execute(
+            "SELECT project_id, input_hash FROM projection_events WHERE id = ?",
+            (event_id,),
+        ).fetchone()
+        if event is None or str(event["input_hash"]) != expected_input_hash:
+            return False
+        latest = connection.execute(
+            """SELECT id FROM projection_events WHERE project_id = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (str(event["project_id"]),),
+        ).fetchone()
+        if latest is None or str(latest["id"]) != event_id:
+            return False
+        rows = connection.execute(
+            """SELECT item.* FROM knowledge AS item
+            JOIN (
+                SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
+            ) AS current ON current.id = item.id AND current.version = item.version
+            WHERE item.project_id = ? AND item.scope = 'project'
+              AND item.status IN ('active', 'archived')
+            ORDER BY item.id""",
+            (str(event["project_id"]),),
+        ).fetchall()
+        knowledge = [self._knowledge_from_row(connection, row) for row in rows]
+        return projection_input_hash(knowledge) == expected_input_hash
 
     def save_project_mapping(self, mapping: ProjectMapping, actor: str) -> None:
         with self.transaction() as connection:

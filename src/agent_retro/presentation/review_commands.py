@@ -330,4 +330,5 @@ def _projection_data(result: ProjectionResult) -> dict[str, object]:
         "status": result.status.value,
         "warning": result.warning,
         "recovery_command": result.recovery_command,
+        "reason": result.reason,
     }

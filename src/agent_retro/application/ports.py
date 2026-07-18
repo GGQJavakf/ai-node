@@ -148,7 +148,12 @@ class RetroRepository(Protocol):
         event_id: str,
         project_id: str,
         file_states: Sequence[tuple[Path, str, str]],
+        expected_input_hash: str,
     ) -> None: ...
+
+    def projection_fence_matches(
+        self, event_id: str, expected_input_hash: str
+    ) -> bool: ...
 
     def has_rollback_required_sync(self) -> bool: ...
 

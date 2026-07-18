@@ -23,6 +23,10 @@ class UnsafeVaultPathError(ValueError):
     """A planned target is outside the configured vault boundary."""
 
 
+class VaultNotConfiguredError(ValueError):
+    """Obsidian projection is explicitly disabled until a root is configured."""
+
+
 @dataclass(frozen=True)
 class PlannedWrite:
     target: Path
@@ -86,9 +90,11 @@ def managed_block_hash(content: bytes) -> str:
 class ObsidianProjection:
     """Build immutable write plans; applying them belongs to SyncService."""
 
-    def __init__(self, vault_root: Path, backup_root: Path | None = None) -> None:
-        self.vault_root = Path(vault_root)
-        self.backup_root = Path(backup_root or self.vault_root.parent / "backups")
+    def __init__(
+        self, vault_root: Path | None, backup_root: Path | None = None
+    ) -> None:
+        self.vault_root = None if vault_root is None else Path(vault_root)
+        self.backup_root = Path(backup_root) if backup_root is not None else None
 
     def plan(
         self,
@@ -97,6 +103,10 @@ class ObsidianProjection:
         *,
         event_id: str | None = None,
     ) -> SyncPlan:
+        if self.vault_root is None:
+            raise VaultNotConfiguredError("Obsidian vault is not configured")
+        if self.backup_root is None:
+            raise ValueError("AgentRetro backup root is not configured")
         project_root = self._safe_target(Path("项目") / project_id)
         grouped: dict[KnowledgeType, list[Knowledge]] = {}
         for item in knowledge:
