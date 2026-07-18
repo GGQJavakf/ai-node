@@ -12,7 +12,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from agent_retro.application.ports import RetroRepository
@@ -263,6 +263,8 @@ _PURGE_SQLITE_FIELDS = (
     ("sqlite_review", "review_attempts", "id", "error"),
     ("sqlite_conflict", "conflicts", "id", "reason"),
     ("sqlite_conflict", "conflicts", "id", "merge_text"),
+    ("sqlite_projection", "projection_events", "id", "input_hash"),
+    ("sqlite_projection", "projection_events", "id", "error"),
     ("sqlite_projection", "sync_jobs", "id", "plan_json"),
     ("sqlite_projection", "sync_jobs", "id", "error"),
     ("sqlite_projection", "managed_file_snapshots", "path", "owned_bytes"),
@@ -2639,16 +2641,14 @@ class SQLiteRetroRepository(RetroRepository):
 
         connection = self._connect()
         try:
-            row = connection.execute(
-                """SELECT item.* FROM knowledge AS item
-                JOIN (
-                    SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
-                ) AS latest ON latest.id = item.id AND latest.version = item.version
-                WHERE item.id = ?""",
+            knowledge_rows = connection.execute(
+                "SELECT * FROM knowledge WHERE id = ? ORDER BY version",
                 (knowledge_id,),
-            ).fetchone()
+            ).fetchall()
             knowledge = (
-                None if row is None else self._knowledge_from_row(connection, row)
+                None
+                if not knowledge_rows
+                else self._knowledge_from_row(connection, knowledge_rows[-1])
             )
             purged = connection.execute(
                 "SELECT 1 FROM purge_jobs WHERE knowledge_id = ? AND status = ? LIMIT 1",
@@ -2661,19 +2661,189 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if knowledge is None:
                 return PurgeInspection(
-                    None, purged is not None, sync_pending is not None, ()
+                    None, purged is not None, sync_pending is not None, (), ()
                 )
 
-            marker = knowledge.text.encode("utf-8")
-            copies = self._purge_database_copies(connection, marker)
+            markers, copies = self._purge_entity_copies(
+                connection, knowledge_id, knowledge_rows
+            )
             return PurgeInspection(
                 knowledge,
                 purged is not None,
                 sync_pending is not None,
                 tuple(copies),
+                markers,
             )
         finally:
             connection.close()
+
+    @staticmethod
+    def _purge_entity_copies(
+        connection: sqlite3.Connection,
+        knowledge_id: str,
+        knowledge_rows: Sequence[sqlite3.Row] | None = None,
+    ) -> tuple[tuple[bytes, ...], list[PurgeCopy]]:
+        rows = list(
+            knowledge_rows
+            if knowledge_rows is not None
+            else connection.execute(
+                "SELECT * FROM knowledge WHERE id = ? ORDER BY version",
+                (knowledge_id,),
+            ).fetchall()
+        )
+        if not rows:
+            return (), []
+
+        candidate_ids = tuple(sorted({str(row["candidate_id"]) for row in rows}))
+        candidate_placeholders = ",".join("?" for _ in candidate_ids)
+        candidates = connection.execute(
+            f"SELECT * FROM candidates WHERE id IN ({candidate_placeholders}) ORDER BY id",
+            candidate_ids,
+        ).fetchall()
+        evidence_ids = {
+            str(row["evidence_id"])
+            for row in connection.execute(
+                "SELECT evidence_id FROM knowledge_evidence WHERE knowledge_id = ?",
+                (knowledge_id,),
+            ).fetchall()
+        }
+        evidence_ids.update(
+            str(row["evidence_id"])
+            for row in connection.execute(
+                f"SELECT evidence_id FROM candidate_evidence "
+                f"WHERE candidate_id IN ({candidate_placeholders})",
+                candidate_ids,
+            ).fetchall()
+        )
+        ordered_evidence_ids = tuple(sorted(evidence_ids))
+        evidence = (
+            connection.execute(
+                f"SELECT * FROM evidence WHERE id IN "
+                f"({','.join('?' for _ in ordered_evidence_ids)}) ORDER BY id",
+                ordered_evidence_ids,
+            ).fetchall()
+            if ordered_evidence_ids
+            else []
+        )
+        reviews = connection.execute(
+            f"SELECT * FROM review_attempts "
+            f"WHERE candidate_id IN ({candidate_placeholders}) ORDER BY id",
+            candidate_ids,
+        ).fetchall()
+        conflicts = connection.execute(
+            f"SELECT * FROM conflicts WHERE active_knowledge_id = ? "
+            f"OR candidate_id IN ({candidate_placeholders}) ORDER BY id",
+            (knowledge_id, *candidate_ids),
+        ).fetchall()
+
+        marker_values = {
+            str(value).encode("utf-8")
+            for value in (
+                *(row["text"] for row in rows),
+                *(row["proposed_text"] for row in candidates),
+                *(row["excerpt"] for row in evidence),
+                *(
+                    row[field]
+                    for row in conflicts
+                    for field in ("reason", "merge_text")
+                ),
+            )
+            if str(value)
+        }
+        markers = tuple(sorted(marker_values, key=lambda item: (-len(item), item)))
+        copies: list[PurgeCopy] = []
+
+        def add(
+            kind: str, table: str, key: object, row: sqlite3.Row, *fields: str
+        ) -> None:
+            for field in fields:
+                value = row[field]
+                content = (
+                    bytes(value)
+                    if isinstance(value, bytes)
+                    else str(value).encode("utf-8")
+                )
+                if content:
+                    copies.append(PurgeCopy(kind, f"{table}:{key}:{field}", content))
+
+        for row in rows:
+            add(
+                "sqlite_knowledge",
+                "knowledge",
+                f"{knowledge_id}:{row['version']}",
+                row,
+                "text",
+            )
+        for row in candidates:
+            add(
+                "sqlite_candidate",
+                "candidates",
+                row["id"],
+                row,
+                "proposed_text",
+                "review_json",
+            )
+        for row in evidence:
+            add("sqlite_evidence", "evidence", row["id"], row, "excerpt")
+        for row in reviews:
+            add(
+                "sqlite_review",
+                "review_attempts",
+                row["id"],
+                row,
+                "result_json",
+                "error",
+            )
+        for row in conflicts:
+            add("sqlite_conflict", "conflicts", row["id"], row, "reason", "merge_text")
+
+        related_ids = {
+            knowledge_id,
+            *candidate_ids,
+            *ordered_evidence_ids,
+            *(str(row["id"]) for row in reviews),
+            *(str(row["id"]) for row in conflicts),
+        }
+        placeholders = ",".join("?" for _ in related_ids)
+        related_values = tuple(sorted(related_ids))
+        audits = connection.execute(
+            f"SELECT * FROM audit_log WHERE entity_id IN ({placeholders}) ORDER BY id",
+            related_values,
+        ).fetchall()
+        projections = connection.execute(
+            f"SELECT * FROM projection_events WHERE cause_entity_id IN ({placeholders}) ORDER BY id",
+            related_values,
+        ).fetchall()
+        for row in audits:
+            add("sqlite_audit", "audit_log", row["id"], row, "detail_json")
+        for row in projections:
+            for field in ("input_hash", "error"):
+                content = str(row[field]).encode("utf-8")
+                if content and any(marker in content for marker in markers):
+                    add("sqlite_projection", "projection_events", row["id"], row, field)
+
+        project_id = str(rows[-1]["project_id"])
+        for table, key_field, fields in (
+            ("sync_jobs", "id", ("plan_json", "error")),
+            ("managed_file_snapshots", "path", ("owned_bytes",)),
+        ):
+            project_rows = connection.execute(
+                f"SELECT * FROM {table} WHERE project_id = ? ORDER BY {key_field}",
+                (project_id,),
+            ).fetchall()
+            for row in project_rows:
+                for field in fields:
+                    value = row[field]
+                    content = (
+                        bytes(value)
+                        if isinstance(value, bytes)
+                        else str(value).encode("utf-8")
+                    )
+                    if content and any(marker in content for marker in markers):
+                        add("sqlite_projection", table, row[key_field], row, field)
+
+        copies.sort(key=lambda item: (item.location_kind, item.locator))
+        return markers, copies
 
     def begin_purge(
         self,
@@ -2681,23 +2851,33 @@ class SQLiteRetroRepository(RetroRepository):
         *,
         plan_hash: str,
         actor: str,
-        marker: bytes,
+        markers: Sequence[bytes],
         journal_locations: Mapping[str, str],
         database_expected_hashes: Mapping[str, str],
         recovery_payloads: Mapping[str, str],
         tombstone_json: str,
+        precommit_guard: Callable[[], None],
     ) -> None:
         """Journal and scrub SQLite-owned copies in one transaction."""
 
         with self.transaction() as connection:
             connection.execute("PRAGMA secure_delete = ON")
-            current_copies = self._purge_database_copies(connection, marker)
+            knowledge_rows = connection.execute(
+                "SELECT * FROM knowledge WHERE id = ? ORDER BY version",
+                (plan.knowledge_id,),
+            ).fetchall()
+            current_markers, current_copies = self._purge_entity_copies(
+                connection, plan.knowledge_id, knowledge_rows
+            )
             current_hashes = {
                 item.locator: hashlib.sha256(item.content).hexdigest()
                 for item in current_copies
             }
-            if current_hashes != dict(database_expected_hashes):
+            if current_markers != tuple(markers) or current_hashes != dict(
+                database_expected_hashes
+            ):
                 raise ValueError("purge database preflight changed")
+            precommit_guard()
 
             now = _now_text()
             connection.execute(
@@ -2737,19 +2917,34 @@ class SQLiteRetroRepository(RetroRepository):
                     ),
                 )
 
-            marker_text = marker.decode("utf-8")
+            expected_locators = set(database_expected_hashes)
             for _, table, _, column in _PURGE_SQLITE_FIELDS:
                 rows = connection.execute(
-                    f"SELECT rowid AS purge_rowid, {column} AS content FROM {table}"
+                    f"SELECT rowid AS purge_rowid, {_purge_key_expression(table)} "
+                    f"AS record_key, {column} AS content FROM {table}"
                 ).fetchall()
                 for row in rows:
+                    locator = f"{table}:{row['record_key']}:{column}"
+                    if locator not in expected_locators:
+                        continue
                     value = row["content"]
-                    if isinstance(value, bytes):
-                        replacement: bytes | str = bytes(value).replace(marker, b"")
-                        changed = replacement != bytes(value)
+                    if table in {
+                        "candidates",
+                        "evidence",
+                        "review_attempts",
+                        "conflicts",
+                        "audit_log",
+                    }:
+                        replacement: bytes | str = (
+                            "{}"
+                            if column in {"review_json", "result_json", "detail_json"}
+                            else b""
+                            if isinstance(value, bytes)
+                            else ""
+                        )
                     else:
-                        replacement = str(value).replace(marker_text, "")
-                        changed = replacement != str(value)
+                        replacement = _remove_sensitive_values(value, markers)
+                    changed = replacement != value
                     if changed:
                         connection.execute(
                             f"UPDATE {table} SET {column} = ? WHERE rowid = ?",
@@ -2760,6 +2955,15 @@ class SQLiteRetroRepository(RetroRepository):
                 "DELETE FROM knowledge_evidence WHERE knowledge_id = ?",
                 (plan.knowledge_id,),
             )
+            candidate_ids = tuple(
+                sorted({str(row["candidate_id"]) for row in knowledge_rows})
+            )
+            if candidate_ids:
+                connection.execute(
+                    f"DELETE FROM candidate_evidence WHERE candidate_id IN "
+                    f"({','.join('?' for _ in candidate_ids)})",
+                    candidate_ids,
+                )
             connection.execute(
                 "DELETE FROM knowledge WHERE id = ?", (plan.knowledge_id,)
             )
@@ -2820,12 +3024,14 @@ class SQLiteRetroRepository(RetroRepository):
                 ORDER BY location_kind, id""",
                 (row["id"],),
             ).fetchall()
+            fingerprints = _purge_marker_fingerprints(metadata)
             return PurgeJournal(
                 id=str(row["id"]),
                 knowledge_id=str(row["knowledge_id"]),
                 project_id=str(metadata.get("project_id", "")),
                 marker_hash=str(metadata.get("marker_hash", "")),
                 marker_length=int(metadata.get("marker_length", 0)),
+                marker_fingerprints=fingerprints,
                 status=PurgeStatus(row["status"]),
                 tombstone_json=str(row["tombstone_json"]),
                 operations=tuple(
@@ -2919,17 +3125,31 @@ class SQLiteRetroRepository(RetroRepository):
             )
             _require_row(cursor, "purge operation", operation_id)
 
-    def purge_database_residual_kinds(self, marker: bytes) -> tuple[str, ...]:
+    def purge_database_residual_kinds(
+        self, markers: Sequence[bytes], locators: Sequence[str]
+    ) -> tuple[str, ...]:
         connection = self._connect()
         try:
-            return tuple(
-                sorted(
-                    {
-                        item.location_kind
-                        for item in self._purge_database_copies(connection, marker)
-                    }
-                )
-            )
+            expected = set(locators)
+            kinds: set[str] = set()
+            for kind, table, _, column in _PURGE_SQLITE_FIELDS:
+                rows = connection.execute(
+                    f"SELECT {_purge_key_expression(table)} AS record_key, "
+                    f"{column} AS content FROM {table}"
+                ).fetchall()
+                for row in rows:
+                    locator = f"{table}:{row['record_key']}:{column}"
+                    if locator not in expected:
+                        continue
+                    value = row["content"]
+                    content = (
+                        bytes(value)
+                        if isinstance(value, bytes)
+                        else str(value).encode("utf-8")
+                    )
+                    if _contains_sensitive_value(content, markers):
+                        kinds.add(kind)
+            return tuple(sorted(kinds))
         finally:
             connection.close()
 
@@ -3001,23 +3221,43 @@ class SQLiteRetroRepository(RetroRepository):
             str(kind): int(count) for kind, count in sorted(kind_counts.items())
         }
         with self.transaction() as connection:
-            cursor = connection.execute(
-                """UPDATE purge_jobs SET plan_hash = '', status = ?,
-                    tombstone_json = ?, residual_json = '[]', updated_at = ?
-                    WHERE id = ?""",
+            connection.execute("PRAGMA secure_delete = ON")
+            job = connection.execute(
+                "SELECT knowledge_id, created_at FROM purge_jobs WHERE id = ?",
+                (plan_id,),
+            ).fetchone()
+            if job is None:
+                raise KeyError(f"purge plan not found: {plan_id}")
+            operation_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM purge_operations WHERE purge_job_id = ?",
+                    (plan_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "DELETE FROM purge_operations WHERE purge_job_id = ?",
+                (plan_id,),
+            )
+            connection.execute(
+                "DELETE FROM audit_log WHERE entity_type = 'purge_job' AND entity_id = ?",
+                (plan_id,),
+            )
+            connection.execute("DELETE FROM purge_jobs WHERE id = ?", (plan_id,))
+            tombstone_id = f"purged-{uuid4()}"
+            now = _now_text()
+            connection.execute(
+                """INSERT INTO purge_jobs(
+                    id, knowledge_id, plan_hash, status, tombstone_json,
+                    residual_json, created_at, updated_at
+                ) VALUES (?, ?, '', ?, ?, '[]', ?, ?)""",
                 (
+                    tombstone_id,
+                    str(job["knowledge_id"]),
                     PurgeStatus.PURGED.value,
                     tombstone_json,
-                    _now_text(),
-                    plan_id,
+                    str(job["created_at"]),
+                    now,
                 ),
-            )
-            _require_row(cursor, "purge plan", plan_id)
-            connection.execute(
-                """UPDATE purge_operations
-                SET location = '', expected_hash = '', status = 'completed', error = ''
-                WHERE purge_job_id = ?""",
-                (plan_id,),
             )
             self._append_audit_record(
                 connection,
@@ -3025,10 +3265,10 @@ class SQLiteRetroRepository(RetroRepository):
                     actor=actor,
                     action="purge_succeeded",
                     entity_type="purge_job",
-                    entity_id=plan_id,
+                    entity_id=tombstone_id,
                     detail={
                         "kind_counts": safe_counts,
-                        "operation_count": sum(safe_counts.values()),
+                        "operation_count": operation_count,
                         "status": PurgeStatus.PURGED.value,
                     },
                 ),
@@ -3424,3 +3664,56 @@ def _has_sha256_window(content: bytes, expected_hash: str, length: int) -> bool:
         hashlib.sha256(content[offset : offset + length]).hexdigest() == expected_hash
         for offset in range(len(content) - length + 1)
     )
+
+
+def _purge_marker_fingerprints(
+    metadata: Mapping[str, Any],
+) -> tuple[tuple[str, int], ...]:
+    fingerprints: list[tuple[str, int]] = []
+    stored = metadata.get("marker_fingerprints", ())
+    if isinstance(stored, list):
+        for item in stored:
+            if not isinstance(item, dict):
+                continue
+            marker_hash = str(item.get("hash", ""))
+            try:
+                length = int(item.get("length", 0))
+            except (TypeError, ValueError):
+                continue
+            if len(marker_hash) == 64 and length > 0:
+                fingerprints.append((marker_hash, length))
+    if not fingerprints:
+        marker_hash = str(metadata.get("marker_hash", ""))
+        try:
+            length = int(metadata.get("marker_length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if len(marker_hash) == 64 and length > 0:
+            fingerprints.append((marker_hash, length))
+    return tuple(sorted(set(fingerprints), key=lambda item: (item[1], item[0])))
+
+
+def _purge_key_expression(table: str) -> str:
+    if table == "knowledge":
+        return "id || ':' || version"
+    if table == "managed_file_snapshots":
+        return "path"
+    return "id"
+
+
+def _remove_sensitive_values(
+    value: bytes | str, markers: Sequence[bytes]
+) -> bytes | str:
+    if isinstance(value, bytes):
+        result = bytes(value)
+        for marker in markers:
+            result = result.replace(marker, b"")
+        return result
+    result_text = str(value)
+    for marker in markers:
+        result_text = result_text.replace(marker.decode("utf-8"), "")
+    return result_text
+
+
+def _contains_sensitive_value(content: bytes, markers: Sequence[bytes]) -> bool:
+    return any(marker in content for marker in markers)

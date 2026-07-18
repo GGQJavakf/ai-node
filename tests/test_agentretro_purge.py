@@ -486,11 +486,7 @@ def test_apply_journals_and_scrubs_sqlite_in_one_stage_without_claiming_purged(
     for forbidden in ("text", "excerpt", "summary", "content_hash", "filename"):
         assert not hasattr(typed_tombstone, forbidden)
     operations = _table_rows(repository, "purge_operations")
-    assert len(operations) == len(plan.operations)
-    assert all(MARKER not in json.dumps(row) for row in operations)
-    assert all(row["location"] == "" for row in operations)
-    assert all(row["expected_hash"] == "" for row in operations)
-    assert all(row["status"] == "completed" for row in operations)
+    assert operations == []
     for path in service.log_paths + service.trace_paths:
         assert MARKER.encode() not in path.read_bytes()
     for root in service.backup_roots.values():
@@ -623,7 +619,6 @@ def test_interrupted_cleanup_recovers_from_persisted_journal_only(purge_fixture)
     before = _table_rows(repository, "purge_operations")
     assert any(row["status"] == "completed" for row in before)
     assert any(row["status"] == "failed" for row in before)
-    completed_ids = {row["id"] for row in before if row["status"] == "completed"}
 
     recovery_writes: list[Path] = []
 
@@ -644,8 +639,7 @@ def test_interrupted_cleanup_recovers_from_persisted_journal_only(purge_fixture)
     assert status is PurgeStatus.PURGED
     assert len(recovery_writes) == 1
     after = _table_rows(repository, "purge_operations")
-    assert completed_ids <= {row["id"] for row in after if row["status"] == "completed"}
-    assert all(row["location"] == "" and row["expected_hash"] == "" for row in after)
+    assert after == []
     assert MARKER.encode() not in repository.db_path.read_bytes()
     assert all(
         MARKER.encode() not in path.read_bytes()
@@ -1130,3 +1124,313 @@ def test_sqlite_stage_failure_rolls_back_the_journal_and_every_scrub(purge_fixtu
 
     assert _database_rows(failing) == before
     assert failing.get_purge_tombstone(KNOWLEDGE_ID) is None
+
+
+def test_purge_removes_sensitive_copies_related_to_every_knowledge_version(
+    purge_fixture,
+):
+    repository, service, managed, *_ = purge_fixture
+    current_marker = "agentretro-current-8d9cc8fb"
+    now = "2026-07-18T00:01:00+00:00"
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.execute(
+            "INSERT INTO evidence VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "evidence-b",
+                "session-a",
+                "fact",
+                "source-a",
+                "event-b",
+                "redacted",
+                "evidence-hash-b",
+                f"evidence {current_marker}",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "candidate-b",
+                "session-a",
+                "RULE",
+                PROJECT_ID,
+                "project",
+                current_marker,
+                "accepted",
+                0.99,
+                json.dumps({"reason": current_marker}),
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO candidate_evidence VALUES (?, ?)",
+            ("candidate-b", "evidence-b"),
+        )
+        connection.execute(
+            "INSERT INTO knowledge VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                KNOWLEDGE_ID,
+                2,
+                "candidate-b",
+                "RULE",
+                PROJECT_ID,
+                "project",
+                current_marker,
+                "active",
+                0.99,
+                "user",
+                None,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO knowledge_evidence VALUES (?, ?, ?)",
+            (KNOWLEDGE_ID, 2, "evidence-b"),
+        )
+        connection.execute(
+            "INSERT INTO projection_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "projection-old",
+                PROJECT_ID,
+                "knowledge_accept",
+                KNOWLEDGE_ID,
+                "input-old",
+                "synced",
+                f"error {MARKER}",
+                now,
+                now,
+            ),
+        )
+
+    managed.write_text(f"old {MARKER}\ncurrent {current_marker}\n", encoding="utf-8")
+    plan = service.plan(KNOWLEDGE_ID)
+
+    assert (
+        service.apply(plan.id, frozenset(operation.id for operation in plan.operations))
+        is PurgeStatus.PURGED
+    )
+
+    related_fields = {
+        "candidates": ("proposed_text", "review_json"),
+        "evidence": ("excerpt",),
+        "review_attempts": ("result_json", "error"),
+        "conflicts": ("reason", "merge_text"),
+        "sync_jobs": ("plan_json", "error"),
+        "projection_events": ("input_hash", "error"),
+        "managed_file_snapshots": ("owned_bytes",),
+        "audit_log": ("detail_json",),
+    }
+    for table, fields in related_fields.items():
+        for row in _table_rows(repository, table):
+            serialized = " ".join(str(row[field]) for field in fields)
+            assert MARKER not in serialized
+            assert current_marker not in serialized
+    raw_database = repository.db_path.read_bytes()
+    assert MARKER.encode() not in raw_database
+    assert current_marker.encode() not in raw_database
+    for path in (managed, *service.log_paths, *service.trace_paths):
+        assert MARKER.encode() not in path.read_bytes()
+
+
+def test_begin_purge_precommit_guard_rolls_back_when_registered_file_changes(
+    purge_fixture, monkeypatch: pytest.MonkeyPatch
+):
+    repository, service, managed, *_ = purge_fixture
+    plan = service.plan(KNOWLEDGE_ID)
+    confirmations = frozenset(operation.id for operation in plan.operations)
+    before_database = _database_rows(repository)
+    changed_content = f"concurrent edit {MARKER}\n"
+    original_begin = repository.begin_purge
+
+    def begin_with_precommit_race(*args, **kwargs):
+        guard = kwargs.get("precommit_guard")
+        if guard is None:
+            managed.write_text(changed_content, encoding="utf-8")
+        else:
+
+            def inject_change_then_guard():
+                managed.write_text(changed_content, encoding="utf-8")
+                guard()
+
+            kwargs["precommit_guard"] = inject_change_then_guard
+        return original_begin(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "begin_purge", begin_with_precommit_race)
+
+    with pytest.raises(StalePurgePlan):
+        service.apply(plan.id, confirmations)
+
+    assert _database_rows(repository) == before_database
+    assert _table_rows(repository, "purge_jobs") == []
+    assert _table_rows(repository, "purge_operations") == []
+    assert managed.read_text(encoding="utf-8") == changed_content
+
+
+def test_success_replaces_content_derived_journal_with_opaque_tombstone(
+    purge_fixture,
+):
+    repository, service, *_ = purge_fixture
+    plan = service.plan(KNOWLEDGE_ID)
+    content_derived_ids = {plan.id, *(operation.id for operation in plan.operations)}
+
+    assert (
+        service.apply(plan.id, frozenset(operation.id for operation in plan.operations))
+        is PurgeStatus.PURGED
+    )
+
+    assert _table_rows(repository, "purge_operations") == []
+    jobs = _table_rows(repository, "purge_jobs")
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job["id"] not in content_derived_ids
+    assert job["knowledge_id"] == KNOWLEDGE_ID
+    assert job["plan_hash"] == ""
+    assert job["status"] == PurgeStatus.PURGED.value
+    assert job["residual_json"] == "[]"
+    tombstone = json.loads(job["tombstone_json"])
+    assert set(tombstone) == {
+        "knowledge_id",
+        "actor",
+        "started_at",
+        "updated_at",
+        "status",
+        "operation_count",
+        "residual_count",
+    }
+    assert tombstone["knowledge_id"] == KNOWLEDGE_ID
+    assert tombstone["status"] == PurgeStatus.PURGED.value
+    assert tombstone["operation_count"] == len(plan.operations)
+    assert tombstone["residual_count"] == 0
+    raw_database = repository.db_path.read_bytes()
+    for derived_id in content_derived_ids:
+        assert derived_id.encode() not in raw_database
+    typed = repository.get_purge_tombstone(KNOWLEDGE_ID)
+    assert typed is not None
+    assert typed.status is PurgeStatus.PURGED
+
+
+def test_multi_marker_incomplete_journal_recovers_all_registered_files(
+    purge_fixture,
+):
+    repository, service, _, _, _, log, trace = purge_fixture
+    current_marker = "agentretro-current-recovery-cde370"
+    now = "2026-07-18T00:02:00+00:00"
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.execute(
+            "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "candidate-recovery-v2",
+                "session-a",
+                "RULE",
+                PROJECT_ID,
+                "project",
+                current_marker,
+                "accepted",
+                0.99,
+                "{}",
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO knowledge VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                KNOWLEDGE_ID,
+                2,
+                "candidate-recovery-v2",
+                "RULE",
+                PROJECT_ID,
+                "project",
+                current_marker,
+                "active",
+                0.99,
+                "user",
+                None,
+                now,
+            ),
+        )
+    log.write_text(f"old {MARKER}\n", encoding="utf-8")
+    trace.write_text(f"current {current_marker}\n", encoding="utf-8")
+    replace_count = 0
+
+    def fail_second_replace(source: Path, target: Path) -> None:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise OSError("injected multi-marker write failure")
+        source.replace(target)
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_second_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+    journal = repository.get_purge_journal(KNOWLEDGE_ID)
+    assert journal is not None
+    fingerprints = set(journal.marker_fingerprints)
+    assert (hashlib.sha256(MARKER.encode()).hexdigest(), len(MARKER)) in fingerprints
+    assert (
+        hashlib.sha256(current_marker.encode()).hexdigest(),
+        len(current_marker),
+    ) in fingerprints
+
+    restarted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+    )
+    assert restarted.recover(KNOWLEDGE_ID) is PurgeStatus.PURGED
+    for marker in (MARKER.encode(), current_marker.encode()):
+        for path in (*restarted.log_paths, *restarted.trace_paths):
+            if path.exists():
+                assert marker not in path.read_bytes()
+        for root in restarted.backup_roots.values():
+            for path in root.rglob("*"):
+                if path.is_file():
+                    assert marker not in path.read_bytes()
+
+
+def test_purge_preserves_unrelated_entity_with_identical_text(purge_fixture):
+    repository, service, *_ = purge_fixture
+    now = "2026-07-18T00:03:00+00:00"
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.execute(
+            "INSERT INTO candidates VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "candidate-unrelated-same-text",
+                "session-a",
+                "RULE",
+                "project-unrelated",
+                "project",
+                MARKER,
+                "pending_review",
+                0.9,
+                "{}",
+                now,
+                now,
+            ),
+        )
+    plan = service.plan(KNOWLEDGE_ID)
+
+    assert (
+        service.apply(plan.id, frozenset(operation.id for operation in plan.operations))
+        is PurgeStatus.PURGED
+    )
+    unrelated = next(
+        row
+        for row in _table_rows(repository, "candidates")
+        if row["id"] == "candidate-unrelated-same-text"
+    )
+    assert unrelated["proposed_text"] == MARKER

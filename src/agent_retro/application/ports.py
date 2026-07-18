@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from agent_retro.domain.models import (
     AcceptanceDecision,
@@ -271,11 +271,12 @@ class RetroRepository(Protocol):
         *,
         plan_hash: str,
         actor: str,
-        marker: bytes,
+        markers: Sequence[bytes],
         journal_locations: Mapping[str, str],
         database_expected_hashes: Mapping[str, str],
         recovery_payloads: Mapping[str, str],
         tombstone_json: str,
+        precommit_guard: Callable[[], None],
     ) -> None: ...
 
     def get_purge_tombstone(self, knowledge_id: str) -> PurgeTombstone | None: ...
@@ -284,7 +285,9 @@ class RetroRepository(Protocol):
         self, operation_id: str, status: str, error: str = ""
     ) -> None: ...
 
-    def purge_database_residual_kinds(self, marker: bytes) -> tuple[str, ...]: ...
+    def purge_database_residual_kinds(
+        self, markers: Sequence[bytes], locators: Sequence[str]
+    ) -> tuple[str, ...]: ...
 
     def finish_purge_incomplete(
         self,

@@ -292,6 +292,7 @@ class PurgeInspection:
     already_purged: bool
     sync_pending: bool
     copies: tuple[PurgeCopy, ...]
+    markers: tuple[bytes, ...]
 
 
 @dataclass(frozen=True)
@@ -324,6 +325,7 @@ class PurgeJournal:
     project_id: str
     marker_hash: str
     marker_length: int
+    marker_fingerprints: tuple[tuple[str, int], ...]
     status: PurgeStatus
     tombstone_json: str
     operations: tuple[PurgeJournalOperation, ...]

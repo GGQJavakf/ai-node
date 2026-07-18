@@ -138,7 +138,7 @@ class PurgeService:
         self.projection_result = None
         knowledge_id = self._knowledge_id_from_plan(plan_id)
         try:
-            current, copies, marker, project_id = self._current_manifest(knowledge_id)
+            current, copies, markers, project_id = self._current_manifest(knowledge_id)
         except (
             PurgeKnowledgeNotFound,
             KnowledgeAlreadyPurged,
@@ -178,10 +178,11 @@ class PurgeService:
             if copy.location_kind.startswith("sqlite_")
         }
         recovery_payloads = {
-            operation.id: self._recovery_payload(copy, marker)
+            operation.id: self._recovery_payload(copy, markers)
             for operation, copy in zip(current.operations, copies, strict=True)
             if copy.path is not None
         }
+        planned_file_manifest = self._file_manifest(copies)
         self.repository.begin_purge(
             current,
             plan_hash=json.dumps(
@@ -189,26 +190,36 @@ class PurgeService:
                     "manifest_hash": hashlib.sha256(
                         current.id.encode("utf-8")
                     ).hexdigest(),
-                    "marker_hash": hashlib.sha256(marker).hexdigest(),
-                    "marker_length": len(marker),
+                    "marker_hash": hashlib.sha256(markers[0]).hexdigest(),
+                    "marker_length": len(markers[0]),
+                    "marker_fingerprints": [
+                        {
+                            "hash": hashlib.sha256(marker).hexdigest(),
+                            "length": len(marker),
+                        }
+                        for marker in markers
+                    ],
                     "project_id": project_id,
                 },
                 separators=(",", ":"),
                 sort_keys=True,
             ),
             actor=actor,
-            marker=marker,
+            markers=markers,
             journal_locations=journal_locations,
             database_expected_hashes=database_expected,
             recovery_payloads=recovery_payloads,
             tombstone_json=tombstone,
+            precommit_guard=lambda: self._guard_file_manifest(
+                planned_file_manifest, copies, markers
+            ),
         )
         failed_kinds: list[str] = []
         for operation, copy in zip(current.operations, copies, strict=True):
             if copy.path is None:
                 continue
             try:
-                self._clean_registered_file(copy, operation.expected_hash, marker)
+                self._clean_registered_file(copy, operation.expected_hash, markers)
             except (OSError, ValueError):
                 failed_kinds.append(copy.location_kind)
                 self.repository.mark_purge_operation(
@@ -220,7 +231,7 @@ class PurgeService:
         return self._finish_file_stage(
             current,
             copies,
-            marker,
+            markers,
             project_id,
             tombstone,
             actor,
@@ -257,8 +268,9 @@ class PurgeService:
                 self.repository.mark_purge_operation(operation.id, "completed")
 
         residual_kinds = list(failed_kinds)
-        if self.repository.purge_database_has_fingerprint(
-            journal.marker_hash, journal.marker_length
+        if any(
+            self.repository.purge_database_has_fingerprint(marker_hash, length)
+            for marker_hash, length in journal.marker_fingerprints
         ):
             residual_kinds.append("sqlite")
         try:
@@ -428,8 +440,8 @@ class PurgeService:
                     self._validate_absent_child(root, target, "managed vault")
                     continue
                 resolved = self._validated_child(root, target, "managed vault")
-                if _has_sha256_window(
-                    resolved.read_bytes(), journal.marker_hash, journal.marker_length
+                if _has_any_fingerprint(
+                    resolved.read_bytes(), journal.marker_fingerprints
                 ):
                     kinds.add("managed_vault")
 
@@ -445,8 +457,8 @@ class PurgeService:
                     target = directory_path / name
                     if target.is_symlink():
                         raise ValueError("registered recovery root contains a symlink")
-                    if _has_sha256_window(
-                        target.read_bytes(), journal.marker_hash, journal.marker_length
+                    if _has_any_fingerprint(
+                        target.read_bytes(), journal.marker_fingerprints
                     ):
                         kinds.add(kind)
         for kind, paths in (
@@ -456,15 +468,15 @@ class PurgeService:
             for target in paths:
                 if target.is_symlink():
                     raise ValueError("registered recovery file is a symlink")
-                if target.exists() and _has_sha256_window(
-                    target.read_bytes(), journal.marker_hash, journal.marker_length
+                if target.exists() and _has_any_fingerprint(
+                    target.read_bytes(), journal.marker_fingerprints
                 ):
                     kinds.add(kind)
         return tuple(sorted(kinds))
 
     def _current_manifest(
         self, knowledge_id: str
-    ) -> tuple[PurgePlan, tuple[_ManifestCopy, ...], bytes, str]:
+    ) -> tuple[PurgePlan, tuple[_ManifestCopy, ...], tuple[bytes, ...], str]:
         inspection = self.repository.inspect_purge_database(knowledge_id)
         if inspection.already_purged:
             raise KnowledgeAlreadyPurged("knowledge is already purged")
@@ -473,16 +485,17 @@ class PurgeService:
         if inspection.sync_pending:
             raise KnowledgeSyncPending("knowledge projection is sync_pending")
 
-        marker = inspection.knowledge.text.encode("utf-8")
+        markers = inspection.markers
+        if not markers:
+            raise PurgeKnowledgeNotFound("knowledge has no purgeable content")
         copies = [
             _ManifestCopy(item.location_kind, item.locator, item.content)
             for item in inspection.copies
-            if marker in item.content
         ]
         copies.extend(
-            self._managed_vault_copies(inspection.knowledge.project_id, marker)
+            self._managed_vault_copies(inspection.knowledge.project_id, markers)
         )
-        copies.extend(self._registered_file_copies(marker))
+        copies.extend(self._registered_file_copies(markers))
         copies.sort(key=lambda item: (item.location_kind, item.locator))
 
         normalized_manifest = [
@@ -527,15 +540,54 @@ class PurgeService:
                 status=PurgeStatus.PLANNED,
             ),
             tuple(copies),
-            marker,
+            markers,
             inspection.knowledge.project_id,
         )
+
+    @staticmethod
+    def _file_manifest(
+        copies: Sequence[_ManifestCopy],
+    ) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            sorted(
+                (
+                    copy.location_kind,
+                    copy.locator,
+                    copy.expected_hash,
+                )
+                for copy in copies
+                if copy.path is not None
+            )
+        )
+
+    def _guard_file_manifest(
+        self,
+        planned_manifest: tuple[tuple[str, str, str], ...],
+        planned_copies: Sequence[_ManifestCopy],
+        markers: Sequence[bytes],
+    ) -> None:
+        current: dict[tuple[str, str], _ManifestCopy] = {}
+        for copy in planned_copies:
+            if copy.path is None or copy.location_kind != "managed_vault":
+                continue
+            target = self._runtime_target(copy)
+            if not target.exists():
+                continue
+            content = target.read_bytes()
+            if _contains_any(content, markers):
+                current[(copy.location_kind, copy.locator)] = _ManifestCopy(
+                    copy.location_kind, copy.locator, content, target
+                )
+        for copy in self._registered_file_copies(markers):
+            current[(copy.location_kind, copy.locator)] = copy
+        if self._file_manifest(tuple(current.values())) != planned_manifest:
+            raise StalePurgePlan("purge plan no longer matches current state")
 
     def _finish_file_stage(
         self,
         plan: PurgePlan,
         planned_copies: tuple[_ManifestCopy, ...],
-        marker: bytes,
+        markers: tuple[bytes, ...],
         project_id: str,
         tombstone_json: str,
         actor: str,
@@ -544,9 +596,14 @@ class PurgeService:
         residual_copies: list[_ManifestCopy] = []
         residual_kinds = list(failed_kinds)
         try:
-            residual_kinds.extend(self.repository.purge_database_residual_kinds(marker))
-            residual_copies.extend(self._managed_vault_copies(project_id, marker))
-            residual_copies.extend(self._registered_file_copies(marker))
+            residual_kinds.extend(
+                self.repository.purge_database_residual_kinds(
+                    markers,
+                    tuple(copy.locator for copy in planned_copies if copy.path is None),
+                )
+            )
+            residual_copies.extend(self._managed_vault_copies(project_id, markers))
+            residual_copies.extend(self._registered_file_copies(markers))
         except (OSError, ValueError):
             residual_kinds.append("verification")
 
@@ -581,7 +638,7 @@ class PurgeService:
                             copy.expected_hash,
                         ),
                         copy.locator,
-                        self._recovery_payload(copy, marker),
+                        self._recovery_payload(copy, markers),
                     )
                 )
             self.repository.finish_purge_incomplete(
@@ -612,16 +669,9 @@ class PurgeService:
         return PurgeStatus.PURGED
 
     @staticmethod
-    def _recovery_payload(copy: _ManifestCopy, marker: bytes) -> str:
-        ranges: list[list[int]] = []
-        offset = 0
-        while True:
-            found = copy.content.find(marker, offset)
-            if found < 0:
-                break
-            ranges.append([found, len(marker)])
-            offset = found + len(marker)
-        after = copy.content.replace(marker, b"")
+    def _recovery_payload(copy: _ManifestCopy, markers: Sequence[bytes]) -> str:
+        ranges = _removal_ranges(copy.content, markers)
+        after = _remove_ranges(copy.content, ranges)
         action = (
             "delete"
             if copy.location_kind.endswith("_backup") or not after
@@ -653,13 +703,13 @@ class PurgeService:
         )
 
     def _clean_registered_file(
-        self, copy: _ManifestCopy, expected_hash: str, marker: bytes
+        self, copy: _ManifestCopy, expected_hash: str, markers: Sequence[bytes]
     ) -> None:
         target = self._runtime_target(copy)
         if not target.exists():
             return
         before = target.read_bytes()
-        if marker not in before:
+        if not _contains_any(before, markers):
             return
         if hashlib.sha256(before).hexdigest() != expected_hash:
             raise ValueError("registered purge copy changed after preflight")
@@ -668,7 +718,7 @@ class PurgeService:
             if target.exists() or target.is_symlink():
                 raise OSError("purge backup delete readback failed")
             return
-        after = before.replace(marker, b"")
+        after = _remove_markers(before, markers)
         if not after:
             target.unlink()
             if target.exists() or target.is_symlink():
@@ -686,7 +736,9 @@ class PurgeService:
                 os.fsync(stream.fileno())
             os.chmod(temporary, target.stat().st_mode)
             self._replace(temporary, target)
-            if target.read_bytes() != after or marker in target.read_bytes():
+            if target.read_bytes() != after or _contains_any(
+                target.read_bytes(), markers
+            ):
                 raise OSError("purge replace readback failed")
         finally:
             if temporary.exists():
@@ -745,7 +797,7 @@ class PurgeService:
         return knowledge_id
 
     def _managed_vault_copies(
-        self, project_id: str, marker: bytes
+        self, project_id: str, markers: Sequence[bytes]
     ) -> list[_ManifestCopy]:
         if self.vault_root is None:
             return []
@@ -758,14 +810,14 @@ class PurgeService:
                 continue
             resolved = self._validated_child(root, target, "managed vault")
             content = resolved.read_bytes()
-            if marker in content:
+            if _contains_any(content, markers):
                 relative = resolved.relative_to(root).as_posix()
                 copies.append(
                     _ManifestCopy("managed_vault", relative, content, resolved)
                 )
         return copies
 
-    def _registered_file_copies(self, marker: bytes) -> list[_ManifestCopy]:
+    def _registered_file_copies(self, markers: Sequence[bytes]) -> list[_ManifestCopy]:
         copies: list[_ManifestCopy] = []
         seen: set[Path] = set()
         for kind, root_value in sorted(self.backup_roots.items()):
@@ -788,7 +840,7 @@ class PurgeService:
                         )
                     resolved = self._validated_child(root, candidate, kind)
                     content = resolved.read_bytes()
-                    if marker in content and resolved not in seen:
+                    if _contains_any(content, markers) and resolved not in seen:
                         seen.add(resolved)
                         copies.append(
                             _ManifestCopy(
@@ -813,7 +865,7 @@ class PurgeService:
                 if resolved in seen:
                     continue
                 content = resolved.read_bytes()
-                if marker in content:
+                if _contains_any(content, markers):
                     seen.add(resolved)
                     copies.append(
                         _ManifestCopy(kind, f"registered-{index}", content, resolved)
@@ -890,6 +942,56 @@ def _has_sha256_window(content: bytes, expected_hash: str, length: int) -> bool:
         hashlib.sha256(content[offset : offset + length]).hexdigest() == expected_hash
         for offset in range(len(content) - length + 1)
     )
+
+
+def _has_any_fingerprint(
+    content: bytes, fingerprints: Sequence[tuple[str, int]]
+) -> bool:
+    return any(
+        _has_sha256_window(content, marker_hash, length)
+        for marker_hash, length in fingerprints
+    )
+
+
+def _contains_any(content: bytes, markers: Sequence[bytes]) -> bool:
+    return any(marker in content for marker in markers)
+
+
+def _remove_markers(content: bytes, markers: Sequence[bytes]) -> bytes:
+    result = content
+    for marker in markers:
+        result = result.replace(marker, b"")
+    return result
+
+
+def _removal_ranges(content: bytes, markers: Sequence[bytes]) -> list[list[int]]:
+    intervals: list[tuple[int, int]] = []
+    for marker in markers:
+        offset = 0
+        while True:
+            found = content.find(marker, offset)
+            if found < 0:
+                break
+            intervals.append((found, found + len(marker)))
+            offset = found + len(marker)
+    merged: list[list[int]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][0] + merged[-1][1]:
+            previous_end = merged[-1][0] + merged[-1][1]
+            merged[-1][1] = max(previous_end, end) - merged[-1][0]
+        else:
+            merged.append([start, end - start])
+    return merged
+
+
+def _remove_ranges(content: bytes, ranges: Sequence[Sequence[int]]) -> bytes:
+    cursor = 0
+    chunks: list[bytes] = []
+    for start, length in ranges:
+        chunks.append(content[cursor:start])
+        cursor = start + length
+    chunks.append(content[cursor:])
+    return b"".join(chunks)
 
 
 def _safe_projection_token(value: object) -> str:
