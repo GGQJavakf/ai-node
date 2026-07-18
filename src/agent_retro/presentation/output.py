@@ -6,7 +6,12 @@ import json
 import sys
 from typing import TextIO
 
-from agent_retro.application.brief import BriefResult
+from agent_retro.application.brief import (
+    BriefResult,
+    brief_json_data as _brief_json_data,
+    render_brief_markdown as _render_brief_markdown,
+    render_brief_terminal as _render_brief_terminal,
+)
 from agent_retro.application.doctor import DoctorReport
 
 
@@ -35,32 +40,7 @@ def write_json(value: object, stream: TextIO | None = None) -> None:
 def brief_json_data(result: BriefResult) -> dict[str, object]:
     """Return the stable JSON view shared by all briefing output modes."""
 
-    return {
-        "conflict_ids": list(result.conflict_ids),
-        "estimated_tokens": result.estimated_tokens,
-        "generated_at": result.generated_at.isoformat(),
-        "items": [
-            {
-                "category": item.category,
-                "estimated_tokens": item.estimated_tokens,
-                "evidence_refs": list(item.evidence_refs),
-                "id": item.id,
-                "knowledge_type": item.knowledge_type,
-                "relevance_score": item.relevance_score,
-                "scope": item.scope,
-                "status": item.status,
-                "text": item.text,
-            }
-            for item in result.items
-        ],
-        "max_tokens": result.max_tokens,
-        "omitted": [{"id": item.id, "reason": item.reason} for item in result.omitted],
-        "omitted_count": result.omitted_count,
-        "project_id": result.project_id,
-        "stale_ids": list(result.stale_ids),
-        "task": result.task,
-        "warnings": list(result.warnings),
-    }
+    return _brief_json_data(result)
 
 
 def doctor_json_data(report: DoctorReport) -> dict[str, object]:
@@ -79,64 +59,8 @@ def render_doctor_terminal(report: DoctorReport) -> str:
 
 
 def render_brief_markdown(result: BriefResult) -> str:
-    data = brief_json_data(result)
-    lines = [
-        f"# AgentRetro Brief: {data['project_id']}",
-        "",
-        f"Task: {data['task']}",
-        f"Budget: {data['estimated_tokens']}/{data['max_tokens']}",
-        "",
-    ]
-    for item in result.items:
-        lines.extend(
-            [
-                f"## {item.category}: {item.id}",
-                "",
-                item.text,
-                "",
-                "Evidence: " + (", ".join(item.evidence_refs) or "none"),
-                "",
-            ]
-        )
-    _append_brief_health(lines, result)
-    return "\n".join(lines).rstrip() + "\n"
+    return _render_brief_markdown(result)
 
 
 def render_brief_terminal(result: BriefResult) -> str:
-    lines = [
-        f"AgentRetro Brief [{result.project_id}]",
-        f"Task: {result.task}",
-        f"Budget: {result.estimated_tokens}/{result.max_tokens}",
-    ]
-    for item in result.items:
-        evidence = ", ".join(item.evidence_refs) or "none"
-        lines.append(f"[{item.category}] {item.id}: {item.text} (evidence: {evidence})")
-    if result.omitted:
-        lines.append(
-            "Omitted: "
-            + ", ".join(f"{item.id}={item.reason}" for item in result.omitted)
-        )
-    if result.warnings:
-        lines.append("Warnings: " + ", ".join(result.warnings))
-    return "\n".join(lines) + "\n"
-
-
-def _append_brief_health(lines: list[str], result: BriefResult) -> None:
-    if result.omitted:
-        lines.extend(
-            [
-                "## Omitted",
-                "",
-                *[f"- {item.id}: {item.reason}" for item in result.omitted],
-                "",
-            ]
-        )
-    if result.warnings:
-        lines.extend(
-            [
-                "## Warnings",
-                "",
-                *[f"- {warning}" for warning in result.warnings],
-                "",
-            ]
-        )
+    return _render_brief_terminal(result)

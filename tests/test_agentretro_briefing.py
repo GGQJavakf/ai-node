@@ -204,7 +204,7 @@ def test_mandatory_rules_over_budget_fail_without_partial_result():
             BriefRequest(task="NPKI", project_id="NPKI", max_tokens=required - 1)
         )
 
-    assert caught.value.required_tokens == required
+    assert caught.value.required_tokens > required
     assert caught.value.max_tokens == required - 1
     assert caught.value.reason == "mandatory_rules_over_budget"
 
@@ -217,15 +217,15 @@ def test_later_items_are_included_or_omitted_atomically_by_utf8_byte_budget():
         "任务状态",
         valid_until=NOW + timedelta(days=1),
     )
-    lesson = _knowledge("lesson", KnowledgeType.LESSON, "经验很长经验很长")
-    budget = estimate_tokens(rule.text) + estimate_tokens(task.text)
+    lesson = _knowledge("lesson", KnowledgeType.LESSON, "经验很长" * 300)
+    budget = 400
 
     result = _service(BriefRepository([lesson, task, rule])).build(
         BriefRequest(task="任务经验", project_id="NPKI", max_tokens=budget)
     )
 
     assert [item.id for item in result.items] == ["rule", "task"]
-    assert result.estimated_tokens == budget
+    assert result.estimated_tokens <= budget
     assert [(item.id, item.reason) for item in result.omitted] == [("lesson", "budget")]
     assert result.omitted_count == 1
     assert estimate_tokens("abc中") == 2
@@ -341,3 +341,33 @@ def test_invalid_request_limits_fail_before_repository_access():
         service.build(BriefRequest(task="task", project_id="NPKI", max_tokens=0))
     with pytest.raises(ValueError, match="project_id"):
         service.build(BriefRequest(task="task", project_id=""))
+
+
+def test_budget_counts_complete_terminal_markdown_and_json_renderer_output():
+    rule = _knowledge(
+        "rule-with-visible-id",
+        KnowledgeType.RULE,
+        "x",
+        evidence_ids=("evidence-visible-1", "evidence-visible-2"),
+    )
+    request = BriefRequest(task="visible task", project_id="NPKI")
+
+    result = _service(BriefRepository([rule])).build(request)
+    rendered_costs = (
+        estimate_tokens(render_brief_terminal(result)),
+        estimate_tokens(render_brief_markdown(result)),
+        estimate_tokens(
+            json.dumps(brief_json_data(result), ensure_ascii=False, sort_keys=True)
+            + "\n"
+        ),
+    )
+
+    assert result.estimated_tokens == max(rendered_costs)
+    assert all(cost <= result.max_tokens for cost in rendered_costs)
+    assert result.items[0].estimated_tokens > estimate_tokens(rule.text)
+
+    with pytest.raises(BriefBudgetError) as caught:
+        _service(BriefRepository([rule])).build(
+            BriefRequest(task="visible task", project_id="NPKI", max_tokens=5)
+        )
+    assert caught.value.required_tokens > estimate_tokens(rule.text)

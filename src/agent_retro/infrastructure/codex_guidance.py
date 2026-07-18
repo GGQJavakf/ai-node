@@ -8,6 +8,7 @@ import hashlib
 import locale
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -197,6 +198,7 @@ class CodexGuidance:
                 current_hash or "missing",
                 planned_hash or "missing",
                 str(self._generation),
+                uuid.uuid4().hex,
             )
         ).encode("utf-8")
         preview_id = "guidance-" + _sha256(identity)[:24]

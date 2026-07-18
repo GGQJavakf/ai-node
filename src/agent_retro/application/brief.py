@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Callable
@@ -97,6 +98,152 @@ def estimate_tokens(value: str) -> int:
     return math.ceil(len(value.encode("utf-8")) / 3)
 
 
+def brief_json_data(result: BriefResult) -> dict[str, object]:
+    """Return the canonical stable JSON view used for output and budgeting."""
+
+    return {
+        "conflict_ids": list(result.conflict_ids),
+        "estimated_tokens": result.estimated_tokens,
+        "generated_at": result.generated_at.isoformat(),
+        "items": [_brief_item_data(item) for item in result.items],
+        "max_tokens": result.max_tokens,
+        "omitted": [{"id": item.id, "reason": item.reason} for item in result.omitted],
+        "omitted_count": result.omitted_count,
+        "project_id": result.project_id,
+        "stale_ids": list(result.stale_ids),
+        "task": result.task,
+        "warnings": list(result.warnings),
+    }
+
+
+def render_brief_markdown(result: BriefResult) -> str:
+    lines = [
+        f"# AgentRetro Brief: {result.project_id}",
+        "",
+        f"Task: {result.task}",
+        f"Budget: {result.estimated_tokens}/{result.max_tokens}",
+        "",
+    ]
+    for item in result.items:
+        lines.extend(
+            [
+                f"## {item.category}: {item.id}",
+                "",
+                item.text,
+                "",
+                "Evidence: " + (", ".join(item.evidence_refs) or "none"),
+                "",
+            ]
+        )
+    _append_brief_health(lines, result)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def render_brief_terminal(result: BriefResult) -> str:
+    lines = [
+        f"AgentRetro Brief [{result.project_id}]",
+        f"Task: {result.task}",
+        f"Budget: {result.estimated_tokens}/{result.max_tokens}",
+    ]
+    for item in result.items:
+        evidence = ", ".join(item.evidence_refs) or "none"
+        lines.append(f"[{item.category}] {item.id}: {item.text} (evidence: {evidence})")
+    if result.omitted:
+        lines.append(
+            "Omitted: "
+            + ", ".join(f"{item.id}={item.reason}" for item in result.omitted)
+        )
+    if result.warnings:
+        lines.append("Warnings: " + ", ".join(result.warnings))
+    return "\n".join(lines) + "\n"
+
+
+def render_brief_json(result: BriefResult) -> str:
+    return (
+        json.dumps(brief_json_data(result), ensure_ascii=False, sort_keys=True) + "\n"
+    )
+
+
+def renderer_token_cost(result: BriefResult) -> int:
+    """Conservatively budget the largest complete visible renderer."""
+
+    return max(
+        estimate_tokens(render_brief_terminal(result)),
+        estimate_tokens(render_brief_markdown(result)),
+        estimate_tokens(render_brief_json(result)),
+    )
+
+
+def _brief_item_data(item: BriefItem) -> dict[str, object]:
+    return {
+        "category": item.category,
+        "estimated_tokens": item.estimated_tokens,
+        "evidence_refs": list(item.evidence_refs),
+        "id": item.id,
+        "knowledge_type": item.knowledge_type,
+        "relevance_score": item.relevance_score,
+        "scope": item.scope,
+        "status": item.status,
+        "text": item.text,
+    }
+
+
+def _append_brief_health(lines: list[str], result: BriefResult) -> None:
+    if result.omitted:
+        lines.extend(
+            [
+                "## Omitted",
+                "",
+                *[f"- {item.id}: {item.reason}" for item in result.omitted],
+                "",
+            ]
+        )
+    if result.warnings:
+        lines.extend(
+            [
+                "## Warnings",
+                "",
+                *[f"- {warning}" for warning in result.warnings],
+                "",
+            ]
+        )
+
+
+def _with_item_cost(item: BriefItem) -> BriefItem:
+    current = item
+    for _ in range(8):
+        terminal = (
+            f"[{current.category}] {current.id}: {current.text} "
+            f"(evidence: {', '.join(current.evidence_refs) or 'none'})\n"
+        )
+        markdown = (
+            f"## {current.category}: {current.id}\n\n{current.text}\n\n"
+            f"Evidence: {', '.join(current.evidence_refs) or 'none'}\n"
+        )
+        json_text = json.dumps(
+            _brief_item_data(current), ensure_ascii=False, sort_keys=True
+        )
+        cost = max(
+            estimate_tokens(terminal),
+            estimate_tokens(markdown),
+            estimate_tokens(json_text),
+        )
+        if cost == current.estimated_tokens:
+            return current
+        current = replace(current, estimated_tokens=cost)
+    return current
+
+
+def _with_result_cost(result: BriefResult) -> BriefResult:
+    current = result
+    for _ in range(8):
+        cost = renderer_token_cost(current)
+        if cost == current.estimated_tokens:
+            return current
+        current = replace(current, estimated_tokens=cost)
+    return current
+
+
 def relevance_score(task: str, item: Knowledge, at: datetime) -> float:
     task_tokens = tokenize(task)
     item_tokens = tokenize(item.text)
@@ -178,62 +325,90 @@ class BriefService:
         for values in categories.values():
             values.sort(key=lambda value: (-value[1], value[0].id))
 
-        mandatory = [
-            *categories["project_rule"],
-            *categories["global_rule"],
-        ]
-        required_tokens = sum(estimate_tokens(item.text) for item, _ in mandatory)
-        if required_tokens > max_tokens:
-            raise BriefBudgetError(required_tokens, max_tokens)
-
-        selected: list[BriefItem] = []
-        consumed = 0
-        for category in (
-            "project_rule",
-            "global_rule",
-            "task_state",
-            "lesson",
-        ):
-            for item, score in categories[category]:
-                self._check_deadline(deadline)
-                cost = estimate_tokens(item.text)
-                if category not in {"project_rule", "global_rule"} and (
-                    consumed + cost > max_tokens
-                ):
-                    omitted.append(BriefOmission(item.id, "budget"))
-                    continue
-                selected.append(
-                    BriefItem(
-                        id=item.id,
-                        category=category,
-                        knowledge_type=item.knowledge_type.value,
-                        scope=item.scope,
-                        text=item.text,
-                        status=item.status,
-                        evidence_refs=tuple(sorted(item.evidence_ids)),
-                        relevance_score=score,
-                        estimated_tokens=cost,
-                    )
-                )
-                consumed += cost
-
         conflicts = self.repository.list_open_conflicts(project_id)
         conflict_ids = tuple(sorted(item.id for item in conflicts))
         omitted.extend(BriefOmission(item_id, "conflict") for item_id in conflict_ids)
         warnings = self._warnings(project_id)
+        by_category: dict[str, list[BriefItem]] = {
+            "project_rule": [],
+            "global_rule": [],
+            "task_state": [],
+            "lesson": [],
+        }
+        for category, values in categories.items():
+            for item, score in values:
+                self._check_deadline(deadline)
+                by_category[category].append(
+                    _with_item_cost(
+                        BriefItem(
+                            id=item.id,
+                            category=category,
+                            knowledge_type=item.knowledge_type.value,
+                            scope=item.scope,
+                            text=item.text,
+                            status=item.status,
+                            evidence_refs=tuple(sorted(item.evidence_ids)),
+                            relevance_score=score,
+                            estimated_tokens=0,
+                        )
+                    )
+                )
+
+        mandatory = [
+            *by_category["project_rule"],
+            *by_category["global_rule"],
+        ]
+        optional = [*by_category["task_state"], *by_category["lesson"]]
+        base_omitted = [
+            *omitted,
+            *[BriefOmission(item.id, "budget") for item in optional],
+        ]
+
+        def result_for(
+            items: list[BriefItem], current_omitted: list[BriefOmission]
+        ) -> BriefResult:
+            return _with_result_cost(
+                BriefResult(
+                    task=task,
+                    project_id=project_id,
+                    generated_at=at,
+                    max_tokens=max_tokens,
+                    estimated_tokens=0,
+                    items=tuple(items),
+                    omitted=tuple(
+                        sorted(
+                            current_omitted, key=lambda value: (value.id, value.reason)
+                        )
+                    ),
+                    stale_ids=tuple(sorted(stale_ids)),
+                    conflict_ids=conflict_ids,
+                    warnings=warnings,
+                )
+            )
+
+        selected = list(mandatory)
+        current_omitted = list(base_omitted)
+        required = result_for(selected, current_omitted)
         self._check_deadline(deadline)
-        return BriefResult(
-            task=task,
-            project_id=project_id,
-            generated_at=at,
-            max_tokens=max_tokens,
-            estimated_tokens=consumed,
-            items=tuple(selected),
-            omitted=tuple(sorted(omitted, key=lambda value: (value.id, value.reason))),
-            stale_ids=tuple(sorted(stale_ids)),
-            conflict_ids=conflict_ids,
-            warnings=warnings,
-        )
+        if required.estimated_tokens > max_tokens:
+            raise BriefBudgetError(required.estimated_tokens, max_tokens)
+
+        for item in optional:
+            self._check_deadline(deadline)
+            trial_omitted = [
+                omission
+                for omission in current_omitted
+                if not (omission.id == item.id and omission.reason == "budget")
+            ]
+            trial = result_for([*selected, item], trial_omitted)
+            self._check_deadline(deadline)
+            if trial.estimated_tokens <= max_tokens:
+                selected.append(item)
+                current_omitted = trial_omitted
+
+        result = result_for(selected, current_omitted)
+        self._check_deadline(deadline)
+        return result
 
     def _warnings(self, project_id: str) -> tuple[str, ...]:
         warnings = [

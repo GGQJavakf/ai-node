@@ -174,6 +174,34 @@ def test_preview_id_is_in_memory_current_and_hash_bound(tmp_path):
     assert not backup_root.exists()
 
 
+def test_cross_process_apply_remove_reapply_uses_unique_retained_backups(tmp_path):
+    codex_home, backup_root, target = _home(tmp_path)
+    original = b"user rules\n"
+    target.write_bytes(original)
+
+    first = CodexGuidance(codex_home, backup_root)
+    first_preview = first.preview()
+    first_result = first.apply(first_preview.id)
+
+    second = CodexGuidance(codex_home, backup_root)
+    remove_preview = second.preview_remove()
+    second.remove(remove_preview.id)
+    assert target.read_bytes() == original
+
+    before_reapply_preview = _snapshot(tmp_path)
+    third = CodexGuidance(codex_home, backup_root)
+    third_preview = third.preview()
+    assert _snapshot(tmp_path) == before_reapply_preview
+    third_result = third.apply(third_preview.id)
+
+    assert discover_managed_instruction(codex_home)
+    assert first_result.backup_path is not None
+    assert third_result.backup_path is not None
+    assert first_result.backup_path != third_result.backup_path
+    assert first_result.backup_path.read_bytes() == original
+    assert third_result.backup_path.read_bytes() == original
+
+
 @pytest.mark.parametrize(
     "content",
     [
