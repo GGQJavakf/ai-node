@@ -11,6 +11,7 @@ from agent_retro.application.merge import (
     MergePlan,
     MergeService,
     SensitiveMergeContentError,
+    canonical_merge_path_identity,
 )
 from agent_retro.infrastructure.redaction import Redactor
 
@@ -32,6 +33,10 @@ class MergeProposalGateway(Protocol):
         *,
         timeout: int,
     ) -> MergeProposal: ...
+
+
+class MergeProposalScopeError(ValueError):
+    """A semantic proposal escaped its project Markdown boundary."""
 
 
 class MergePlanner:
@@ -138,6 +143,7 @@ class MergePlanner:
             )
         ):
             raise ValueError("merge_planner_empty_proposal")
+        self._validate_proposal_scope(project_id, proposal)
         replacements = {
             Path(path): content.encode("utf-8")
             for path, content in proposal.replacements.items()
@@ -149,3 +155,37 @@ class MergePlanner:
             renames=proposal.renames,
             conflicts=proposal.conflicts,
         )
+
+    def _validate_proposal_scope(
+        self, project_id: str, proposal: MergeProposal
+    ) -> None:
+        paths = [*proposal.replacements, *proposal.deletes]
+        for source, target in proposal.renames:
+            paths.extend((source, target))
+        try:
+            expected = canonical_merge_path_identity(Path("项目") / project_id).split(
+                "/"
+            )
+            vault = self.vault_root.resolve(strict=True)
+            for raw_path in paths:
+                path = Path(raw_path)
+                if path.is_absolute() or not path.parts or ".." in path.parts:
+                    raise ValueError
+                if tuple(path.parts[:2]) != ("项目", project_id):
+                    raise ValueError
+                identity = canonical_merge_path_identity(path).split("/")
+                if (
+                    len(identity) <= len(expected)
+                    or identity[: len(expected)] != expected
+                    or ".obsidian" in identity
+                    or not identity[-1].endswith(".md")
+                ):
+                    raise ValueError
+                current = self.vault_root
+                for part in path.parts:
+                    current = current / part
+                    if current.exists() and current.is_symlink():
+                        raise ValueError
+                (self.vault_root / path).resolve(strict=False).relative_to(vault)
+        except (OSError, TypeError, ValueError):
+            raise MergeProposalScopeError("merge_proposal_scope_invalid") from None

@@ -1163,6 +1163,9 @@ class SQLiteRetroRepository(RetroRepository):
         managed_path: Path,
         vault_managed_hash: str,
         vault_full_hash: str,
+        snapshot_kind: str,
+        snapshot_owned_bytes: bytes,
+        snapshot_event_id: str,
     ) -> Knowledge:
         """Atomically supersede the adopted identity and advance its baseline."""
 
@@ -1216,6 +1219,14 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if state is None or str(state["project_id"]) != adoption.project_id:
                 raise ValueError("vault_adoption_baseline_changed")
+            owned_bytes = bytes(snapshot_owned_bytes)
+            owned_hash = hashlib.sha256(owned_bytes).hexdigest()
+            if (
+                snapshot_kind != "full"
+                or owned_hash != vault_managed_hash
+                or owned_hash != vault_full_hash
+            ):
+                raise ValueError("vault_adoption_snapshot_invalid")
             knowledge = self._transition_knowledge(
                 connection,
                 current,
@@ -1239,12 +1250,59 @@ class SQLiteRetroRepository(RetroRepository):
                 updated_at = ? WHERE path = ?""",
                 (vault_managed_hash, vault_full_hash, _now_text(), str(managed_path)),
             )
+            self._upsert_managed_file_snapshot(
+                connection,
+                path=managed_path,
+                project_id=adoption.project_id,
+                snapshot_kind=snapshot_kind,
+                owned_bytes=owned_bytes,
+                managed_hash=vault_managed_hash,
+                full_hash=vault_full_hash,
+                event_id=snapshot_event_id,
+            )
             connection.execute(
                 """UPDATE vault_adoptions SET status = 'accepted', updated_at = ?
                 WHERE candidate_id = ?""",
                 (_now_text(), candidate_id),
             )
             return knowledge
+
+    def _upsert_managed_file_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        path: Path,
+        project_id: str,
+        snapshot_kind: str,
+        owned_bytes: bytes,
+        managed_hash: str,
+        full_hash: str,
+        event_id: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO managed_file_snapshots(
+                path, project_id, snapshot_kind, owned_bytes,
+                managed_hash, full_hash, event_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET
+                project_id = excluded.project_id,
+                snapshot_kind = excluded.snapshot_kind,
+                owned_bytes = excluded.owned_bytes,
+                managed_hash = excluded.managed_hash,
+                full_hash = excluded.full_hash,
+                event_id = excluded.event_id,
+                updated_at = excluded.updated_at""",
+            (
+                str(path),
+                project_id,
+                snapshot_kind,
+                owned_bytes,
+                managed_hash,
+                full_hash,
+                event_id,
+                _now_text(),
+            ),
+        )
 
     def reject_candidate(self, candidate_id: str, actor: str) -> Candidate:
         with self.transaction() as connection:

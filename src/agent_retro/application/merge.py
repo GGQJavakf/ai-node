@@ -179,6 +179,7 @@ class MergeService:
             exists, kind, before = self._read_state(relative)
             if kind not in ("missing", "file"):
                 raise StalePlanError("merge_target_not_file")
+            self._validate_existing_merge_bytes(before)
             target_values.append(
                 MergeTarget(
                     path=relative,
@@ -199,6 +200,7 @@ class MergeService:
                 raise StalePlanError("merge_delete_source_missing")
             if kind != "file":
                 raise StalePlanError("merge_delete_source_not_file")
+            self._validate_existing_merge_bytes(before)
             path_identity = _windows_path_identity(relative)
             identity = ["delete", path_identity, exists, kind, sha256_bytes(before)]
             delete_values.append(
@@ -223,6 +225,8 @@ class MergeService:
                 raise StalePlanError("merge_rename_source_missing")
             if source_kind != "file" or target_kind not in ("missing", "file"):
                 raise StalePlanError("merge_rename_target_not_file")
+            self._validate_existing_merge_bytes(source_bytes)
+            self._validate_existing_merge_bytes(target_bytes)
             source_hash = sha256_bytes(source_bytes)
             target_hash = sha256_bytes(target_bytes)
             source_identity = _windows_path_identity(source_relative)
@@ -704,6 +708,9 @@ class MergeService:
                 managed_path=target,
                 vault_managed_hash=adoption.vault_managed_hash,
                 vault_full_hash=adoption.vault_full_hash,
+                snapshot_kind="full",
+                snapshot_owned_bytes=current,
+                snapshot_event_id=f"vault-adoption:{candidate_id}",
             )
         except ValueError as exc:
             if str(exc).startswith("vault_adoption_"):
@@ -801,6 +808,17 @@ class MergeService:
                 raise SensitiveMergeContentError("sensitive_merge_content") from exc
             if redactor.contains_sensitive_value(text):
                 raise SensitiveMergeContentError("sensitive_merge_content")
+
+    @staticmethod
+    def _validate_existing_merge_bytes(content: bytes) -> None:
+        if not content:
+            return
+        try:
+            text = bytes(content).decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise SensitiveMergeContentError("sensitive_merge_content") from None
+        if Redactor().contains_sensitive_value(text):
+            raise SensitiveMergeContentError("sensitive_merge_content")
 
     @staticmethod
     def _validate_unique_paths(plan: MergePlan) -> None:

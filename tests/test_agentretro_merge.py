@@ -441,6 +441,102 @@ def test_vault_adoption_transaction_failure_rolls_back_every_state(
     assert repository.get_managed_file_state(target) == baseline
 
 
+def test_vault_adoption_snapshot_baseline_survives_projection_failure_and_reconciles_next_edit(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _synchronize_all_targets(tmp_path)
+    target = vault / "项目" / "NPKI" / "AgentRetro" / "规则.md"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    adopted_bytes = target.read_bytes()
+    candidate_id = service.reconcile(
+        next(
+            item
+            for item in service.find_external_edits("NPKI")
+            if item.path == Path("项目/NPKI/AgentRetro/规则.md")
+        ).id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    summary.write_text("malformed summary boundary\n", encoding="utf-8")
+
+    accepted = KnowledgeService(repository, adoption_service=service).accept(
+        candidate_id, actor="user"
+    )
+    state = repository.get_managed_file_state(target)
+    snapshot = repository.get_managed_file_snapshot(target)
+
+    assert state.managed_hash == sha256_bytes(adopted_bytes)
+    assert state.full_hash == sha256_bytes(adopted_bytes)
+    assert snapshot.snapshot_kind == "full"
+    assert snapshot.owned_bytes == adopted_bytes
+    assert snapshot.managed_hash == state.managed_hash
+    assert snapshot.full_hash == state.full_hash
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    )
+    projection = coordinator.after_commit(
+        "adoption-follow-up", accepted.id, accepted.project_id
+    )
+    assert projection.status.value == "sync_pending"
+
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("手工规则", "二次手工规则"),
+        encoding="utf-8",
+    )
+    conflicts = service.find_external_edits("NPKI")
+    conflict = next(
+        item for item in conflicts if item.path == Path("项目/NPKI/AgentRetro/规则.md")
+    )
+
+    assert conflict.status == "external_edit_conflict"
+    assert not conflict.id.startswith("reconcile-diagnostic-")
+    assert repository.get_sync_job(conflict.id).status == "external_edit_conflict"
+
+
+def test_vault_adoption_snapshot_failure_rolls_back_knowledge_state_and_snapshot(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository, service, _, target = _synchronize_rule(tmp_path)
+    baseline_state = repository.get_managed_file_state(target)
+    baseline_snapshot = repository.get_managed_file_snapshot(target)
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        service.find_external_edits("NPKI")[0].id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    original_id = repository.list_project_knowledge("NPKI")[0].id
+
+    def fail_snapshot(*args, **kwargs):
+        raise sqlite3.OperationalError("injected adoption snapshot failure")
+
+    monkeypatch.setattr(
+        repository, "_upsert_managed_file_snapshot", fail_snapshot, raising=False
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="adoption snapshot failure"):
+        KnowledgeService(repository, adoption_service=service).accept(
+            candidate_id, actor="user"
+        )
+
+    assert repository.knowledge_versions(original_id)[-1].version == 1
+    assert (
+        repository.get_candidate(candidate_id).status is CandidateStatus.PENDING_REVIEW
+    )
+    assert repository.get_vault_adoption(candidate_id).status == "pending_review"
+    assert repository.get_managed_file_state(target) == baseline_state
+    assert repository.get_managed_file_snapshot(target) == baseline_snapshot
+
+
 def test_vault_drift_after_accept_is_projection_conflict_not_baseline_adoption(
     tmp_path: Path,
 ) -> None:
@@ -828,6 +924,142 @@ def test_sensitive_merge_plan_fails_before_persistence_or_output(
     assert not any(path.name.startswith("merge-") for path in vault.rglob("*"))
 
 
+@pytest.mark.parametrize(
+    "operation", ["replacement", "delete", "rename_source", "rename_target"]
+)
+def test_existing_sensitive_merge_input_fails_before_plan_or_backup(
+    tmp_path: Path, operation: str
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    token = "TOKEN_REVIEW_UNIQUE_3186"
+    sensitive = vault / "sensitive.md"
+    sensitive.write_text(f"token={token}\n", encoding="utf-8")
+    safe = vault / "safe.md"
+    safe.write_text("safe\n", encoding="utf-8")
+    replacements = {}
+    deletes = ()
+    renames = ()
+    if operation == "replacement":
+        replacements = {Path("sensitive.md"): b"safe replacement\n"}
+    elif operation == "delete":
+        deletes = (Path("sensitive.md"),)
+    elif operation == "rename_source":
+        renames = ((Path("sensitive.md"), Path("renamed.md")),)
+    else:
+        renames = ((Path("safe.md"), Path("sensitive.md")),)
+
+    with pytest.raises(SensitiveMergeContentError, match="sensitive_merge_content"):
+        service.create_plan(
+            "NPKI",
+            replacements=replacements,
+            deletes=deletes,
+            renames=renames,
+        )
+
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
+    assert token.encode() not in repository.db_path.read_bytes()
+    for state_file in (tmp_path / "backups").rglob("*"):
+        if state_file.is_file():
+            assert token.encode() not in state_file.read_bytes()
+
+
+def test_cli_existing_sensitive_before_is_sanitized_and_persists_no_plan(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    repository, _, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    token = "TOKEN_REVIEW_UNIQUE_6543"
+    (project_root / "source.md").write_text(
+        f"token={token}\nproject notes\n", encoding="utf-8"
+    )
+    gateway = _ProposalGateway(
+        MergeProposal(
+            replacements={Path("项目/NPKI/source.md"): "safe replacement\n"},
+            deletes=(),
+            renames=(),
+            conflicts=(),
+        )
+    )
+
+    def build(settings, current_repository):
+        return MergePlanner(
+            MergeService(
+                current_repository,
+                settings.obsidian_root,
+                settings.backup_dir,
+            ),
+            settings.obsidian_root,
+            gateway,
+            max_files=10,
+            max_bytes=4096,
+            timeout_seconds=10,
+        )
+
+    monkeypatch.setattr(retro_cli, "_build_merge_planner", build)
+    env = {
+        "AGENTRETRO_HOME": str(tmp_path),
+        "AGENTRETRO_DB_PATH": str(repository.db_path),
+        "AGENTRETRO_BACKUP_DIR": str(tmp_path / "backups"),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+    }
+
+    assert (
+        main(
+            [
+                "--json",
+                "merge",
+                "plan",
+                "--project",
+                "NPKI",
+                "--instruction",
+                "organize",
+            ],
+            home=tmp_path,
+            env=env,
+        )
+        == 2
+    )
+    output = capsys.readouterr().out
+    assert token not in output
+    assert json.loads(output)["data"]["detail"] == "sensitive_merge_content"
+    assert token.encode() not in repository.db_path.read_bytes()
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_existing_non_utf8_merge_input_fails_before_plan_persistence(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    (vault / "binary.md").write_bytes(b"\xff\xfe")
+
+    with pytest.raises(SensitiveMergeContentError, match="sensitive_merge_content"):
+        service.create_plan(
+            "NPKI",
+            replacements={Path("binary.md"): b"safe replacement\n"},
+        )
+
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
 def test_sensitive_vault_adoption_persists_only_redacted_text_and_blocker(
     tmp_path: Path, capsys
 ) -> None:
@@ -1002,6 +1234,102 @@ def test_semantic_merge_planner_rejects_sensitive_source_path_before_gateway(
 
     assert gateway.calls == []
     assert token.encode() not in repository.db_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("operation", "path"),
+    [
+        ("replacement", Path("项目/OTHER/out.md")),
+        ("replacement", Path("项目/npki/out.md")),
+        ("replacement", Path("outside.md")),
+        ("replacement", Path(".obsidian/plugins/out.md")),
+        ("replacement", Path("项目/NPKI")),
+        ("replacement", Path("项目/NPKI/out.txt")),
+        ("replacement", Path("项目/NPKI/CON.md")),
+        ("delete", Path("项目/OTHER/out.md")),
+        ("rename_source", Path("项目/OTHER/out.md")),
+        ("rename_target", Path("项目/OTHER/out.md")),
+    ],
+)
+def test_semantic_merge_proposal_paths_are_strictly_project_markdown_scoped(
+    tmp_path: Path, operation: str, path: Path
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    (project_root / "source.md").write_text("source\n", encoding="utf-8")
+    replacements = {path: "output\n"} if operation == "replacement" else {}
+    deletes = (path,) if operation == "delete" else ()
+    renames = ()
+    if operation == "rename_source":
+        renames = ((path, Path("项目/NPKI/renamed.md")),)
+    elif operation == "rename_target":
+        renames = ((Path("项目/NPKI/source.md"), path),)
+    gateway = _ProposalGateway(MergeProposal(replacements, deletes, renames, ()))
+    planner = MergePlanner(
+        service,
+        vault,
+        gateway,
+        max_files=10,
+        max_bytes=4096,
+        timeout_seconds=10,
+    )
+    before_files = {
+        item.relative_to(vault).as_posix(): item.read_bytes()
+        for item in vault.rglob("*")
+        if item.is_file()
+    }
+
+    with pytest.raises(ValueError, match="merge_proposal_scope_invalid") as error:
+        planner.plan("NPKI", "organize")
+
+    assert error.type.__name__ == "MergeProposalScopeError"
+    assert gateway.calls
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
+    after_files = {
+        item.relative_to(vault).as_posix(): item.read_bytes()
+        for item in vault.rglob("*")
+        if item.is_file()
+    }
+    assert after_files == before_files
+
+
+def test_semantic_merge_proposal_rejects_existing_symlink_path_with_typed_error(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    (project_root / "source.md").write_text("source\n", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+    link = project_root / "linked"
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    gateway = _ProposalGateway(
+        MergeProposal({Path("项目/NPKI/linked/out.md"): "output\n"}, (), (), ())
+    )
+    planner = MergePlanner(service, vault, gateway)
+
+    with pytest.raises(ValueError, match="merge_proposal_scope_invalid") as error:
+        planner.plan("NPKI", "organize")
+
+    assert error.type.__name__ == "MergeProposalScopeError"
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_llm_merge_gateway_receives_only_redacted_inputs_and_returns_typed_plan(
