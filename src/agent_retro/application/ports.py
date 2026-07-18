@@ -81,7 +81,6 @@ class RetroRepository(Protocol):
         vault_managed_hash: str,
         vault_full_hash: str,
         snapshot_kind: str,
-        snapshot_owned_bytes: bytes,
         snapshot_event_id: str,
     ) -> Knowledge: ...
 

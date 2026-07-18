@@ -44,6 +44,7 @@ from agent_retro.domain.models import (
     VaultAdoption,
 )
 from agent_retro.domain.projection import ProjectionFenceError, projection_input_hash
+from agent_retro.infrastructure.obsidian import render_aggregate
 
 
 _SCHEMA_VERSION = 2
@@ -1164,7 +1165,6 @@ class SQLiteRetroRepository(RetroRepository):
         vault_managed_hash: str,
         vault_full_hash: str,
         snapshot_kind: str,
-        snapshot_owned_bytes: bytes,
         snapshot_event_id: str,
     ) -> Knowledge:
         """Atomically supersede the adopted identity and advance its baseline."""
@@ -1219,13 +1219,7 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if state is None or str(state["project_id"]) != adoption.project_id:
                 raise ValueError("vault_adoption_baseline_changed")
-            owned_bytes = bytes(snapshot_owned_bytes)
-            owned_hash = hashlib.sha256(owned_bytes).hexdigest()
-            if (
-                snapshot_kind != "full"
-                or owned_hash != vault_managed_hash
-                or owned_hash != vault_full_hash
-            ):
+            if snapshot_kind != "full":
                 raise ValueError("vault_adoption_snapshot_invalid")
             knowledge = self._transition_knowledge(
                 connection,
@@ -1244,6 +1238,17 @@ class SQLiteRetroRepository(RetroRepository):
                 """UPDATE candidates SET status = ?, proposed_text = ?, updated_at = ?
                 WHERE id = ?""",
                 (candidate_status.value, text, _now_text(), candidate_id),
+            )
+            project_knowledge = self._list_project_knowledge(
+                connection, adoption.project_id
+            )
+            owned_bytes = render_aggregate(
+                knowledge.knowledge_type,
+                (
+                    item
+                    for item in project_knowledge
+                    if item.knowledge_type is knowledge.knowledge_type
+                ),
             )
             connection.execute(
                 """UPDATE managed_file_state SET managed_hash = ?, full_hash = ?,

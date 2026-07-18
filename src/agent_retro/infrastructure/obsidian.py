@@ -142,6 +142,22 @@ def parse_aggregate_entries(content: bytes) -> dict[str, str]:
     return entries
 
 
+def render_aggregate(kind: KnowledgeType, items: Iterable[Knowledge]) -> bytes:
+    """Render one complete aggregate from committed knowledge metadata."""
+
+    title = _FILENAMES[kind].removesuffix(".md")
+    ordered = sorted(items, key=lambda item: item.id)
+    active = [item for item in ordered if item.status == "active"]
+    archived = [item for item in ordered if item.status == "archived"]
+    lines = [f"# {title}", ""]
+    for item in active:
+        lines.extend(_render_item(item))
+    lines.extend(["## 已归档", ""])
+    for item in archived:
+        lines.extend(_render_item(item))
+    return ("\n".join(lines).rstrip() + "\n").encode("utf-8")
+
+
 class ObsidianProjection:
     """Build immutable write plans; applying them belongs to SyncService."""
 
@@ -176,7 +192,7 @@ class ObsidianProjection:
             target = self._safe_target(
                 Path("项目") / project_id / "AgentRetro" / _FILENAMES[kind]
             )
-            writes.append(self._write(target, self._render(kind, items)))
+            writes.append(self._write(target, render_aggregate(kind, items)))
 
         summary_inner = self._render_summary(grouped)
         optional = (
@@ -266,20 +282,6 @@ class ObsidianProjection:
             before_managed_hash=sha256_bytes(before),
             after_managed_hash=sha256_bytes(after),
         )
-
-    @staticmethod
-    def _render(kind: KnowledgeType, items: Iterable[Knowledge]) -> bytes:
-        title = _FILENAMES[kind].removesuffix(".md")
-        ordered = sorted(items, key=lambda item: item.id)
-        active = [item for item in ordered if item.status == "active"]
-        archived = [item for item in ordered if item.status == "archived"]
-        lines = [f"# {title}", ""]
-        for item in active:
-            lines.extend(_render_item(item))
-        lines.extend(["## 已归档", ""])
-        for item in archived:
-            lines.extend(_render_item(item))
-        return ("\n".join(lines).rstrip() + "\n").encode("utf-8")
 
     @staticmethod
     def _render_summary(grouped: dict[KnowledgeType, list[Knowledge]]) -> str:

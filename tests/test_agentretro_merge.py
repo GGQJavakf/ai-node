@@ -34,7 +34,11 @@ from agent_retro.domain.models import (
     ProjectMapping,
     SourceLocator,
 )
-from agent_retro.infrastructure.obsidian import ObsidianProjection, sha256_bytes
+from agent_retro.infrastructure.obsidian import (
+    ObsidianProjection,
+    render_aggregate,
+    sha256_bytes,
+)
 from agent_retro.infrastructure.llm_merge import (
     LLMMergeProposalGateway,
     MergeProposalResponseError,
@@ -472,7 +476,14 @@ def test_vault_adoption_snapshot_baseline_survives_projection_failure_and_reconc
     assert state.managed_hash == sha256_bytes(adopted_bytes)
     assert state.full_hash == sha256_bytes(adopted_bytes)
     assert snapshot.snapshot_kind == "full"
-    assert snapshot.owned_bytes == adopted_bytes
+    assert snapshot.owned_bytes == render_aggregate(
+        KnowledgeType.RULE,
+        (
+            item
+            for item in repository.list_project_knowledge("NPKI")
+            if item.knowledge_type is KnowledgeType.RULE
+        ),
+    )
     assert snapshot.managed_hash == state.managed_hash
     assert snapshot.full_hash == state.full_hash
     coordinator = ProjectionCoordinator(
@@ -497,6 +508,57 @@ def test_vault_adoption_snapshot_baseline_survives_projection_failure_and_reconc
     assert conflict.status == "external_edit_conflict"
     assert not conflict.id.startswith("reconcile-diagnostic-")
     assert repository.get_sync_job(conflict.id).status == "external_edit_conflict"
+
+
+def test_vault_adoption_edit_snapshot_restores_reviewed_authority_after_sync_pending(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _synchronize_all_targets(tmp_path)
+    target = vault / "项目" / "NPKI" / "AgentRetro" / "规则.md"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", "手工规则"),
+        encoding="utf-8",
+    )
+    candidate_id = service.reconcile(
+        next(
+            item
+            for item in service.find_external_edits("NPKI")
+            if item.path == Path("项目/NPKI/AgentRetro/规则.md")
+        ).id,
+        "adopt_vault",
+        actor="user",
+    ).candidate_id
+    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    summary.write_text("malformed summary boundary\n", encoding="utf-8")
+
+    edited = KnowledgeService(repository, adoption_service=service).edit(
+        candidate_id,
+        text="审核整理规则",
+        actor="user",
+    )
+    projection = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        service.sync,
+    ).after_commit("adoption-edit-follow-up", edited.id, edited.project_id)
+
+    assert projection.status.value == "sync_pending"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("手工规则", "二次手工规则"),
+        encoding="utf-8",
+    )
+    conflict = next(
+        item
+        for item in service.find_external_edits("NPKI")
+        if item.path == Path("项目/NPKI/AgentRetro/规则.md")
+    )
+    result = service.reconcile(conflict.id, "keep_database", actor="user")
+    preview = service.preview(result.plan_id)
+
+    assert conflict.status == "external_edit_conflict"
+    assert repository.get_sync_job(conflict.id).status == "external_edit_conflict"
+    assert "审核整理规则" in preview.targets[0].output_bytes.decode("utf-8")
+    assert "手工规则" not in preview.targets[0].output_bytes.decode("utf-8")
 
 
 def test_vault_adoption_snapshot_failure_rolls_back_knowledge_state_and_snapshot(

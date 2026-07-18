@@ -709,7 +709,6 @@ class MergeService:
                 vault_managed_hash=adoption.vault_managed_hash,
                 vault_full_hash=adoption.vault_full_hash,
                 snapshot_kind="full",
-                snapshot_owned_bytes=current,
                 snapshot_event_id=f"vault-adoption:{candidate_id}",
             )
         except ValueError as exc:
