@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent_retro.application.ports import RetroRepository
-from agent_retro.domain.models import ProjectionStatus, SyncJob
+from agent_retro.domain.models import ProjectionEvent, ProjectionStatus, SyncJob
 from agent_retro.domain.projection import ProjectionFenceError, projection_input_hash
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
@@ -84,13 +84,62 @@ class SyncService:
                 ProjectionStatus.SYNC_PENDING,
                 "projection_identity_mismatch",
             )
+        canonical = self._canonical_automatic_plan(event)
+        if canonical is None or plan != canonical:
+            return self._finish(
+                event_id,
+                ProjectionStatus.SYNC_PENDING,
+                "projection_identity_mismatch",
+            )
         try:
             with self._project_lock(plan.project_id):
-                return self._apply_locked(plan, event_id, event.input_hash)
+                current_event = self.repository.get_projection_event(event_id)
+                if current_event is None:
+                    raise ProjectionPersistenceError("projection_event_not_found")
+                canonical = self._canonical_automatic_plan(current_event)
+                if canonical is None:
+                    return self._finish(
+                        event_id,
+                        ProjectionStatus.SYNC_PENDING,
+                        "projection_superseded",
+                    )
+                if plan != canonical:
+                    return self._finish(
+                        event_id,
+                        ProjectionStatus.SYNC_PENDING,
+                        "projection_identity_mismatch",
+                    )
+                return self._apply_locked(
+                    plan, event_id, current_event.input_hash
+                )
         except ProjectionLockBusy:
             return self._finish(
                 event_id, ProjectionStatus.SYNC_PENDING, "sync_lock_busy"
             )
+
+    def _canonical_automatic_plan(
+        self, event: ProjectionEvent
+    ) -> SyncPlan | None:
+        """Rebuild the only plan accepted by the automatic projection path."""
+
+        try:
+            knowledge = self.repository.list_project_knowledge(event.project_id)
+            if projection_input_hash(knowledge) != event.input_hash:
+                return None
+            return ObsidianProjection(self.vault_root, self.backup_root).plan(
+                event.project_id,
+                knowledge,
+                event_id=event.id,
+                input_hash=event.input_hash,
+            )
+        except (
+            BoundaryError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            VaultNotConfiguredError,
+        ):
+            return None
 
     def synchronize(
         self, event_id: str, projection: ObsidianProjection

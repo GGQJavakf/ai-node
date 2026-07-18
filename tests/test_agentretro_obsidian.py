@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 from datetime import datetime, timezone
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -31,8 +32,10 @@ from agent_retro.domain.projection import projection_input_hash
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
     ObsidianProjection,
+    PlannedWrite,
     UnsafeVaultPathError,
     replace_managed_block,
+    sha256_bytes,
 )
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 from agent_retro.presentation.cli import main
@@ -1246,3 +1249,89 @@ def test_unavailable_event_status_store_returns_sanitized_cli_recovery(
     assert "retro doctor --repair-sync" in output
     assert secret not in output
     assert repository.knowledge_for_candidate("candidate-rule").status == "active"
+
+
+def _public_apply_fixture(tmp_path: Path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _repository(tmp_path)
+    _seed_pending_candidate(repository)
+    repository.accept_candidate("candidate-rule", "canonical rule", "user", 0.98)
+    event_id = repository.save_current_projection_event(
+        "NPKI", "accept", "candidate-rule"
+    )
+    event = repository.get_projection_event(event_id)
+    projection = ObsidianProjection(vault, tmp_path / "backups")
+    plan = projection.plan(
+        "NPKI",
+        repository.list_project_knowledge("NPKI"),
+        event_id=event.id,
+        input_hash=event.input_hash,
+    )
+    return repository, SyncService(repository, vault, tmp_path / "backups"), plan
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    ["empty", "missing_aggregate", "missing_log", "extra_prose", "after_bytes"],
+)
+def test_public_apply_rejects_noncanonical_plan_before_any_filesystem_write(
+    tmp_path: Path, forgery: str
+) -> None:
+    repository, sync, canonical = _public_apply_fixture(tmp_path)
+    if forgery == "empty":
+        forged = replace(canonical, writes=())
+    elif forgery == "missing_aggregate":
+        forged = replace(
+            canonical,
+            writes=tuple(
+                write for write in canonical.writes if write.target.name != "规则.md"
+            ),
+        )
+    elif forgery == "missing_log":
+        forged = replace(
+            canonical,
+            writes=tuple(
+                write
+                for write in canonical.writes
+                if write.target.name != "变更日志.md"
+            ),
+        )
+    elif forgery == "extra_prose":
+        prose = tmp_path / "vault" / "人工笔记.md"
+        extra = PlannedWrite(
+            prose,
+            sha256_bytes(b""),
+            b"forged prose",
+            sha256_bytes(b""),
+            sha256_bytes(b"forged prose"),
+        )
+        forged = replace(canonical, writes=canonical.writes + (extra,))
+    else:
+        first = canonical.writes[0]
+        altered = replace(first, after_bytes=first.after_bytes + b"forged")
+        forged = replace(canonical, writes=(altered,) + canonical.writes[1:])
+    lock_root = (tmp_path / "backups").parent / ".projection-locks"
+
+    result = sync.apply(forged, event_id=canonical.event_id)
+
+    assert result.status is ProjectionStatus.SYNC_PENDING
+    assert result.reason == "projection_identity_mismatch"
+    assert repository.get_projection_event(canonical.event_id).status is (
+        ProjectionStatus.SYNC_PENDING
+    )
+    assert not lock_root.exists()
+    assert not canonical.backup_dir.exists()
+    assert not (tmp_path / "vault" / "项目").exists()
+
+
+def test_public_apply_accepts_complete_canonical_plan(tmp_path: Path) -> None:
+    repository, sync, canonical = _public_apply_fixture(tmp_path)
+
+    result = sync.apply(canonical, event_id=canonical.event_id)
+
+    assert result.status is ProjectionStatus.SYNCED
+    assert repository.get_projection_event(canonical.event_id).status is (
+        ProjectionStatus.SYNCED
+    )
+    assert (tmp_path / "vault" / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
