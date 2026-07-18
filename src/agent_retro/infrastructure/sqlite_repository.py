@@ -1495,7 +1495,7 @@ class SQLiteRetroRepository(RetroRepository):
             if not self._projection_fence_matches(
                 connection, event_id, expected_input_hash
             ):
-                raise ProjectionFenceError("projection event is no longer current")
+                raise ProjectionFenceError("projection_superseded")
             for path, managed_hash, full_hash in file_states:
                 connection.execute(
                     """INSERT INTO managed_file_state(
@@ -1552,13 +1552,20 @@ class SQLiteRetroRepository(RetroRepository):
         ).fetchone()
         if event is None or str(event["input_hash"]) != expected_input_hash:
             return False
-        latest = connection.execute(
-            """SELECT id FROM projection_events WHERE project_id = ?
-            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
-            (str(event["project_id"]),),
-        ).fetchone()
-        if latest is None or str(latest["id"]) != event_id:
+        knowledge = self._project_knowledge(connection, str(event["project_id"]))
+        if projection_input_hash(knowledge) != expected_input_hash:
             return False
+        latest = connection.execute(
+            """SELECT id FROM projection_events
+            WHERE project_id = ? AND input_hash = ?
+            ORDER BY created_at DESC, rowid DESC LIMIT 1""",
+            (str(event["project_id"]), expected_input_hash),
+        ).fetchone()
+        return latest is not None and str(latest["id"]) == event_id
+
+    def _project_knowledge(
+        self, connection: sqlite3.Connection, project_id: str
+    ) -> list[Knowledge]:
         rows = connection.execute(
             """SELECT item.* FROM knowledge AS item
             JOIN (
@@ -1567,10 +1574,9 @@ class SQLiteRetroRepository(RetroRepository):
             WHERE item.project_id = ? AND item.scope = 'project'
               AND item.status IN ('active', 'archived')
             ORDER BY item.id""",
-            (str(event["project_id"]),),
+            (project_id,),
         ).fetchall()
-        knowledge = [self._knowledge_from_row(connection, row) for row in rows]
-        return projection_input_hash(knowledge) == expected_input_hash
+        return [self._knowledge_from_row(connection, row) for row in rows]
 
     def save_project_mapping(self, mapping: ProjectMapping, actor: str) -> None:
         with self.transaction() as connection:
@@ -1932,6 +1938,59 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
         return stored_id
+
+    def save_current_projection_event(
+        self, project_id: str, cause: str, cause_entity_id: str
+    ) -> str:
+        """Atomically bind a deterministic event to authoritative knowledge."""
+
+        with self.transaction() as connection:
+            input_hash = projection_input_hash(
+                self._project_knowledge(connection, project_id)
+            )
+            identity = json.dumps(
+                [project_id, cause, cause_entity_id, input_hash],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            event_id = "projection-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+            existing = connection.execute(
+                """SELECT id FROM projection_events
+                WHERE project_id = ? AND cause = ? AND cause_entity_id = ?
+                  AND input_hash = ?""",
+                (project_id, cause, cause_entity_id, input_hash),
+            ).fetchone()
+            stored_id = str(existing["id"]) if existing is not None else event_id
+            if existing is None:
+                now = _now_text()
+                connection.execute(
+                    """INSERT INTO projection_events(
+                        id, project_id, cause, cause_entity_id, input_hash,
+                        status, error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event_id,
+                        project_id,
+                        cause,
+                        cause_entity_id,
+                        input_hash,
+                        ProjectionStatus.SYNC_PENDING.value,
+                        "",
+                        now,
+                        now,
+                    ),
+                )
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    action="projection_event_saved",
+                    entity_type="projection_event",
+                    entity_id=stored_id,
+                    after_hash=input_hash,
+                    detail={"duplicate": existing is not None},
+                ),
+            )
+            return stored_id
 
     def get_projection_event(self, event_id: str) -> ProjectionEvent | None:
         connection = self._connect()

@@ -12,6 +12,10 @@ from agent_retro.domain.models import Knowledge
 class ProjectionFenceError(RuntimeError):
     """The authoritative project state moved beyond a projection event."""
 
+    def __init__(self, reason: str = "projection_superseded") -> None:
+        super().__init__(reason)
+        self.reason = reason
+
 
 def projection_input_hash(knowledge: Sequence[Knowledge]) -> str:
     payload = [

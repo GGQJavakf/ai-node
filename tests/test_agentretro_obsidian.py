@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sqlite3
 import sys
 import threading
 from datetime import datetime, timezone
@@ -122,6 +123,20 @@ class KnowledgeRepository(SQLiteRetroRepository):
 
     def list_project_knowledge(self, project_id: str) -> list[Knowledge]:
         return [item for item in self.items if item.project_id == project_id]
+
+    def save_current_projection_event(
+        self, project_id: str, cause: str, cause_entity_id: str
+    ) -> str:
+        input_hash = projection_input_hash(self.list_project_knowledge(project_id))
+        identity = json.dumps(
+            [project_id, cause, cause_entity_id, input_hash],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        event_id = "projection-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+        return self.save_projection_event(
+            event_id, project_id, cause, cause_entity_id, input_hash
+        )
 
     def projection_fence_matches(
         self, event_id: str, expected_input_hash: str
@@ -994,3 +1009,240 @@ def test_boundary_private_details_are_reduced_to_stable_reason(
     assert result.reason == "planning_failed"
     assert event.error == "planning_failed"
     assert secret not in serialized
+
+
+def test_apply_rejects_plan_bound_to_different_event_before_any_filesystem_write(
+    tmp_path: Path,
+) -> None:
+    repository, coordinator = _coordinator(
+        tmp_path, [_knowledge("rule", KnowledgeType.RULE)]
+    )
+    input_hash = projection_input_hash(repository.items)
+    event_a = repository.save_projection_event(
+        "event-a", "NPKI", "accept", "a", input_hash
+    )
+    event_b = repository.save_projection_event(
+        "event-b", "NPKI", "accept", "b", input_hash
+    )
+    plan_b = coordinator.projection.plan(
+        "NPKI",
+        repository.items,
+        event_id=event_b,
+        input_hash=input_hash,
+    )
+    lock_root = (tmp_path / "backups").parent / ".projection-locks"
+
+    result = coordinator.sync.apply(plan_b, event_id=event_a)
+
+    assert result.status is ProjectionStatus.SYNC_PENDING
+    assert result.reason == "projection_identity_mismatch"
+    assert repository.get_projection_event(event_a).error == (
+        "projection_identity_mismatch"
+    )
+    assert not (tmp_path / "vault" / "项目").exists()
+    assert not lock_root.exists()
+
+
+def test_late_stale_event_does_not_poison_current_event_retry(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _repository(tmp_path)
+    _seed_pending_candidate(repository, "candidate-old")
+    repository.accept_candidate("candidate-old", "旧知识", "user", 0.98)
+    old_hash = projection_input_hash(repository.list_project_knowledge("NPKI"))
+    old_ready = threading.Event()
+    release_old = threading.Event()
+
+    def save_late_old() -> None:
+        old_ready.set()
+        assert release_old.wait(5)
+        repository.save_projection_event(
+            "late-old", "NPKI", "accept", "old", old_hash
+        )
+
+    thread = threading.Thread(target=save_late_old)
+    thread.start()
+    assert old_ready.wait(5)
+    evidence = repository.list_evidence("session-1")[0]
+    repository.save_candidates(
+        [
+            Candidate(
+                "candidate-new",
+                KnowledgeType.RULE,
+                "NPKI",
+                "project",
+                "新知识",
+                (evidence.id,),
+                CandidateStatus.PENDING_REVIEW,
+                0.99,
+            )
+        ]
+    )
+    try:
+        repository.accept_candidate("candidate-new", "新知识", "user", 0.99)
+        current = repository.save_current_projection_event(
+            "NPKI", "accept", "candidate-new"
+        )
+    finally:
+        release_old.set()
+        thread.join(5)
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        SyncService(repository, vault, tmp_path / "backups"),
+    )
+
+    result = coordinator.retry(current)
+
+    assert result.status is ProjectionStatus.SYNCED
+    assert repository.get_projection_event(current).status is ProjectionStatus.SYNCED
+    assert repository.get_projection_event("late-old").status is (
+        ProjectionStatus.SYNC_PENDING
+    )
+
+
+def test_begin_sync_sqlite_error_is_sanitized_and_writes_no_vault_file(
+    tmp_path: Path,
+) -> None:
+    secret = "PRIVATE-BEGIN-SQLITE"
+
+    class BeginFailure(SQLiteRetroRepository):
+        def begin_sync(self, job) -> None:
+            raise sqlite3.OperationalError(secret)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = BeginFailure(tmp_path / "retro.db", tmp_path / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+    knowledge = repository.accept_candidate(
+        "candidate-rule", "开始日志失败", "user", 0.98
+    )
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        SyncService(repository, vault, tmp_path / "backups"),
+    )
+
+    result = coordinator.after_commit("accept", knowledge.id, "NPKI")
+    event = repository.get_projection_event(result.event_id)
+    serialized = json.dumps(
+        [result.__dict__, event.__dict__, [a.__dict__ for a in repository.list_audit_entries()]],
+        default=str,
+    )
+
+    assert result.reason == "journal_start_failed"
+    assert event.error == "journal_start_failed"
+    assert secret not in serialized
+    assert not (vault / "项目").exists()
+
+
+def test_finish_sync_sqlite_error_after_rollback_is_sanitized(tmp_path: Path) -> None:
+    secret = "PRIVATE-FINISH-SQLITE"
+
+    class FinishFailure(SQLiteRetroRepository):
+        def finish_sync(self, job_id: str, status: str, error: str = "") -> None:
+            raise sqlite3.OperationalError(secret)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = FinishFailure(tmp_path / "retro.db", tmp_path / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+    knowledge = repository.accept_candidate(
+        "candidate-rule", "结束日志失败", "user", 0.98
+    )
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("PRIVATE-REPLACE")
+
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        SyncService(
+            repository, vault, tmp_path / "backups", replace=fail_replace
+        ),
+    )
+
+    result = coordinator.after_commit("accept", knowledge.id, "NPKI")
+    serialized = json.dumps(
+        [result.__dict__, repository.get_projection_event(result.event_id).__dict__],
+        default=str,
+    )
+
+    assert result.reason == "journal_update_failed"
+    assert secret not in serialized
+    assert "PRIVATE-REPLACE" not in serialized
+    assert not (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
+
+
+def test_rollback_required_retry_uses_stable_named_fields(tmp_path: Path) -> None:
+    repository, coordinator = _coordinator(
+        tmp_path, [_knowledge("rule", KnowledgeType.RULE)]
+    )
+    event_id = repository.save_projection_event(
+        "rollback-event",
+        "NPKI",
+        "accept",
+        "rule",
+        projection_input_hash(repository.items),
+    )
+    repository.finish_projection_event(
+        event_id, ProjectionStatus.ROLLBACK_REQUIRED, "rollback_failed"
+    )
+
+    result = coordinator.retry(event_id)
+
+    assert result.warning == "RETRO_ROLLBACK_REQUIRED"
+    assert result.reason == "rollback_failed"
+    assert result.recovery_command == "retro doctor --repair-sync"
+
+
+def test_unavailable_event_status_store_returns_sanitized_cli_recovery(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    secret = "PRIVATE-STATUS-SQLITE"
+
+    class StatusFailure(SQLiteRetroRepository):
+        def begin_sync(self, job) -> None:
+            raise sqlite3.OperationalError(secret)
+
+        def finish_projection_event(self, event_id, status, error="") -> None:
+            raise sqlite3.OperationalError(secret)
+
+    home = tmp_path / "home"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = StatusFailure(
+        home / ".agentretro" / "retro.db",
+        home / ".agentretro" / "backups",
+    )
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+    monkeypatch.setattr(
+        "agent_retro.presentation.cli.build_retro_repository",
+        lambda settings: repository,
+    )
+
+    result = main(
+        ["--json", "review", "accept", "candidate-rule"],
+        home=home,
+        env={"AGENTRETRO_OBSIDIAN_ROOT": str(vault)},
+    )
+    output = capsys.readouterr().out
+
+    assert result == 2
+    assert "RETRO_SYNC_STATE_UNAVAILABLE" in output
+    assert "journal_start_failed" in output
+    assert "retro doctor --repair-sync" in output
+    assert secret not in output
+    assert repository.knowledge_for_candidate("candidate-rule").status == "active"

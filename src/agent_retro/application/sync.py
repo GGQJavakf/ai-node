@@ -41,6 +41,15 @@ class ProjectionLockBusy(RuntimeError):
     """A project projection is already active in another thread/process."""
 
 
+class ProjectionPersistenceError(RuntimeError):
+    """A sanitized synchronization-state persistence failure."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.recovery_command = "retro doctor --repair-sync"
+
+
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 _THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -64,7 +73,17 @@ class SyncService:
     def apply(self, plan: SyncPlan, *, event_id: str) -> ProjectionResult:
         event = self.repository.get_projection_event(event_id)
         if event is None:
-            raise KeyError(f"projection event not found: {event_id}")
+            raise ProjectionPersistenceError("projection_event_not_found")
+        if (
+            plan.event_id != event_id
+            or plan.project_id != event.project_id
+            or plan.input_hash != event.input_hash
+        ):
+            return self._finish(
+                event_id,
+                ProjectionStatus.SYNC_PENDING,
+                "projection_identity_mismatch",
+            )
         try:
             with self._project_lock(plan.project_id):
                 return self._apply_locked(plan, event_id, event.input_hash)
@@ -91,7 +110,10 @@ class SyncService:
                     )
                 try:
                     plan = projection.plan(
-                        event.project_id, knowledge, event_id=event.id
+                        event.project_id,
+                        knowledge,
+                        event_id=event.id,
+                        input_hash=event.input_hash,
                     )
                 except VaultNotConfiguredError:
                     return self._finish(
@@ -116,7 +138,7 @@ class SyncService:
             return self._finish(
                 event_id,
                 ProjectionStatus.ROLLBACK_REQUIRED,
-                "previous synchronization requires rollback recovery",
+                "rollback_blocked",
             )
         try:
             snapshots = self._preflight(plan)
@@ -142,7 +164,17 @@ class SyncService:
             plan_json=self._plan_json(plan),
             backup_path=backup_dir,
         )
-        self.repository.begin_sync(job)
+        try:
+            self.repository.begin_sync(job)
+        except sqlite3.Error as exc:
+            try:
+                return self._finish(
+                    event_id,
+                    ProjectionStatus.SYNC_PENDING,
+                    "journal_start_failed",
+                )
+            except ProjectionPersistenceError:
+                raise ProjectionPersistenceError("journal_start_failed") from exc
         try:
             for write in plan.writes:
                 try:
@@ -150,22 +182,21 @@ class SyncService:
                         event_id, expected_input_hash
                     )
                 except sqlite3.Error as exc:
-                    raise ProjectionFenceError("projection fence unavailable") from exc
+                    raise ProjectionFenceError("projection_fence_failed") from exc
                 if not current:
-                    raise ProjectionFenceError("projection superseded")
+                    raise ProjectionFenceError("projection_superseded")
                 self._atomic_replace(write.target, write.after_bytes)
                 if write.target.read_bytes() != write.after_bytes:
                     raise OSError(f"post-write readback mismatch: {write.target}")
-        except ProjectionFenceError:
+        except ProjectionFenceError as exc:
             rollback_error = self._restore(plan, snapshots)
             status = (
                 ProjectionStatus.ROLLBACK_REQUIRED
                 if rollback_error
                 else ProjectionStatus.SYNC_PENDING
             )
-            error = "rollback_failed" if rollback_error else "projection_superseded"
-            self.repository.finish_sync(event_id, status.value, error)
-            return self._finish(event_id, status, error)
+            error = "rollback_failed" if rollback_error else exc.reason
+            return self._finish_after_rollback(event_id, status, error)
         except (OSError, RuntimeError):
             rollback_error = self._restore(plan, snapshots)
             status = (
@@ -174,8 +205,7 @@ class SyncService:
                 else ProjectionStatus.SYNC_PENDING
             )
             error = "write_failed" if not rollback_error else "rollback_failed"
-            self.repository.finish_sync(event_id, status.value, error)
-            return self._finish(event_id, status, error)
+            return self._finish_after_rollback(event_id, status, error)
 
         states = [
             (
@@ -189,17 +219,25 @@ class SyncService:
             self.repository.complete_sync(
                 event_id, plan.project_id, states, expected_input_hash
             )
-        except ProjectionFenceError:
+        except ProjectionFenceError as exc:
             rollback_error = self._restore(plan, snapshots)
             status = (
                 ProjectionStatus.ROLLBACK_REQUIRED
                 if rollback_error
                 else ProjectionStatus.SYNC_PENDING
             )
-            error = "rollback_failed" if rollback_error else "projection_superseded"
-            self.repository.finish_sync(event_id, status.value, error)
-            return self._finish(event_id, status, error)
-        except (OSError, RuntimeError, ValueError, sqlite3.Error):
+            error = "rollback_failed" if rollback_error else exc.reason
+            return self._finish_after_rollback(event_id, status, error)
+        except sqlite3.Error:
+            rollback_error = self._restore(plan, snapshots)
+            status = (
+                ProjectionStatus.ROLLBACK_REQUIRED
+                if rollback_error
+                else ProjectionStatus.SYNC_PENDING
+            )
+            error = "rollback_failed" if rollback_error else "journal_update_failed"
+            return self._finish_after_rollback(event_id, status, error)
+        except (OSError, RuntimeError, ValueError):
             rollback_error = self._restore(plan, snapshots)
             status = (
                 ProjectionStatus.ROLLBACK_REQUIRED
@@ -207,8 +245,7 @@ class SyncService:
                 else ProjectionStatus.SYNC_PENDING
             )
             error = "rollback_failed" if rollback_error else "journal_finalize_failed"
-            self.repository.finish_sync(event_id, status.value, error)
-            return self._finish(event_id, status, error)
+            return self._finish_after_rollback(event_id, status, error)
         return ProjectionResult(event_id, ProjectionStatus.SYNCED)
 
     def enumerate_backups_containing(self, content_hash: str) -> tuple[Path, ...]:
@@ -339,6 +376,8 @@ class SyncService:
             {
                 "id": plan.id,
                 "project_id": plan.project_id,
+                "event_id": plan.event_id,
+                "input_hash": plan.input_hash,
                 "writes": [
                     {
                         "target": str(write.target),
@@ -356,7 +395,10 @@ class SyncService:
     def _finish(
         self, event_id: str, status: ProjectionStatus, error: str
     ) -> ProjectionResult:
-        self.repository.finish_projection_event(event_id, status, error)
+        try:
+            self.repository.finish_projection_event(event_id, status, error)
+        except sqlite3.Error as exc:
+            raise ProjectionPersistenceError(error or "journal_update_failed") from exc
         if status is ProjectionStatus.SYNCED:
             return ProjectionResult(event_id, status)
         command = (
@@ -370,6 +412,15 @@ class SyncService:
             else "RETRO_SYNC_PENDING"
         )
         return ProjectionResult(event_id, status, warning, command, error)
+
+    def _finish_after_rollback(
+        self, event_id: str, status: ProjectionStatus, reason: str
+    ) -> ProjectionResult:
+        try:
+            self.repository.finish_sync(event_id, status.value, reason)
+        except sqlite3.Error:
+            reason = "journal_update_failed"
+        return self._finish(event_id, status, reason)
 
     @contextmanager
     def _project_lock(self, project_id: str):
@@ -433,17 +484,12 @@ class ProjectionCoordinator:
     def after_commit(
         self, cause: str, entity_id: str, project_id: str
     ) -> ProjectionResult:
-        knowledge = self.repository.list_project_knowledge(project_id)
-        input_hash = projection_input_hash(knowledge)
-        raw = json.dumps(
-            [project_id, cause, entity_id, input_hash],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        event_id = "projection-" + hashlib.sha256(raw.encode()).hexdigest()[:24]
-        event_id = self.repository.save_projection_event(
-            event_id, project_id, cause, entity_id, input_hash
-        )
+        try:
+            event_id = self.repository.save_current_projection_event(
+                project_id, cause, entity_id
+            )
+        except sqlite3.Error as exc:
+            raise ProjectionPersistenceError("projection_event_failed") from exc
         existing = self.repository.get_projection_event(event_id)
         if existing is not None and existing.status is ProjectionStatus.SYNCED:
             return ProjectionResult(event_id, ProjectionStatus.SYNCED)
@@ -455,10 +501,11 @@ class ProjectionCoordinator:
             raise KeyError(f"projection event not found: {event_id}")
         if event.status is ProjectionStatus.ROLLBACK_REQUIRED:
             return ProjectionResult(
-                event.id,
-                event.status,
-                event.error,
-                "retro doctor --repair-sync",
+                event_id=event.id,
+                status=event.status,
+                warning="RETRO_ROLLBACK_REQUIRED",
+                recovery_command="retro doctor --repair-sync",
+                reason=event.error or "rollback_failed",
             )
         return self.sync.synchronize(event.id, self.projection)
 

@@ -14,6 +14,7 @@ from agent_retro.application.bootstrap import (
     build_projection_coordinator,
     build_retro_repository,
 )
+from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.application.capture import CaptureResult, CaptureService
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
 from agent_retro.domain.models import CandidateStatus, KnowledgeType
@@ -143,6 +144,28 @@ def main(
                 )
             else:
                 sys.stderr.write(safe_text("模型审核暂不可用；可安全重试。") + "\n")
+            return 2
+        except ProjectionPersistenceError as exc:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_SYNC_STATE_UNAVAILABLE",
+                        "message": "Projection state is unavailable; SQLite knowledge remains authoritative.",
+                        "data": {
+                            "reason": exc.reason,
+                            "recovery_command": exc.recovery_command,
+                        },
+                    }
+                )
+            else:
+                sys.stderr.write(
+                    safe_text(
+                        "SQLite 知识保持权威；"
+                        f"{exc.reason}；恢复命令: {exc.recovery_command}"
+                    )
+                    + "\n"
+                )
             return 2
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
             detail = Redactor().redact(str(exc))

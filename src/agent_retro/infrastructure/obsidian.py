@@ -42,6 +42,8 @@ class SyncPlan:
     project_id: str
     writes: tuple[PlannedWrite, ...]
     backup_dir: Path
+    event_id: str = ""
+    input_hash: str = ""
 
 
 _FILENAMES = {
@@ -102,6 +104,7 @@ class ObsidianProjection:
         knowledge: Sequence[Knowledge],
         *,
         event_id: str | None = None,
+        input_hash: str = "",
     ) -> SyncPlan:
         if self.vault_root is None:
             raise VaultNotConfiguredError("Obsidian vault is not configured")
@@ -172,6 +175,8 @@ class ObsidianProjection:
             project_id=project_id,
             writes=tuple(writes),
             backup_dir=self.backup_root / plan_id,
+            event_id=event_id or "",
+            input_hash=input_hash,
         )
 
     def _safe_existing_target(self, target: Path) -> Path:
