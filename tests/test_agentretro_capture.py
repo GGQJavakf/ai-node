@@ -166,22 +166,30 @@ def test_unknown_optional_event_is_diagnosed_and_never_normalized(fixtures_dir):
 
 
 def test_discovery_stops_at_configured_count(fixtures_dir, tmp_path):
-    first = _copy_fixture(fixtures_dir, tmp_path / "sessions", "active")
-    second = _copy_fixture(fixtures_dir, tmp_path / "sessions", "unknown-event")
-    third = _copy_fixture(fixtures_dir, tmp_path / "sessions", "completed")
+    sessions = tmp_path / "sessions"
+    first_directory = sessions / "2026" / "07" / "20"
+    second_directory = sessions / "2026" / "07" / "19"
+    third_directory = sessions / "2026" / "07" / "18"
+    first = _copy_fixture(fixtures_dir, first_directory, "active")
+    second = _copy_fixture(fixtures_dir, second_directory, "unknown-event")
+    third = _copy_fixture(fixtures_dir, third_directory, "completed")
     os.utime(first, (30, 30))
     os.utime(second, (20, 20))
     os.utime(third, (10, 10))
-    source = CodexSessionSource(tmp_path / "sessions", max_candidates=2)
+    os.utime(first_directory, (30, 30))
+    os.utime(second_directory, (20, 20))
+    os.utime(third_directory, (10, 10))
+    source = CodexSessionSource(sessions, max_candidates=2)
 
     session = source.latest_completed()
 
     assert session.source_session_id == "session-unknown"
     assert source.last_discovery.inspected_count <= 2
     assert any("session-active" in item for item in source.last_discovery.diagnostics)
+    assert any("候选数量上限" in item for item in source.last_discovery.diagnostics)
 
 
-def test_candidate_budget_stops_session_parse_work_in_a_large_tree(
+def test_candidate_budget_stops_discovery_and_stat_work_in_a_large_tree(
     fixtures_dir, tmp_path, monkeypatch
 ):
     sessions = tmp_path / "sessions"
@@ -192,25 +200,58 @@ def test_candidate_budget_stops_session_parse_work_in_a_large_tree(
             template.replace("session-active", f"session-{index:02d}"),
             encoding="utf-8",
         )
-    real_open = Path.open
-    jsonl_opens = 0
+    real_scandir = os.scandir
+    real_stat = Path.stat
+    jsonl_scans = 0
+    jsonl_stats = 0
 
-    def bounded_open(path, *args, **kwargs):
-        nonlocal jsonl_opens
+    def bounded_stat(path, *args, **kwargs):
+        nonlocal jsonl_stats
         if path.suffix == ".jsonl":
-            jsonl_opens += 1
-            if jsonl_opens > 2:
-                raise AssertionError("candidate count did not stop parse work")
-        return real_open(path, *args, **kwargs)
+            jsonl_stats += 1
+            if jsonl_stats > 2:
+                raise AssertionError("candidate count did not stop stat work")
+        return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "open", bounded_open)
+    class BoundedScan:
+        def __init__(self, path):
+            self.inner = real_scandir(path)
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal jsonl_scans
+            item = next(self.inner)
+            if item.name.lower().endswith(".jsonl"):
+                jsonl_scans += 1
+                if jsonl_scans > 2:
+                    raise AssertionError(
+                        "candidate count did not stop JSONL discovery"
+                    )
+            return item
+
+    monkeypatch.setattr(os, "scandir", BoundedScan)
+    monkeypatch.setattr(Path, "stat", bounded_stat)
 
     source = CodexSessionSource(sessions, max_candidates=2)
     with pytest.raises(SessionNotFoundError):
         source.latest_completed()
 
-    assert jsonl_opens == 2
+    assert jsonl_scans == 2
+    assert jsonl_stats == 2
     assert source.last_discovery.inspected_count == 2
+    assert any(
+        "候选数量上限" in item
+        for item in source.last_discovery.diagnostics
+    )
 
 
 def test_deadline_interrupts_directory_enumeration(

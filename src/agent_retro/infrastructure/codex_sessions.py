@@ -193,7 +193,8 @@ class CodexSessionSource:
     ) -> list[_SessionCandidate]:
         directories = [self.codex_home]
         candidates: list[_SessionCandidate] = []
-        while directories:
+        limit_reached = False
+        while directories and not limit_reached:
             self._check_deadline(deadline)
             directory = directories.pop(0)
             try:
@@ -228,15 +229,14 @@ class CodexSessionSource:
                                     modified_ns=stat.st_mtime_ns,
                                 )
                             )
-                            candidates.sort(
-                                key=lambda item: (
-                                    item.modified_ns,
-                                    str(item.path),
-                                ),
-                                reverse=True,
-                            )
-                            if len(candidates) > self.max_candidates:
-                                candidates.pop()
+                            if len(candidates) == self.max_candidates:
+                                self._diagnostics.append(
+                                    "已达到候选数量上限 "
+                                    f"{self.max_candidates}；"
+                                    "未继续枚举剩余来源"
+                                )
+                                limit_reached = True
+                                break
                         except OSError as exc:
                             self._diagnostics.append(
                                 f"跳过无法检查路径 {entry_path}: {exc}"

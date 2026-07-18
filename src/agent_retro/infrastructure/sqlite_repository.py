@@ -430,8 +430,8 @@ class SQLiteRetroRepository(RetroRepository):
     ) -> NormalizedSession | None:
         """Return an existing source identity regardless of its content hash.
 
-        This concrete-adapter query lets capture distinguish a strict replay
-        from a changed source without widening the fixed application port.
+        This mandatory repository query lets capture distinguish a strict
+        replay from a changed source through the typed application port.
         """
 
         connection = self._connect()
