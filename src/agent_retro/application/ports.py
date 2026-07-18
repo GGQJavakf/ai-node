@@ -36,6 +36,10 @@ class RetroRepository(Protocol):
         self, source_session_id: str, source_hash: str
     ) -> NormalizedSession | None: ...
 
+    def find_session_by_source_id(
+        self, source_session_id: str
+    ) -> NormalizedSession | None: ...
+
     def save_capture(
         self, session: NormalizedSession, evidence: Sequence[Evidence]
     ) -> None: ...
@@ -85,6 +89,14 @@ class RetroRepository(Protocol):
     ) -> list[ProjectMapping]: ...
 
     def deactivate_project_mapping(self, mapping_id: str, actor: str) -> None: ...
+
+    def reclassify_session(
+        self,
+        session_id: str,
+        project_id: str,
+        mapping_id: str,
+        actor: str,
+    ) -> str: ...
 
     def save_projection_event(
         self,

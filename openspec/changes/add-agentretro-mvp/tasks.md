@@ -16,7 +16,7 @@
 - [x] 2.5 Implement Git-root and normalized-remote project routing plus audited SQLite project mapping records, including unknown and ambiguous project states.
 - [x] 2.6 Implement pre-model and pre-persistence redaction, minimal evidence excerpts, source locators, and tests proving captured instructions cannot trigger actions.
 - [x] 2.7 Wire `retro capture` to one database transaction so parser or evidence failure creates no partial session, candidate, or knowledge state.
-- [x] 2.8 Implement `retro project map/list/remove/reclassify` with containment checks, collision rejection, actor/time audit records, and reclassification of awaiting sessions without reparsing source events.
+- [ ] 2.8 Implement `retro project map/list/remove/reclassify` with containment checks, collision rejection, actor/time audit records, and reclassification of awaiting sessions without reparsing source events.
 - [x] 2.9 Bound newest-first session discovery by configured candidate count and deadline, stream parsing, reject oversized files before model work, and preserve an explicit diagnostic for every skipped or timed-out source.
 - [ ] 2.10 Add tests whose names or metadata reference every Codex retrospective scenario `CR-01` through `CR-22`, and record the scenario-to-test mapping in verification evidence.
 

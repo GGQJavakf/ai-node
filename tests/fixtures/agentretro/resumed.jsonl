@@ -1,0 +1,4 @@
+{"version":1,"type":"session_meta","timestamp":"2026-07-18T08:04:00Z","payload":{"id":"session-resumed","cwd":"C:/synthetic/project"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:04:01Z","payload":{"type":"task_started","id":"start-resumed-1"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:04:02Z","payload":{"type":"task_complete","id":"complete-resumed-1"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:04:03Z","payload":{"type":"task_started","id":"start-resumed-2"}}

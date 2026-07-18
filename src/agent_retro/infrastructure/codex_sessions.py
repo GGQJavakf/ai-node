@@ -49,6 +49,13 @@ class DiscoveryDiagnostics:
     diagnostics: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _SessionCandidate:
+    path: Path
+    size: int
+    modified_ns: int
+
+
 def effective_codex_home(
     *, home: Path | None = None, env: Mapping[str, str] | None = None
 ) -> Path:
@@ -90,26 +97,31 @@ class CodexSessionSource:
 
     def latest_completed(self) -> NormalizedSession:
         self._begin_discovery()
-        self._require_home()
         deadline = self.monotonic() + self.discovery_timeout_seconds
-        for path in self._session_paths_newest_first()[: self.max_candidates]:
-            if self.monotonic() >= deadline:
-                message = "会话发现超过配置时限"
-                self._diagnostics.append(message)
-                self._finish_discovery()
-                raise SessionDiscoveryTimeout(message)
-            self._inspected_count += 1
-            try:
-                session = self._parse_bounded(path)
-            except CodexSessionError as exc:
-                self._diagnostics.append(f"跳过 {path}: {exc}")
-                continue
-            if session.completed:
-                self._finish_discovery()
-                return session
-            self._diagnostics.append(
-                f"跳过未完成会话 {session.source_session_id}: {path}"
-            )
+        try:
+            self._require_home(deadline)
+            candidates = self._session_candidates_newest_first(deadline)
+            for candidate in candidates:
+                self._check_deadline(deadline)
+                try:
+                    session = self._parse_bounded(candidate, deadline)
+                except SessionDiscoveryTimeout:
+                    raise
+                except CodexSessionError as exc:
+                    self._diagnostics.append(
+                        f"跳过 {candidate.path}: {exc}"
+                    )
+                    continue
+                if session.completed:
+                    self._finish_discovery()
+                    return session
+                self._diagnostics.append(
+                    "跳过未完成会话 "
+                    f"{session.source_session_id}: {candidate.path}"
+                )
+        except BaseException:
+            self._finish_discovery()
+            raise
         self._finish_discovery()
         raise SessionNotFoundError("未找到已完成的 Codex 会话")
 
@@ -117,14 +129,131 @@ class CodexSessionSource:
         if not session_id or not session_id.strip():
             raise SessionNotFoundError("Codex 会话 ID 不能为空")
         self._begin_discovery()
-        self._require_home()
-        path = self._path_for(session_id)
-        self._inspected_count = 1
-        session = self._parse_bounded(path)
+        deadline = self.monotonic() + self.discovery_timeout_seconds
+        try:
+            self._require_home(deadline)
+            candidates = self._session_candidates_newest_first(deadline)
+            session = self._load_candidate(session_id, candidates, deadline)
+        except BaseException:
+            self._finish_discovery()
+            raise
         self._finish_discovery()
         if not session.completed:
             raise IncompleteSessionError(f"Codex 会话仍在进行: {session_id}")
         return session
+
+    def _load_candidate(
+        self,
+        session_id: str,
+        candidates: list[_SessionCandidate],
+        deadline: float,
+    ) -> NormalizedSession:
+        aliases = {session_id, session_id.removeprefix("session-")}
+        self._check_deadline(deadline)
+        direct = [
+            candidate
+            for candidate in candidates
+            if candidate.path.stem in aliases
+            or session_id in candidate.path.stem
+        ]
+        self._check_deadline(deadline)
+        for candidate in direct:
+            session = self._parse_bounded(candidate, deadline)
+            if session.source_session_id == session_id:
+                return session
+            self._diagnostics.append(
+                f"跳过 ID 不匹配会话 {candidate.path}"
+            )
+        for candidate in candidates:
+            if candidate in direct:
+                continue
+            self._check_size(candidate)
+            if self._peek_session_id(candidate, deadline) == session_id:
+                return self._parse_bounded(candidate, deadline)
+        raise SessionNotFoundError(f"未找到 Codex 会话: {session_id}")
+
+    def _check_deadline(self, deadline: float) -> None:
+        if self.monotonic() >= deadline:
+            message = "会话发现超过配置时限"
+            if message not in self._diagnostics:
+                self._diagnostics.append(message)
+            raise SessionDiscoveryTimeout(message)
+
+    def _require_home(self, deadline: float) -> None:
+        self._check_deadline(deadline)
+        available = self.codex_home.is_dir()
+        self._check_deadline(deadline)
+        if not available:
+            raise SessionNotFoundError(
+                f"Codex 会话源不可用: {self.codex_home}"
+            )
+
+    def _session_candidates_newest_first(
+        self, deadline: float
+    ) -> list[_SessionCandidate]:
+        directories = [self.codex_home]
+        candidates: list[_SessionCandidate] = []
+        while directories:
+            self._check_deadline(deadline)
+            directory = directories.pop(0)
+            try:
+                with os.scandir(directory) as entries:
+                    self._check_deadline(deadline)
+                    child_directories: list[tuple[int, Path]] = []
+                    for entry in entries:
+                        self._check_deadline(deadline)
+                        entry_path = Path(entry.path)
+                        try:
+                            is_symlink = entry.is_symlink()
+                            self._check_deadline(deadline)
+                            if is_symlink:
+                                continue
+                            is_directory = entry.is_dir(follow_symlinks=False)
+                            self._check_deadline(deadline)
+                            if is_directory:
+                                stat = entry_path.stat()
+                                self._check_deadline(deadline)
+                                child_directories.append(
+                                    (stat.st_mtime_ns, entry_path)
+                                )
+                                continue
+                            if not entry.name.lower().endswith(".jsonl"):
+                                continue
+                            stat = entry_path.stat()
+                            self._check_deadline(deadline)
+                            candidates.append(
+                                _SessionCandidate(
+                                    path=entry_path,
+                                    size=stat.st_size,
+                                    modified_ns=stat.st_mtime_ns,
+                                )
+                            )
+                            candidates.sort(
+                                key=lambda item: (
+                                    item.modified_ns,
+                                    str(item.path),
+                                ),
+                                reverse=True,
+                            )
+                            if len(candidates) > self.max_candidates:
+                                candidates.pop()
+                        except OSError as exc:
+                            self._diagnostics.append(
+                                f"跳过无法检查路径 {entry_path}: {exc}"
+                            )
+                    child_directories.sort(
+                        key=lambda item: (item[0], str(item[1])), reverse=True
+                    )
+                    self._check_deadline(deadline)
+                    directories[0:0] = [item[1] for item in child_directories]
+            except OSError as exc:
+                self._diagnostics.append(f"跳过无法枚举目录 {directory}: {exc}")
+        candidates.sort(
+            key=lambda item: (item.modified_ns, str(item.path)), reverse=True
+        )
+        self._check_deadline(deadline)
+        self._inspected_count = len(candidates)
+        return candidates
 
     def _begin_discovery(self) -> None:
         self._warnings = []
@@ -139,47 +268,19 @@ class CodexSessionSource:
             diagnostics=tuple(self._diagnostics),
         )
 
-    def _require_home(self) -> None:
-        if not self.codex_home.is_dir():
-            raise SessionNotFoundError(
-                f"Codex 会话源不可用: {self.codex_home}"
-            )
-
-    def _session_paths_newest_first(self) -> list[Path]:
-        paths = list(self.codex_home.rglob("*.jsonl"))
-        return sorted(
-            paths,
-            key=lambda path: (path.stat().st_mtime_ns, str(path)),
-            reverse=True,
-        )
-
-    def _path_for(self, session_id: str) -> Path:
-        paths = self._session_paths_newest_first()
-        aliases = {session_id, session_id.removeprefix("session-")}
-        filename_matches = [
-            path
-            for path in paths
-            if path.stem in aliases or session_id in path.stem
-        ]
-        for path in filename_matches:
-            identity = self._peek_session_id(path)
-            if identity in (None, session_id):
-                return path
-        for path in paths:
-            if path in filename_matches:
-                continue
-            if self._peek_session_id(path) == session_id:
-                return path
-        raise SessionNotFoundError(f"未找到 Codex 会话: {session_id}")
-
-    @staticmethod
-    def _peek_session_id(path: Path) -> str | None:
+    def _peek_session_id(
+        self, candidate: _SessionCandidate, deadline: float
+    ) -> str | None:
+        self._check_size(candidate)
+        self._check_deadline(deadline)
         try:
-            with path.open("r", encoding="utf-8") as stream:
+            with candidate.path.open("r", encoding="utf-8") as stream:
                 for line in stream:
+                    self._check_deadline(deadline)
                     if not line.strip():
                         continue
                     value = json.loads(line)
+                    self._check_deadline(deadline)
                     if value.get("type") != "session_meta":
                         return None
                     payload = value.get("payload")
@@ -188,18 +289,21 @@ class CodexSessionSource:
             return None
         return None
 
-    def _parse_bounded(self, path: Path) -> NormalizedSession:
-        try:
-            size = path.stat().st_size
-        except OSError as exc:
-            raise SessionNotFoundError(f"无法读取 Codex 会话: {path}") from exc
-        if size > self.max_session_bytes:
+    def _check_size(self, candidate: _SessionCandidate) -> None:
+        if candidate.size > self.max_session_bytes:
             raise SessionSizeLimitError(
-                f"Codex 会话超过 {self.max_session_bytes} 字节限制: {path}"
+                "Codex 会话超过 "
+                f"{self.max_session_bytes} 字节限制: {candidate.path}"
             )
-        return self._parse(path)
 
-    def _parse(self, path: Path) -> NormalizedSession:
+    def _parse_bounded(
+        self, candidate: _SessionCandidate, deadline: float
+    ) -> NormalizedSession:
+        self._check_size(candidate)
+        self._check_deadline(deadline)
+        return self._parse(candidate.path, deadline)
+
+    def _parse(self, path: Path, deadline: float) -> NormalizedSession:
         digest = hashlib.sha256()
         session_id: str | None = None
         project_id: str | None = None
@@ -210,6 +314,7 @@ class CodexSessionSource:
         try:
             with path.open("rb") as stream:
                 for line_number, raw_line in enumerate(stream, start=1):
+                    self._check_deadline(deadline)
                     digest.update(raw_line)
                     if not raw_line.strip():
                         continue
@@ -223,6 +328,7 @@ class CodexSessionSource:
                         raise SessionFormatError(
                             f"JSONL 记录必须是对象，行 {line_number}: {path}"
                         )
+                    self._check_deadline(deadline)
                     version = record.get("version")
                     if version not in (None, 1, "1"):
                         raise SessionFormatError(
@@ -242,15 +348,6 @@ class CodexSessionSource:
                         project_id = _required_text(
                             payload.get("cwd"), "session source locator"
                         )
-                        status = payload.get("status")
-                        if status == "completed":
-                            completion_state = True
-                        elif status in ("active", "running"):
-                            completion_state = False
-                        elif status is not None:
-                            raise SessionFormatError(
-                                f"未知 Codex 会话状态 {status}: {path}"
-                            )
                         completed_at = _parse_timestamp(record.get("timestamp"))
                         continue
                     if not saw_meta or session_id is None:
@@ -268,6 +365,8 @@ class CodexSessionSource:
                     if normalized is _COMPLETION:
                         completion_state = True
                         completed_at = _parse_timestamp(record.get("timestamp"))
+                    elif normalized in (_STARTED, _ABORTED):
+                        completion_state = False
                     elif isinstance(normalized, NormalizedEvent):
                         events.append(normalized)
         except OSError as exc:
@@ -278,7 +377,7 @@ class CodexSessionSource:
         if project_id is None:
             raise SessionFormatError(f"缺少 session source locator: {path}")
         if completion_state is None:
-            raise SessionFormatError(f"缺少 completion state: {path}")
+            completion_state = False
         if completed_at is None:
             completed_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
         source_hash = digest.hexdigest()
@@ -311,6 +410,10 @@ class CodexSessionSource:
             "turn_complete",
         ):
             return _COMPLETION
+        if payload_type == "task_started":
+            return _STARTED
+        if payload_type == "turn_aborted" or record_type == "turn_aborted":
+            return _ABORTED
 
         kind: str | None = None
         content: str | None = None
@@ -360,6 +463,8 @@ class CodexSessionSource:
 
 
 _COMPLETION = object()
+_STARTED = object()
+_ABORTED = object()
 
 
 def _required_text(value: object, field: str) -> str:

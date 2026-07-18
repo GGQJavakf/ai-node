@@ -1,2 +1,3 @@
-{"version":1,"type":"session_meta","timestamp":"2026-07-18T08:02:00Z","payload":{"cwd":"C:/synthetic/project","status":"completed"}}
-{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:02:01Z","payload":{"type":"task_complete","id":"complete-malformed"}}
+{"version":1,"type":"session_meta","timestamp":"2026-07-18T08:02:00Z","payload":{"cwd":"C:/synthetic/project"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:02:01Z","payload":{"type":"task_started","id":"start-malformed"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:02:02Z","payload":{"type":"task_complete","id":"complete-malformed"}}

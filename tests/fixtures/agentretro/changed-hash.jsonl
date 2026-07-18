@@ -1,5 +1,6 @@
-{"version":1,"type":"session_meta","timestamp":"2026-07-18T08:00:00Z","payload":{"id":"session-completed","cwd":"C:/synthetic/project","status":"completed"}}
-{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:00:01Z","payload":{"type":"user_message","id":"user-1","message":"The same source identity now has different bytes."}}
-{"version":1,"type":"response_item","timestamp":"2026-07-18T08:00:02Z","payload":{"type":"message","id":"assistant-1","role":"assistant","content":[{"type":"output_text","text":"Changed source content must be rejected."}]}}
-{"version":1,"type":"response_item","timestamp":"2026-07-18T08:00:03Z","payload":{"type":"function_call_output","id":"command-1","call_id":"call-1","output":"Process exited with code 0"}}
-{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:00:04Z","payload":{"type":"task_complete","id":"complete-1"}}
+{"version":1,"type":"session_meta","timestamp":"2026-07-18T08:00:00Z","payload":{"id":"session-completed","cwd":"C:/synthetic/project"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:00:01Z","payload":{"type":"task_started","id":"start-1"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:00:02Z","payload":{"type":"user_message","id":"user-1","message":"The same source identity now has different bytes."}}
+{"version":1,"type":"response_item","timestamp":"2026-07-18T08:00:03Z","payload":{"type":"message","id":"assistant-1","role":"assistant","content":[{"type":"output_text","text":"Changed source content must be rejected."}]}}
+{"version":1,"type":"response_item","timestamp":"2026-07-18T08:00:04Z","payload":{"type":"function_call_output","id":"command-1","call_id":"call-1","output":"Process exited with code 0"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:00:05Z","payload":{"type":"task_complete","id":"complete-1"}}

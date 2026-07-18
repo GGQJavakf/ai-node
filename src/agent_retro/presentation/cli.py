@@ -55,11 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
     project_commands.add_parser("list", help="列出活动项目映射")
     remove = project_commands.add_parser("remove", help="停用项目映射")
     remove.add_argument("mapping_id")
-    reclassify = project_commands.add_parser(
-        "reclassify", help="使用已存证据重新分类会话"
-    )
-    reclassify.add_argument("session_id")
-    reclassify.add_argument("mapping_id")
     return parser
 
 
@@ -120,7 +115,9 @@ def _run_command(
         return 0
 
     service = ProjectMappingService(
-        repository, vault_root=settings.obsidian_root
+        repository,
+        vault_root=settings.obsidian_root,
+        review_stored_evidence=_review_unavailable,
     )
     if args.project_command == "map":
         mapping = service.map(args.root, args.vault_project)
@@ -131,12 +128,7 @@ def _run_command(
         service.remove(args.mapping_id)
         data = {"mapping_id": args.mapping_id, "active": False}
     else:
-        service.reclassify(args.session_id, args.mapping_id)
-        data = {
-            "session_id": args.session_id,
-            "mapping_id": args.mapping_id,
-            "reclassified": True,
-        }
+        raise ValueError(f"unsupported project command: {args.project_command}")
     if args.json_output:
         write_json(
             {
@@ -193,3 +185,7 @@ def json_text(value: object) -> str:
     import json
 
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _review_unavailable(session_id, project_id, evidence) -> None:
+    raise RuntimeError("项目重分类将在 ReviewService 接入后开放")

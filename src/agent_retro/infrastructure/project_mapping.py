@@ -160,8 +160,10 @@ class ProjectMappingService:
         repository: RetroRepository,
         *,
         vault_root: Path | None,
-        review_stored_evidence: ReviewStoredEvidence | None = None,
+        review_stored_evidence: ReviewStoredEvidence,
     ) -> None:
+        if not callable(review_stored_evidence):
+            raise TypeError("review_stored_evidence callback is required")
         self.repository = repository
         self.vault_root = Path(vault_root).expanduser().resolve() if vault_root else None
         self.review_stored_evidence = review_stored_evidence
@@ -210,45 +212,23 @@ class ProjectMappingService:
         mapping = mappings.get(mapping_id)
         if mapping is None:
             raise ProjectMappingError(f"项目映射不存在或已停用: {mapping_id}")
-        internal_session_id: str
-        with self.repository.transaction() as connection:
-            row = connection.execute(
-                "SELECT id, project_id FROM sessions "
-                "WHERE source_session_id = ? OR id = ? ORDER BY captured_at LIMIT 1",
-                (session_id, session_id),
-            ).fetchone()
-            if row is None:
-                raise ProjectMappingError(f"会话不存在: {session_id}")
-            if not str(row["project_id"]).startswith("awaiting"):
-                raise ProjectMappingConflictError(
-                    f"会话不在 awaiting classification 状态: {session_id}"
-                )
-            internal_session_id = str(row["id"])
-            connection.execute(
-                "UPDATE sessions SET project_id = ? WHERE id = ?",
-                (mapping.obsidian_project, internal_session_id),
+        session = self.repository.find_session_by_source_id(session_id)
+        if session is None:
+            raise ProjectMappingError(f"会话不存在: {session_id}")
+        if not session.project_id.startswith("awaiting:"):
+            raise ProjectMappingConflictError(
+                f"会话不在 awaiting classification 状态: {session_id}"
             )
-            append = getattr(self.repository, "_append_audit_record", None)
-            make_entry = getattr(self.repository, "_audit_entry", None)
-            if callable(append) and callable(make_entry):
-                append(
-                    connection,
-                    make_entry(
-                        actor=actor,
-                        action="session_reclassified",
-                        entity_type="session",
-                        entity_id=internal_session_id,
-                        after_hash=hashlib.sha256(
-                            mapping.obsidian_project.encode("utf-8")
-                        ).hexdigest(),
-                        detail={"mapping_id": mapping.id},
-                    ),
-                )
-        if self.review_stored_evidence is not None:
-            evidence = self.repository.list_evidence(internal_session_id)
-            self.review_stored_evidence(
-                session_id, mapping.obsidian_project, tuple(evidence)
-            )
+        evidence = self.repository.list_evidence(session.id)
+        self.review_stored_evidence(
+            session_id, mapping.obsidian_project, tuple(evidence)
+        )
+        self.repository.reclassify_session(
+            session_id,
+            mapping.obsidian_project,
+            mapping.id,
+            actor,
+        )
 
     def _validated_project(self, obsidian_project: str) -> str:
         if self.vault_root is None:

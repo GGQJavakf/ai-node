@@ -1006,6 +1006,59 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
 
+    def reclassify_session(
+        self,
+        session_id: str,
+        project_id: str,
+        mapping_id: str,
+        actor: str,
+    ) -> str:
+        """Assign an awaiting session after its stored evidence was reviewed."""
+
+        with self.transaction() as connection:
+            mapping = connection.execute(
+                "SELECT obsidian_project FROM project_mappings "
+                "WHERE id = ? AND active = 1",
+                (mapping_id,),
+            ).fetchone()
+            if mapping is None:
+                raise ValueError(f"project mapping not found: {mapping_id}")
+            if str(mapping["obsidian_project"]) != project_id:
+                raise ValueError(
+                    f"project mapping target mismatch: {mapping_id}"
+                )
+            row = connection.execute(
+                "SELECT id, project_id FROM sessions "
+                "WHERE source_session_id = ? OR id = ? "
+                "ORDER BY captured_at LIMIT 1",
+                (session_id, session_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"session not found: {session_id}")
+            before_project = str(row["project_id"])
+            if not before_project.startswith("awaiting:"):
+                raise ValueError(
+                    f"session is not awaiting classification: {session_id}"
+                )
+            internal_session_id = str(row["id"])
+            connection.execute(
+                "UPDATE sessions SET project_id = ? WHERE id = ?",
+                (project_id, internal_session_id),
+            )
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    actor=actor,
+                    action="session_reclassified",
+                    entity_type="session",
+                    entity_id=internal_session_id,
+                    before_hash=_hash_value({"project_id": before_project}),
+                    after_hash=_hash_value({"project_id": project_id}),
+                    detail={"mapping_id": mapping_id},
+                ),
+            )
+            return internal_session_id
+
     def save_projection_event(
         self,
         event_id: str,

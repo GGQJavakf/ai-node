@@ -74,16 +74,14 @@ class CaptureService:
                 warnings=self.source.last_discovery.warnings,
                 project_status=_persisted_project_status(existing.project_id),
             )
-        find_by_identity = getattr(
-            self.repository, "find_session_by_source_id", None
+        conflicting = self.repository.find_session_by_source_id(
+            source_session.source_session_id
         )
-        if callable(find_by_identity):
-            conflicting = find_by_identity(source_session.source_session_id)
-            if conflicting is not None:
-                raise SourceIntegrityError(
-                    "Codex 会话源哈希发生冲突: "
-                    f"{source_session.source_session_id}"
-                )
+        if conflicting is not None:
+            raise SourceIntegrityError(
+                "Codex 会话源哈希发生冲突: "
+                f"{source_session.source_session_id}"
+            )
 
         resolution = self._resolve_project(source_session.project_id)
         # Pass 1: values are redacted before any future model consumer can see
