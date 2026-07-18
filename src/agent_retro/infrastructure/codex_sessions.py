@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,7 +55,15 @@ class DiscoveryDiagnostics:
 class _SessionCandidate:
     path: Path
     size: int
-    modified_ns: int
+
+
+_SESSION_PATH_PATTERN = re.compile(
+    r"^rollout-"
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-"
+    r"(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$",
+    re.IGNORECASE,
+)
 
 
 def effective_codex_home(
@@ -191,16 +201,15 @@ class CodexSessionSource:
     def _session_candidates_newest_first(
         self, deadline: float
     ) -> list[_SessionCandidate]:
-        directories = [self.codex_home]
-        candidates: list[_SessionCandidate] = []
-        limit_reached = False
-        while directories and not limit_reached:
+        directories = [self.codex_home / "sessions"]
+        newest: list[tuple[tuple[str, str], str, Path]] = []
+        while directories:
             self._check_deadline(deadline)
             directory = directories.pop(0)
             try:
                 with os.scandir(directory) as entries:
                     self._check_deadline(deadline)
-                    child_directories: list[tuple[int, Path]] = []
+                    child_directories: list[Path] = []
                     for entry in entries:
                         self._check_deadline(deadline)
                         entry_path = Path(entry.path)
@@ -208,52 +217,103 @@ class CodexSessionSource:
                             is_symlink = entry.is_symlink()
                             self._check_deadline(deadline)
                             if is_symlink:
+                                self._diagnostics.append(
+                                    f"跳过符号链接 Codex 会话来源 {entry_path}"
+                                )
                                 continue
                             is_directory = entry.is_dir(follow_symlinks=False)
                             self._check_deadline(deadline)
                             if is_directory:
-                                stat = entry_path.stat()
-                                self._check_deadline(deadline)
-                                child_directories.append(
-                                    (stat.st_mtime_ns, entry_path)
-                                )
+                                child_directories.append(entry_path)
                                 continue
                             if not entry.name.lower().endswith(".jsonl"):
                                 continue
-                            stat = entry_path.stat()
-                            self._check_deadline(deadline)
-                            candidates.append(
-                                _SessionCandidate(
-                                    path=entry_path,
-                                    size=stat.st_size,
-                                    modified_ns=stat.st_mtime_ns,
-                                )
+                            recency_key = self._trusted_recency_key(entry_path)
+                            if recency_key is None:
+                                continue
+                            discovered = (
+                                recency_key,
+                                str(entry_path),
+                                entry_path,
                             )
-                            if len(candidates) == self.max_candidates:
+                            if len(newest) < self.max_candidates:
+                                heapq.heappush(newest, discovered)
+                            elif discovered > newest[0]:
+                                skipped = heapq.heapreplace(newest, discovered)
                                 self._diagnostics.append(
-                                    "已达到候选数量上限 "
-                                    f"{self.max_candidates}；"
-                                    "未继续枚举剩余来源"
+                                    "跳过超出最新候选数量限制 "
+                                    f"{self.max_candidates} 的 Codex 会话 "
+                                    f"{skipped[2]}"
                                 )
-                                limit_reached = True
-                                break
+                            else:
+                                self._diagnostics.append(
+                                    "跳过超出最新候选数量限制 "
+                                    f"{self.max_candidates} 的 Codex 会话 "
+                                    f"{entry_path}"
+                                )
                         except OSError as exc:
                             self._diagnostics.append(
                                 f"跳过无法检查路径 {entry_path}: {exc}"
                             )
                     child_directories.sort(
-                        key=lambda item: (item[0], str(item[1])), reverse=True
+                        key=lambda item: (item.name, str(item)), reverse=True
                     )
                     self._check_deadline(deadline)
-                    directories[0:0] = [item[1] for item in child_directories]
+                    directories[0:0] = child_directories
             except OSError as exc:
                 self._diagnostics.append(f"跳过无法枚举目录 {directory}: {exc}")
-        candidates.sort(
-            key=lambda item: (item.modified_ns, str(item.path)), reverse=True
-        )
         self._check_deadline(deadline)
+        candidates: list[_SessionCandidate] = []
+        for _, _, path in sorted(newest, reverse=True):
+            self._check_deadline(deadline)
+            try:
+                stat = path.stat()
+                self._check_deadline(deadline)
+            except OSError as exc:
+                self._diagnostics.append(f"跳过无法检查路径 {path}: {exc}")
+                continue
+            candidates.append(
+                _SessionCandidate(
+                    path=path,
+                    size=stat.st_size,
+                )
+            )
         self._inspected_count = len(candidates)
         return candidates
+
+    def _trusted_recency_key(self, path: Path) -> tuple[str, str] | None:
+        try:
+            relative = path.relative_to(self.codex_home)
+        except ValueError:
+            relative = path
+        parts = relative.parts
+        match = _SESSION_PATH_PATTERN.fullmatch(path.name)
+        expected_shape = len(parts) == 5 and parts[0].lower() == "sessions"
+        if match is None or not expected_shape:
+            self._diagnostics.append(
+                "跳过非规范 Codex 会话路径 "
+                f"{path}: 需要 sessions/YYYY/MM/DD/"
+                "rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl"
+            )
+            return None
+        timestamp = match.group("timestamp")
+        try:
+            datetime.strptime(timestamp, "%Y-%m-%dT%H-%M-%S")
+        except ValueError:
+            self._diagnostics.append(
+                f"跳过非规范 Codex 会话路径 {path}: 文件名时间无效"
+            )
+            return None
+        if parts[1:4] != (
+            timestamp[0:4],
+            timestamp[5:7],
+            timestamp[8:10],
+        ):
+            self._diagnostics.append(
+                f"跳过非规范 Codex 会话路径 {path}: 目录日期与文件名不一致"
+            )
+            return None
+        return timestamp, match.group("uuid").lower()
 
     def _begin_discovery(self) -> None:
         self._warnings = []

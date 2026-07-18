@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -16,7 +17,6 @@ from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     IncompleteSessionError,
     SessionDiscoveryTimeout,
-    SessionFormatError,
     SessionNotFoundError,
     SessionSizeLimitError,
     effective_codex_home,
@@ -36,6 +36,28 @@ from agent_retro.presentation.cli import build_parser, main
 @pytest.fixture
 def fixtures_dir() -> Path:
     return Path(__file__).parent / "fixtures" / "agentretro"
+
+
+@pytest.fixture
+def codex_home(fixtures_dir: Path, tmp_path: Path) -> Path:
+    home = tmp_path / "codex-home"
+    for index, name in enumerate(
+        (
+            "aborted",
+            "active",
+            "completed",
+            "resumed",
+            "unknown-event",
+        ),
+        start=1,
+    ):
+        _copy_fixture(
+            fixtures_dir,
+            home,
+            name,
+            timestamp=f"2026-07-18T{index:02d}-00-00",
+        )
+    return home
 
 
 def _repository(tmp_path: Path) -> SQLiteRetroRepository:
@@ -61,19 +83,91 @@ def _git_repository(path: Path, remote: str) -> Path:
     return path.resolve()
 
 
-def _copy_fixture(fixtures_dir: Path, target: Path, name: str) -> Path:
-    target.mkdir(parents=True, exist_ok=True)
-    destination = target / f"{name}.jsonl"
+def _standard_session_path(
+    codex_home: Path,
+    identity: str,
+    *,
+    timestamp: str,
+    directory_date: str | None = None,
+) -> Path:
+    date = directory_date or timestamp[:10]
+    year, month, day = date.split("-")
+    return (
+        codex_home
+        / "sessions"
+        / year
+        / month
+        / day
+        / f"rollout-{timestamp}-{uuid5(NAMESPACE_URL, f'{identity}:{timestamp}')}.jsonl"
+    )
+
+
+def _copy_fixture(
+    fixtures_dir: Path,
+    codex_home: Path,
+    name: str,
+    *,
+    timestamp: str = "2026-07-18T12-00-00",
+    directory_date: str | None = None,
+) -> Path:
+    destination = _standard_session_path(
+        codex_home,
+        name,
+        timestamp=timestamp,
+        directory_date=directory_date,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes((fixtures_dir / f"{name}.jsonl").read_bytes())
     return destination
+
+
+class _ScandirEntries:
+    def __init__(self, entries, on_yield=lambda entry: None):
+        self._entries = iter(entries)
+        self._on_yield = on_yield
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        entry = next(self._entries)
+        self._on_yield(entry)
+        return entry
+
+
+def _track_jsonl_io(monkeypatch):
+    real_stat = Path.stat
+    real_open = Path.open
+    stated: list[Path] = []
+    opened: list[Path] = []
+
+    def tracked_stat(path, *args, **kwargs):
+        if path.suffix.lower() == ".jsonl":
+            stated.append(path)
+        return real_stat(path, *args, **kwargs)
+
+    def tracked_open(path, *args, **kwargs):
+        if path.suffix.lower() == ".jsonl":
+            opened.append(path)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", tracked_stat)
+    monkeypatch.setattr(Path, "open", tracked_open)
+    return stated, opened
 
 
 def _ignore_review(session_id, project_id, evidence):
     return None
 
 
-def test_completed_session_is_normalized(fixtures_dir):
-    source = CodexSessionSource(fixtures_dir)
+def test_completed_session_is_normalized(codex_home):
+    source = CodexSessionSource(codex_home)
 
     session = source.load("session-completed")
 
@@ -85,25 +179,28 @@ def test_completed_session_is_normalized(fixtures_dir):
         "command",
     ]
     assert len({event.id for event in session.events}) == 3
-    assert all(event.locator.source_path.endswith("completed.jsonl") for event in session.events)
+    assert all(
+        Path(event.locator.source_path).name.startswith("rollout-2026-07-18T03-00-00-")
+        for event in session.events
+    )
 
 
-def test_active_session_is_rejected(fixtures_dir):
-    source = CodexSessionSource(fixtures_dir)
+def test_active_session_is_rejected(codex_home):
+    source = CodexSessionSource(codex_home)
 
     with pytest.raises(IncompleteSessionError):
         source.load("session-active")
 
 
 @pytest.mark.parametrize("session_id", ["session-resumed", "session-aborted"])
-def test_nonterminal_real_lifecycle_is_rejected(fixtures_dir, session_id):
-    source = CodexSessionSource(fixtures_dir)
+def test_nonterminal_real_lifecycle_is_rejected(codex_home, session_id):
+    source = CodexSessionSource(codex_home)
 
     with pytest.raises(IncompleteSessionError, match=session_id):
         source.load(session_id)
 
 
-def test_versionless_real_lifecycle_record_is_supported(fixtures_dir):
+def test_versionless_real_lifecycle_record_is_supported(fixtures_dir, codex_home):
     first_record = json.loads(
         (fixtures_dir / "unknown-event.jsonl")
         .read_text(encoding="utf-8")
@@ -111,13 +208,18 @@ def test_versionless_real_lifecycle_record_is_supported(fixtures_dir):
     )
     assert "version" not in first_record
 
-    session = CodexSessionSource(fixtures_dir).load("session-unknown")
+    session = CodexSessionSource(codex_home).load("session-unknown")
 
     assert session.completed is True
 
 
 def test_session_without_a_terminal_complete_is_incomplete(tmp_path):
-    session_path = tmp_path / "no-terminal.jsonl"
+    session_path = _standard_session_path(
+        tmp_path,
+        "no-terminal",
+        timestamp="2026-07-18T12-00-00",
+    )
+    session_path.parent.mkdir(parents=True)
     session_path.write_text(
         "\n".join(
             [
@@ -149,15 +251,20 @@ def test_session_without_a_terminal_complete_is_incomplete(tmp_path):
         CodexSessionSource(tmp_path).load("session-no-terminal")
 
 
-def test_malformed_session_fails_closed(fixtures_dir):
-    source = CodexSessionSource(fixtures_dir)
+def test_malformed_session_fails_closed(fixtures_dir, tmp_path):
+    _copy_fixture(fixtures_dir, tmp_path, "malformed")
+    source = CodexSessionSource(tmp_path)
 
-    with pytest.raises(SessionFormatError, match="session ID"):
-        source.load("malformed")
+    with pytest.raises(SessionNotFoundError):
+        source.latest_completed()
+
+    assert any(
+        "缺少 session ID" in item for item in source.last_discovery.diagnostics
+    )
 
 
-def test_unknown_optional_event_is_diagnosed_and_never_normalized(fixtures_dir):
-    source = CodexSessionSource(fixtures_dir)
+def test_unknown_optional_event_is_diagnosed_and_never_normalized(codex_home):
+    source = CodexSessionSource(codex_home)
 
     session = source.load("session-unknown")
 
@@ -165,93 +272,151 @@ def test_unknown_optional_event_is_diagnosed_and_never_normalized(fixtures_dir):
     assert any("future_optional_event" in warning for warning in source.last_discovery.warnings)
 
 
-def test_discovery_stops_at_configured_count(fixtures_dir, tmp_path):
-    sessions = tmp_path / "sessions"
-    first_directory = sessions / "2026" / "07" / "20"
-    second_directory = sessions / "2026" / "07" / "19"
-    third_directory = sessions / "2026" / "07" / "18"
-    first = _copy_fixture(fixtures_dir, first_directory, "active")
-    second = _copy_fixture(fixtures_dir, second_directory, "unknown-event")
-    third = _copy_fixture(fixtures_dir, third_directory, "completed")
-    os.utime(first, (30, 30))
-    os.utime(second, (20, 20))
-    os.utime(third, (10, 10))
-    os.utime(first_directory, (30, 30))
-    os.utime(second_directory, (20, 20))
-    os.utime(third_directory, (10, 10))
-    source = CodexSessionSource(sessions, max_candidates=2)
+def test_candidate_budget_selects_global_newest_before_stat_and_parse(
+    fixtures_dir, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    old = _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "completed",
+        timestamp="2026-07-18T10-00-00",
+    )
+    newest = _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "active",
+        timestamp="2026-07-18T12-00-00",
+    )
+    second_newest = _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "unknown-event",
+        timestamp="2026-07-18T11-00-00",
+    )
+    os.utime(old, (10, 10))
+    os.utime(newest, (30, 30))
+    os.utime(second_newest, (20, 20))
+    leaf = old.parent
+    real_scandir = os.scandir
+    yielded_jsonl: list[Path] = []
 
+    def shuffled_scandir(path):
+        if Path(path) != leaf:
+            return real_scandir(path)
+        with real_scandir(path) as entries:
+            by_path = {Path(entry.path): entry for entry in entries}
+        return _ScandirEntries(
+            [by_path[old], by_path[newest], by_path[second_newest]],
+            lambda entry: yielded_jsonl.append(Path(entry.path)),
+        )
+
+    monkeypatch.setattr(os, "scandir", shuffled_scandir)
+    stated_jsonl, opened_jsonl = _track_jsonl_io(monkeypatch)
+
+    source = CodexSessionSource(codex_home, max_candidates=2)
     session = source.latest_completed()
 
     assert session.source_session_id == "session-unknown"
-    assert source.last_discovery.inspected_count <= 2
-    assert any("session-active" in item for item in source.last_discovery.diagnostics)
-    assert any("候选数量上限" in item for item in source.last_discovery.diagnostics)
-
-
-def test_candidate_budget_stops_discovery_and_stat_work_in_a_large_tree(
-    fixtures_dir, tmp_path, monkeypatch
-):
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    template = (fixtures_dir / "active.jsonl").read_text(encoding="utf-8")
-    for index in range(20):
-        (sessions / f"candidate-{index:02d}.jsonl").write_text(
-            template.replace("session-active", f"session-{index:02d}"),
-            encoding="utf-8",
-        )
-    real_scandir = os.scandir
-    real_stat = Path.stat
-    jsonl_scans = 0
-    jsonl_stats = 0
-
-    def bounded_stat(path, *args, **kwargs):
-        nonlocal jsonl_stats
-        if path.suffix == ".jsonl":
-            jsonl_stats += 1
-            if jsonl_stats > 2:
-                raise AssertionError("candidate count did not stop stat work")
-        return real_stat(path, *args, **kwargs)
-
-    class BoundedScan:
-        def __init__(self, path):
-            self.inner = real_scandir(path)
-
-        def __enter__(self):
-            self.inner.__enter__()
-            return self
-
-        def __exit__(self, *args):
-            return self.inner.__exit__(*args)
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            nonlocal jsonl_scans
-            item = next(self.inner)
-            if item.name.lower().endswith(".jsonl"):
-                jsonl_scans += 1
-                if jsonl_scans > 2:
-                    raise AssertionError(
-                        "candidate count did not stop JSONL discovery"
-                    )
-            return item
-
-    monkeypatch.setattr(os, "scandir", BoundedScan)
-    monkeypatch.setattr(Path, "stat", bounded_stat)
-
-    source = CodexSessionSource(sessions, max_candidates=2)
-    with pytest.raises(SessionNotFoundError):
-        source.latest_completed()
-
-    assert jsonl_scans == 2
-    assert jsonl_stats == 2
+    assert yielded_jsonl == [old, newest, second_newest]
+    assert set(stated_jsonl) == {newest, second_newest}
+    assert len(stated_jsonl) == 2
+    assert set(opened_jsonl) == {newest, second_newest}
+    assert len(opened_jsonl) == 2
     assert source.last_discovery.inspected_count == 2
     assert any(
-        "候选数量上限" in item
+        str(old) in item and "候选数量" in item
         for item in source.last_discovery.diagnostics
     )
+
+
+def test_nonstandard_and_date_mismatched_sessions_are_not_statted_or_opened(
+    fixtures_dir, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    selected = _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "completed",
+        timestamp="2026-07-18T12-00-00",
+    )
+    nonstandard = selected.parent / "completed.jsonl"
+    nonstandard.write_bytes((fixtures_dir / "completed.jsonl").read_bytes())
+    mismatched = _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "active",
+        timestamp="2026-07-17T13-00-00",
+        directory_date="2026-07-18",
+    )
+    forbidden = {nonstandard, mismatched}
+    stated_jsonl, opened_jsonl = _track_jsonl_io(monkeypatch)
+
+    source = CodexSessionSource(codex_home)
+    session = source.latest_completed()
+
+    assert session.source_session_id == "session-completed"
+    assert forbidden.isdisjoint(stated_jsonl)
+    assert forbidden.isdisjoint(opened_jsonl)
+    assert all(
+        any(str(path) in item and "非规范" in item for item in source.last_discovery.diagnostics)
+        for path in forbidden
+    )
+
+
+def test_partial_namespace_enumeration_timeout_never_stats_or_opens_candidates(
+    fixtures_dir, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    first = _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "completed",
+        timestamp="2026-07-18T12-00-00",
+    )
+    _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "active",
+        timestamp="2026-07-18T11-00-00",
+    )
+    leaf = first.parent
+    real_scandir = os.scandir
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    yielded = 0
+
+    def expire_after_second(entry):
+        nonlocal yielded
+        yielded += 1
+        if yielded == 2:
+            clock.now = 11.0
+
+    def expiring_scandir(path):
+        if Path(path) != leaf:
+            return real_scandir(path)
+        with real_scandir(path) as entries:
+            return _ScandirEntries(list(entries), expire_after_second)
+
+    monkeypatch.setattr(os, "scandir", expiring_scandir)
+    stated_jsonl, opened_jsonl = _track_jsonl_io(monkeypatch)
+    source = CodexSessionSource(
+        codex_home, discovery_timeout_seconds=10.0, monotonic=clock
+    )
+
+    with pytest.raises(SessionDiscoveryTimeout, match="配置时限"):
+        source.latest_completed()
+
+    assert stated_jsonl == []
+    assert opened_jsonl == []
+    assert source.last_discovery.inspected_count == 0
+    assert source.last_discovery.diagnostics == ("会话发现超过配置时限",)
 
 
 def test_deadline_interrupts_directory_enumeration(
@@ -305,8 +470,9 @@ def test_deadline_interrupts_directory_enumeration(
 def test_deadline_is_checked_after_the_last_non_session_entry(
     tmp_path, monkeypatch
 ):
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
+    codex_home = tmp_path / "codex"
+    sessions = codex_home / "sessions"
+    sessions.mkdir(parents=True)
     (sessions / "not-a-session.txt").write_text("synthetic", encoding="utf-8")
     real_scandir = os.scandir
 
@@ -339,7 +505,7 @@ def test_deadline_is_checked_after_the_last_non_session_entry(
 
     monkeypatch.setattr(os, "scandir", LastEntryScan)
     source = CodexSessionSource(
-        sessions, discovery_timeout_seconds=10.0, monotonic=clock
+        codex_home, discovery_timeout_seconds=10.0, monotonic=clock
     )
 
     with pytest.raises(SessionDiscoveryTimeout):
@@ -347,12 +513,20 @@ def test_deadline_is_checked_after_the_last_non_session_entry(
 
 
 def test_explicit_load_uses_the_same_candidate_budget(fixtures_dir, tmp_path):
-    sessions = tmp_path / "sessions"
-    unrelated = _copy_fixture(fixtures_dir, sessions, "active")
-    target = _copy_fixture(fixtures_dir, sessions, "completed")
-    os.utime(unrelated, (20, 20))
-    os.utime(target, (10, 10))
-    source = CodexSessionSource(sessions, max_candidates=1)
+    codex_home = tmp_path / "codex"
+    _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "active",
+        timestamp="2026-07-18T12-00-00",
+    )
+    _copy_fixture(
+        fixtures_dir,
+        codex_home,
+        "completed",
+        timestamp="2026-07-18T11-00-00",
+    )
+    source = CodexSessionSource(codex_home, max_candidates=1)
 
     with pytest.raises(SessionNotFoundError, match="session-completed"):
         source.load("session-completed")
@@ -361,9 +535,10 @@ def test_explicit_load_uses_the_same_candidate_budget(fixtures_dir, tmp_path):
 
 
 def test_oversized_explicit_session_is_never_opened(
-    fixtures_dir, monkeypatch
+    fixtures_dir, tmp_path, monkeypatch
 ):
-    source = CodexSessionSource(fixtures_dir, max_session_bytes=8)
+    _copy_fixture(fixtures_dir, tmp_path, "completed")
+    source = CodexSessionSource(tmp_path, max_session_bytes=8)
     opens = 0
 
     def forbidden_open(*args, **kwargs):
@@ -379,8 +554,9 @@ def test_oversized_explicit_session_is_never_opened(
     assert opens == 0
 
 
-def test_oversized_session_is_rejected_before_parse(fixtures_dir):
-    source = CodexSessionSource(fixtures_dir, max_session_bytes=8)
+def test_oversized_session_is_rejected_before_parse(fixtures_dir, tmp_path):
+    _copy_fixture(fixtures_dir, tmp_path, "completed")
+    source = CodexSessionSource(tmp_path, max_session_bytes=8)
 
     with pytest.raises(SessionSizeLimitError, match="8"):
         source.load("session-completed")
@@ -590,8 +766,13 @@ def test_parser_failure_creates_no_partial_capture(fixtures_dir, tmp_path):
         CodexSessionSource(codex_home), repo, Redactor(), ProjectResolver([])
     )
 
-    with pytest.raises(SessionFormatError):
-        service.capture_session("malformed")
+    with pytest.raises(SessionNotFoundError):
+        service.capture_last()
+
+    assert any(
+        "缺少 session ID" in item
+        for item in service.source.last_discovery.diagnostics
+    )
 
     connection = sqlite3.connect(repo.db_path)
     try:
@@ -605,7 +786,7 @@ def test_reclassify_reviews_stored_redacted_evidence_before_repository_update(
     fixtures_dir, tmp_path
 ):
     codex_home = tmp_path / "codex"
-    _copy_fixture(fixtures_dir, codex_home, "completed")
+    completed_path = _copy_fixture(fixtures_dir, codex_home, "completed")
     source = CodexSessionSource(codex_home)
     repo = _repository(tmp_path)
     CaptureService(source, repo, Redactor(), ProjectResolver([])).capture_session(
@@ -627,7 +808,6 @@ def test_reclassify_reviews_stored_redacted_evidence_before_repository_update(
         review_stored_evidence=review_stored,
     )
     mapping = mapping_service.map(root, "Projects/Example")
-    completed_path = codex_home / "completed.jsonl"
     completed_path.unlink()
 
     mapping_service.reclassify("session-completed", mapping.id, actor="tester")
