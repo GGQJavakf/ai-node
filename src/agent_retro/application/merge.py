@@ -1,0 +1,690 @@
+"""Explicit reconciliation and hash-bound deep Obsidian merge plans."""
+
+from __future__ import annotations
+
+import base64
+import difflib
+import hashlib
+import json
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Sequence
+
+from agent_retro.application.ports import RetroRepository
+from agent_retro.application.sync import ProjectionPersistenceError, SyncService
+from agent_retro.domain.models import Candidate, CandidateStatus, KnowledgeType, SyncJob
+from agent_retro.domain.projection import projection_input_hash
+from agent_retro.infrastructure.obsidian import (
+    BoundaryError,
+    ObsidianProjection,
+    managed_block_hash,
+    parse_aggregate_entries,
+    sha256_bytes,
+)
+
+
+class MergeIntegrityError(ValueError):
+    """A persisted plan or caller-supplied identity was modified."""
+
+
+class StalePlanError(ValueError):
+    """The vault no longer matches the immutable plan inputs."""
+
+
+class ConfirmationRequiredError(ValueError):
+    """General apply or exact destructive confirmation is missing."""
+
+    def __init__(self, missing_operation_ids: Sequence[str] = ()) -> None:
+        self.missing_operation_ids = tuple(sorted(missing_operation_ids))
+        reason = (
+            "merge_apply_confirmation_required"
+            if not self.missing_operation_ids
+            else "merge_operation_confirmation_required"
+        )
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class MergeTarget:
+    path: Path
+    input_hash: str
+    output_bytes: bytes
+    unified_diff: str
+
+
+@dataclass(frozen=True)
+class MergeDelete:
+    operation_id: str
+    path: Path
+    input_hash: str
+
+
+@dataclass(frozen=True)
+class MergeRename:
+    operation_id: str
+    source: Path
+    target: Path
+    source_hash: str
+    target_hash: str
+
+
+@dataclass(frozen=True)
+class MergeConflict:
+    operation_id: str
+    description: str
+
+
+@dataclass(frozen=True)
+class MergePlan:
+    id: str
+    project_id: str
+    authority_hash: str
+    targets: tuple[MergeTarget, ...]
+    deletes: tuple[MergeDelete, ...]
+    renames: tuple[MergeRename, ...]
+    conflicts: tuple[MergeConflict, ...]
+
+
+@dataclass(frozen=True)
+class MergeApplyResult:
+    plan_id: str
+    status: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ReconciliationConflict:
+    id: str
+    project_id: str
+    path: Path
+    recorded_hash: str
+    vault_hash: str
+    status: str = "external_edit_conflict"
+
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    conflict_id: str
+    status: str
+    candidate_id: str = ""
+    plan_id: str = ""
+
+
+class MergeService:
+    """Persist previews and apply only current, fully confirmed plans."""
+
+    def __init__(
+        self,
+        repository: RetroRepository,
+        vault_root: Path | None,
+        backup_root: Path,
+        *,
+        sync: SyncService | None = None,
+    ) -> None:
+        if vault_root is None:
+            raise ValueError("vault_not_configured")
+        self.repository = repository
+        self.vault_root = Path(vault_root)
+        self.backup_root = Path(backup_root)
+        self.sync = sync or SyncService(repository, self.vault_root, self.backup_root)
+
+    def create_plan(
+        self,
+        project_id: str,
+        *,
+        replacements: Mapping[Path, bytes],
+        deletes: Sequence[Path] = (),
+        renames: Sequence[tuple[Path, Path]] = (),
+        conflicts: Sequence[str] = (),
+    ) -> MergePlan:
+        self._require_mapping(project_id)
+        targets = tuple(
+            MergeTarget(
+                path=relative,
+                input_hash=sha256_bytes(before),
+                output_bytes=bytes(output),
+                unified_diff=_unified_diff(relative, before, bytes(output)),
+            )
+            for relative, output in sorted(
+                (
+                    (self._safe_relative(project_id, path), output)
+                    for path, output in replacements.items()
+                ),
+                key=lambda item: item[0].as_posix(),
+            )
+            for before in [self._read(relative)]
+        )
+        delete_values = []
+        for path in sorted(deletes, key=lambda item: item.as_posix()):
+            relative = self._safe_relative(project_id, path)
+            before = self._read(relative)
+            if not (self.vault_root / relative).exists():
+                raise StalePlanError("merge_delete_source_missing")
+            identity = ["delete", relative.as_posix(), sha256_bytes(before)]
+            delete_values.append(
+                MergeDelete(_operation_id(identity), relative, sha256_bytes(before))
+            )
+        rename_values = []
+        for source, target in sorted(
+            renames, key=lambda item: (item[0].as_posix(), item[1].as_posix())
+        ):
+            source_relative = self._safe_relative(project_id, source)
+            target_relative = self._safe_relative(project_id, target)
+            source_path = self.vault_root / source_relative
+            if not source_path.exists():
+                raise StalePlanError("merge_rename_source_missing")
+            source_hash = sha256_bytes(self._read(source_relative))
+            target_hash = sha256_bytes(self._read(target_relative))
+            identity = [
+                "rename",
+                source_relative.as_posix(),
+                target_relative.as_posix(),
+                source_hash,
+                target_hash,
+            ]
+            rename_values.append(
+                MergeRename(
+                    _operation_id(identity),
+                    source_relative,
+                    target_relative,
+                    source_hash,
+                    target_hash,
+                )
+            )
+        conflict_values = tuple(
+            MergeConflict(_operation_id(["conflict", description]), description)
+            for description in sorted(conflicts)
+        )
+        plan = MergePlan(
+            id="",
+            project_id=project_id,
+            authority_hash=projection_input_hash(
+                self.repository.list_project_knowledge(project_id)
+            ),
+            targets=targets,
+            deletes=tuple(delete_values),
+            renames=tuple(rename_values),
+            conflicts=conflict_values,
+        )
+        self._validate_unique_paths(plan)
+        plan_json = _plan_json(plan)
+        plan = MergePlan(
+            id="merge-" + hashlib.sha256(plan_json.encode("utf-8")).hexdigest()[:24],
+            project_id=plan.project_id,
+            authority_hash=plan.authority_hash,
+            targets=plan.targets,
+            deletes=plan.deletes,
+            renames=plan.renames,
+            conflicts=plan.conflicts,
+        )
+        plan_json = _plan_json(plan)
+        self.repository.begin_sync(
+            SyncJob(
+                id=plan.id,
+                project_id=project_id,
+                status="planned",
+                plan_json=plan_json,
+                backup_path=self.backup_root / plan.id,
+            )
+        )
+        return plan
+
+    def preview(self, plan_id: str) -> MergePlan:
+        return self._load_plan(plan_id)
+
+    def apply(
+        self,
+        plan_id: str,
+        *,
+        confirmed: bool,
+        confirmed_operations: Sequence[str] = (),
+    ) -> MergeApplyResult:
+        if not confirmed:
+            raise ConfirmationRequiredError()
+        try:
+            plan = self._load_plan(plan_id)
+        except MergeIntegrityError:
+            raise
+        except ValueError as exc:
+            raise StalePlanError("merge_plan_stale") from exc
+        job = self._get_job(plan_id)
+        if job is None:
+            raise KeyError("merge_plan_not_found")
+        if job.status == "synced":
+            return MergeApplyResult(plan.id, "already_applied")
+        required = {
+            item.operation_id
+            for item in (*plan.deletes, *plan.renames, *plan.conflicts)
+        }
+        supplied = set(confirmed_operations)
+        missing = required - supplied
+        if missing:
+            raise ConfirmationRequiredError(tuple(missing))
+        if supplied - required:
+            raise MergeIntegrityError("unknown_merge_operation_confirmation")
+        try:
+            result = self.sync.apply_confirmed_merge(plan, plan_json=job.plan_json)
+        except ValueError as exc:
+            if str(exc) == "merge_plan_stale":
+                raise StalePlanError("merge_plan_stale") from exc
+            raise
+        status = (
+            "already_applied"
+            if result.reason == "already_applied"
+            else result.status.value
+        )
+        return MergeApplyResult(plan.id, status, result.reason)
+
+    def find_external_edits(
+        self, project_id: str
+    ) -> tuple[ReconciliationConflict, ...]:
+        self._require_mapping(project_id)
+        knowledge = self.repository.list_project_knowledge(project_id)
+        authority_hash = projection_input_hash(knowledge)
+        canonical = ObsidianProjection(self.vault_root, self.backup_root).plan(
+            project_id, knowledge
+        )
+        intended = {write.target: write.after_bytes for write in canonical.writes}
+        conflicts = []
+        for state in self.repository.list_managed_file_states(project_id):
+            target = self._absolute_from_state(project_id, state.path)
+            current = target.read_bytes() if target.exists() else b""
+            try:
+                current_managed_hash = (
+                    managed_block_hash(current)
+                    if target.name.startswith("项目_") or target.name == "项目索引.md"
+                    else sha256_bytes(current)
+                )
+            except BoundaryError:
+                current_managed_hash = sha256_bytes(current)
+            if current_managed_hash == state.managed_hash:
+                continue
+            database_bytes = intended.get(target, b"")
+            relative = target.relative_to(self.vault_root)
+            conflict_id = _reconciliation_id(
+                project_id,
+                relative,
+                state.managed_hash,
+                current_managed_hash,
+                authority_hash,
+                database_bytes,
+            )
+            payload = _json(
+                {
+                    "kind": "reconciliation",
+                    "id": conflict_id,
+                    "project_id": project_id,
+                    "path": relative.as_posix(),
+                    "recorded_hash": state.managed_hash,
+                    "vault_hash": current_managed_hash,
+                    "authority_hash": authority_hash,
+                    "database_base64": _b64(database_bytes),
+                    "vault_base64": _b64(current),
+                }
+            )
+            existing = self._get_job(conflict_id)
+            if existing is None:
+                self.repository.begin_sync(
+                    SyncJob(
+                        id=conflict_id,
+                        project_id=project_id,
+                        status="external_edit_conflict",
+                        plan_json=payload,
+                        backup_path=self.backup_root / conflict_id,
+                    )
+                )
+            elif existing.plan_json != payload:
+                raise MergeIntegrityError("reconciliation_state_changed")
+            conflicts.append(
+                ReconciliationConflict(
+                    conflict_id,
+                    project_id,
+                    relative,
+                    state.managed_hash,
+                    current_managed_hash,
+                )
+            )
+        return tuple(conflicts)
+
+    def reconcile(
+        self, conflict_id: str, action: str, *, actor: str
+    ) -> ReconciliationResult:
+        if actor != "user":
+            raise ValueError("reconciliation_actor_must_be_user")
+        job = self._get_job(conflict_id)
+        if job is None:
+            raise KeyError("reconciliation_conflict_not_found")
+        try:
+            payload = json.loads(job.plan_json)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise MergeIntegrityError("reconciliation_plan_invalid") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("kind") != "reconciliation"
+            or payload.get("id") != conflict_id
+            or _json(payload) != job.plan_json
+        ):
+            raise MergeIntegrityError("reconciliation_plan_invalid")
+        project_id = str(payload["project_id"])
+        relative = self._safe_relative(project_id, Path(payload["path"]))
+        target = self.vault_root / relative
+        vault_bytes = _unb64(payload["vault_base64"])
+        database_bytes = _unb64(payload["database_base64"])
+        if (
+            _reconciliation_id(
+                project_id,
+                relative,
+                str(payload["recorded_hash"]),
+                str(payload["vault_hash"]),
+                str(payload["authority_hash"]),
+                database_bytes,
+            )
+            != conflict_id
+        ):
+            raise MergeIntegrityError("reconciliation_plan_integrity_mismatch")
+        if projection_input_hash(
+            self.repository.list_project_knowledge(project_id)
+        ) != str(payload["authority_hash"]):
+            raise StalePlanError("reconciliation_authority_changed")
+        if not target.exists() or target.read_bytes() != vault_bytes:
+            raise StalePlanError("reconciliation_target_changed")
+        if action == "manual_edit":
+            self.repository.finish_sync(conflict_id, "awaiting_user_input")
+            return ReconciliationResult(conflict_id, "awaiting_user_input")
+        if action == "keep_database":
+            plan = self.create_plan(project_id, replacements={relative: database_bytes})
+            return ReconciliationResult(
+                conflict_id, "preview_required", plan_id=plan.id
+            )
+        if action != "adopt_vault":
+            raise ValueError("unsupported_reconciliation_action")
+        database_entries = parse_aggregate_entries(database_bytes)
+        vault_entries = parse_aggregate_entries(vault_bytes)
+        changed = [
+            identifier
+            for identifier in sorted(set(database_entries) | set(vault_entries))
+            if database_entries.get(identifier) != vault_entries.get(identifier)
+        ]
+        if len(changed) != 1 or changed[0] not in vault_entries:
+            raise ValueError("vault_edit_requires_one_changed_managed_entry")
+        identifier = changed[0]
+        kind = _kind_from_name(relative.name)
+        identity = [
+            conflict_id,
+            identifier,
+            sha256_bytes(vault_entries[identifier].encode("utf-8")),
+        ]
+        candidate_id = (
+            "candidate-vault-"
+            + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
+        )
+        candidate = Candidate(
+            id=candidate_id,
+            knowledge_type=kind,
+            project_id=project_id,
+            scope="project",
+            proposed_text=vault_entries[identifier],
+            evidence_ids=(),
+            status=CandidateStatus.PENDING_REVIEW,
+            extraction_confidence=0.0,
+        )
+        self.repository.save_manual_edit_candidate(
+            candidate,
+            relative_path=relative,
+            content_hash=sha256_bytes(vault_bytes),
+        )
+        self.repository.finish_sync(conflict_id, "pending_review")
+        return ReconciliationResult(
+            conflict_id, "pending_review", candidate_id=candidate_id
+        )
+
+    def _load_plan(self, plan_id: str) -> MergePlan:
+        job = self._get_job(plan_id)
+        if job is None:
+            raise KeyError("merge_plan_not_found")
+        try:
+            data = json.loads(job.plan_json)
+            plan = _plan_from_data(data)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise MergeIntegrityError("merge_plan_invalid") from exc
+        if plan.id != plan_id or job.project_id != plan.project_id:
+            raise MergeIntegrityError("merge_plan_identity_mismatch")
+        without_id = MergePlan(
+            "",
+            plan.project_id,
+            plan.authority_hash,
+            plan.targets,
+            plan.deletes,
+            plan.renames,
+            plan.conflicts,
+        )
+        expected = (
+            "merge-"
+            + hashlib.sha256(_plan_json(without_id).encode("utf-8")).hexdigest()[:24]
+        )
+        if expected != plan.id or _plan_json(plan) != job.plan_json:
+            raise MergeIntegrityError("merge_plan_integrity_mismatch")
+        self._validate_unique_paths(plan)
+        for path in _all_plan_paths(plan):
+            self._safe_relative(plan.project_id, path)
+        return plan
+
+    def _get_job(self, job_id: str) -> SyncJob | None:
+        try:
+            return self.repository.get_sync_job(job_id)
+        except sqlite3.Error as exc:
+            raise ProjectionPersistenceError("merge_state_unavailable") from exc
+
+    def _require_mapping(self, project_id: str) -> None:
+        mappings = [
+            item
+            for item in self.repository.list_project_mappings()
+            if item.obsidian_project == project_id
+        ]
+        if len(mappings) != 1:
+            raise ValueError("project_mapping_invalid")
+
+    def _safe_relative(self, project_id: str, path: Path) -> Path:
+        path = Path(path)
+        if path.is_absolute():
+            try:
+                path = path.relative_to(self.vault_root)
+            except ValueError as exc:
+                raise ValueError("merge_target_outside_vault") from exc
+        if not path.parts or ".." in path.parts:
+            raise ValueError("merge_target_outside_vault")
+        if len(path.parts) >= 2 and path.parts[0] == "项目":
+            if path.parts[1] not in (project_id, "项目索引.md"):
+                raise ValueError("merge_target_cross_project")
+        root = self.vault_root.resolve(strict=True)
+        current = self.vault_root
+        for part in path.parts:
+            current = current / part
+            if current.exists() and current.is_symlink():
+                raise ValueError("merge_target_symlink")
+        try:
+            (self.vault_root / path).resolve(strict=False).relative_to(root)
+        except ValueError as exc:
+            raise ValueError("merge_target_outside_vault") from exc
+        return path
+
+    def _absolute_from_state(self, project_id: str, path: Path) -> Path:
+        relative = self._safe_relative(project_id, path)
+        return self.vault_root / relative
+
+    def _read(self, relative: Path) -> bytes:
+        target = self.vault_root / relative
+        return target.read_bytes() if target.exists() else b""
+
+    @staticmethod
+    def _validate_unique_paths(plan: MergePlan) -> None:
+        paths = [target.path for target in plan.targets]
+        paths.extend(item.path for item in plan.deletes)
+        for item in plan.renames:
+            paths.extend((item.source, item.target))
+        if len(paths) != len(set(paths)):
+            raise MergeIntegrityError("merge_plan_paths_overlap")
+
+
+def _kind_from_name(name: str) -> KnowledgeType:
+    mapping = {
+        "规则.md": KnowledgeType.RULE,
+        "经验.md": KnowledgeType.LESSON,
+        "任务状态.md": KnowledgeType.TASK_STATE,
+    }
+    try:
+        return mapping[name]
+    except KeyError as exc:
+        raise ValueError("vault_adoption_requires_aggregate_entry") from exc
+
+
+def _unified_diff(path: Path, before: bytes, after: bytes) -> str:
+    return "".join(
+        difflib.unified_diff(
+            before.decode("utf-8", errors="replace").splitlines(keepends=True),
+            after.decode("utf-8", errors="replace").splitlines(keepends=True),
+            fromfile=path.as_posix(),
+            tofile=path.as_posix(),
+        )
+    )
+
+
+def _operation_id(identity: object) -> str:
+    return (
+        "merge-op-" + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
+    )
+
+
+def _reconciliation_id(
+    project_id: str,
+    relative: Path,
+    recorded_hash: str,
+    vault_hash: str,
+    authority_hash: str,
+    database_bytes: bytes,
+) -> str:
+    identity = [
+        project_id,
+        relative.as_posix(),
+        recorded_hash,
+        vault_hash,
+        authority_hash,
+        sha256_bytes(database_bytes),
+    ]
+    return (
+        "reconcile-" + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
+    )
+
+
+def _all_plan_paths(plan: MergePlan) -> tuple[Path, ...]:
+    values = [target.path for target in plan.targets]
+    values.extend(item.path for item in plan.deletes)
+    for item in plan.renames:
+        values.extend((item.source, item.target))
+    return tuple(values)
+
+
+def _plan_json(plan: MergePlan) -> str:
+    return _json(
+        {
+            "id": plan.id,
+            "kind": "merge",
+            "project_id": plan.project_id,
+            "authority_hash": plan.authority_hash,
+            "targets": [
+                {
+                    "path": item.path.as_posix(),
+                    "input_hash": item.input_hash,
+                    "output_base64": _b64(item.output_bytes),
+                    "unified_diff": item.unified_diff,
+                }
+                for item in plan.targets
+            ],
+            "deletes": [
+                {
+                    "operation_id": item.operation_id,
+                    "path": item.path.as_posix(),
+                    "input_hash": item.input_hash,
+                }
+                for item in plan.deletes
+            ],
+            "renames": [
+                {
+                    "operation_id": item.operation_id,
+                    "source": item.source.as_posix(),
+                    "target": item.target.as_posix(),
+                    "source_hash": item.source_hash,
+                    "target_hash": item.target_hash,
+                }
+                for item in plan.renames
+            ],
+            "conflicts": [
+                {
+                    "operation_id": item.operation_id,
+                    "description": item.description,
+                }
+                for item in plan.conflicts
+            ],
+        }
+    )
+
+
+def _plan_from_data(data: object) -> MergePlan:
+    if not isinstance(data, dict) or data.get("kind") != "merge":
+        raise ValueError("not a merge plan")
+    return MergePlan(
+        id=str(data["id"]),
+        project_id=str(data["project_id"]),
+        authority_hash=str(data["authority_hash"]),
+        targets=tuple(
+            MergeTarget(
+                Path(item["path"]),
+                str(item["input_hash"]),
+                _unb64(item["output_base64"]),
+                str(item["unified_diff"]),
+            )
+            for item in data["targets"]
+        ),
+        deletes=tuple(
+            MergeDelete(
+                str(item["operation_id"]),
+                Path(item["path"]),
+                str(item["input_hash"]),
+            )
+            for item in data["deletes"]
+        ),
+        renames=tuple(
+            MergeRename(
+                str(item["operation_id"]),
+                Path(item["source"]),
+                Path(item["target"]),
+                str(item["source_hash"]),
+                str(item["target_hash"]),
+            )
+            for item in data["renames"]
+        ),
+        conflicts=tuple(
+            MergeConflict(str(item["operation_id"]), str(item["description"]))
+            for item in data["conflicts"]
+        ),
+    )
+
+
+def _json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _b64(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+def _unb64(value: object) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError("invalid base64 value")
+    return base64.b64decode(value.encode("ascii"), validate=True)

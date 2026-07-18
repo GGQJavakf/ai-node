@@ -614,11 +614,104 @@ class SQLiteRetroRepository(RetroRepository):
         if row is None:
             return None
         evidence_rows = connection.execute(
-            "SELECT evidence_id FROM candidate_evidence "
-            "WHERE candidate_id = ? ORDER BY evidence_id",
+            """SELECT ce.evidence_id, e.kind FROM candidate_evidence ce
+            JOIN evidence e ON e.id = ce.evidence_id
+            WHERE ce.candidate_id = ? ORDER BY ce.evidence_id""",
             (candidate_id,),
         ).fetchall()
         return _candidate_from_row(row, tuple(str(item[0]) for item in evidence_rows))
+
+    def save_manual_edit_candidate(
+        self,
+        candidate: Candidate,
+        *,
+        relative_path: Path,
+        content_hash: str,
+    ) -> Candidate:
+        """Atomically persist synthetic provenance and one pending vault edit."""
+
+        identity = hashlib.sha256(
+            f"{candidate.id}:{content_hash}".encode("utf-8")
+        ).hexdigest()[:24]
+        session_id = f"vault-session-{identity}"
+        evidence_id = f"vault-evidence-{identity}"
+        now = _now_text()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO sessions(
+                    id, source_session_id, source_path, source_hash, project_id,
+                    status, completed_at, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    session_id,
+                    relative_path.as_posix(),
+                    content_hash,
+                    candidate.project_id,
+                    "completed",
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO evidence(
+                    id, session_id, kind, locator_session_id, event_id,
+                    locator_source_path, content_hash, excerpt
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    evidence_id,
+                    session_id,
+                    "obsidian-manual-edit",
+                    session_id,
+                    candidate.id,
+                    relative_path.as_posix(),
+                    content_hash,
+                    candidate.proposed_text,
+                ),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO candidates(
+                    id, session_id, knowledge_type, project_id, scope,
+                    proposed_text, status, extraction_confidence, review_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate.id,
+                    session_id,
+                    candidate.knowledge_type.value,
+                    candidate.project_id,
+                    candidate.scope,
+                    candidate.proposed_text,
+                    CandidateStatus.PENDING_REVIEW.value,
+                    candidate.extraction_confidence,
+                    _review_to_json(None),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO candidate_evidence(candidate_id, evidence_id)
+                VALUES (?, ?)""",
+                (candidate.id, evidence_id),
+            )
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    action="vault_edit_candidate_saved",
+                    entity_type="candidate",
+                    entity_id=candidate.id,
+                    after_hash=content_hash,
+                    actor="user",
+                    detail={
+                        "source": "obsidian-manual-edit",
+                        "relative_path": relative_path.as_posix(),
+                    },
+                ),
+            )
+            saved = self._get_candidate(connection, candidate.id)
+            if saved is None:
+                raise sqlite3.IntegrityError("candidate readback failed")
+            return saved
 
     def list_candidates(self, status: CandidateStatus) -> list[Candidate]:
         connection = self._connect()
@@ -1471,6 +1564,25 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
 
+    def get_sync_job(self, job_id: str) -> SyncJob | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM sync_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return SyncJob(
+                id=str(row["id"]),
+                project_id=str(row["project_id"]),
+                status=str(row["status"]),
+                plan_json=str(row["plan_json"]),
+                backup_path=Path(row["backup_path"]),
+                error=str(row["error"]),
+            )
+        finally:
+            connection.close()
+
     def has_rollback_required_sync(self) -> bool:
         connection = self._connect()
         try:
@@ -1529,9 +1641,7 @@ class SQLiteRetroRepository(RetroRepository):
                 ),
             )
 
-    def projection_fence_matches(
-        self, event_id: str, expected_input_hash: str
-    ) -> bool:
+    def projection_fence_matches(self, event_id: str, expected_input_hash: str) -> bool:
         connection = self._connect()
         try:
             return self._projection_fence_matches(
@@ -1953,7 +2063,9 @@ class SQLiteRetroRepository(RetroRepository):
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            event_id = "projection-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+            event_id = (
+                "projection-" + hashlib.sha256(identity.encode()).hexdigest()[:24]
+            )
             existing = connection.execute(
                 """SELECT id FROM projection_events
                 WHERE project_id = ? AND cause = ? AND cause_entity_id = ?
@@ -2110,6 +2222,25 @@ class SQLiteRetroRepository(RetroRepository):
                 managed_hash=str(row["managed_hash"]),
                 full_hash=str(row["full_hash"]),
             )
+        finally:
+            connection.close()
+
+    def list_managed_file_states(self, project_id: str) -> list[ManagedFileState]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM managed_file_state WHERE project_id = ? ORDER BY path",
+                (project_id,),
+            ).fetchall()
+            return [
+                ManagedFileState(
+                    project_id=str(row["project_id"]),
+                    path=Path(row["path"]),
+                    managed_hash=str(row["managed_hash"]),
+                    full_hash=str(row["full_hash"]),
+                )
+                for row in rows
+            ]
         finally:
             connection.close()
 

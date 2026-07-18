@@ -51,9 +51,7 @@ _FILENAMES = {
     KnowledgeType.LESSON: "经验.md",
     KnowledgeType.TASK_STATE: "任务状态.md",
 }
-_START = re.compile(
-    rb"<!-- agentretro:(summary|index):start project=([^>\r\n]+) -->"
-)
+_START = re.compile(rb"<!-- agentretro:(summary|index):start project=([^>\r\n]+) -->")
 _END = re.compile(rb"<!-- agentretro:(summary|index):end -->")
 
 
@@ -87,6 +85,35 @@ def managed_block_hash(content: bytes) -> str:
     if len(starts) != 1 or len(ends) != 1 or ends[0].start() <= starts[0].end():
         raise BoundaryError("managed boundary must contain exactly one ordered pair")
     return sha256_bytes(content[starts[0].end() : ends[0].start()])
+
+
+def parse_aggregate_entries(content: bytes) -> dict[str, str]:
+    """Parse stable AgentRetro aggregate entries without interpreting prose."""
+
+    text = content.decode("utf-8")
+    headings = list(re.finditer(r"(?m)^### ([^\r\n]+)\r?$", text))
+    entries: dict[str, str] = {}
+    for index, heading in enumerate(headings):
+        identifier = heading.group(1).strip()
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        block = text[heading.end() : end]
+        archived = re.search(r"(?m)^## 已归档\r?$", block)
+        if archived is not None:
+            block = block[: archived.start()]
+        if identifier in entries:
+            raise BoundaryError("aggregate contains a duplicate stable item id")
+        lines = block.replace("\r\n", "\n").split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        separator = next(
+            (offset for offset, line in enumerate(lines) if not line.strip()),
+            None,
+        )
+        if separator is None:
+            raise BoundaryError("aggregate item metadata is malformed")
+        body = "\n".join(lines[separator + 1 :]).strip()
+        entries[identifier] = body
+    return entries
 
 
 class ObsidianProjection:
@@ -161,8 +188,11 @@ class ObsidianProjection:
             [
                 project_id,
                 [
-                    [str(write.target.relative_to(self.vault_root)), write.before_hash,
-                     sha256_bytes(write.after_bytes)]
+                    [
+                        str(write.target.relative_to(self.vault_root)),
+                        write.before_hash,
+                        sha256_bytes(write.after_bytes),
+                    ]
                     for write in writes
                 ],
             ],

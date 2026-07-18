@@ -14,6 +14,12 @@ from agent_retro.application.bootstrap import (
     build_projection_coordinator,
     build_retro_repository,
 )
+from agent_retro.application.merge import (
+    ConfirmationRequiredError,
+    MergeIntegrityError,
+    MergeService,
+    StalePlanError,
+)
 from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.application.capture import CaptureResult, CaptureService
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
@@ -119,6 +125,33 @@ def build_parser() -> argparse.ArgumentParser:
     sync_commands = sync.add_subparsers(dest="sync_command", required=True)
     sync_retry = sync_commands.add_parser("retry", help="重试待同步投影")
     sync_retry.add_argument("event_id")
+    sync_conflicts = sync_commands.add_parser(
+        "conflicts", help="列出 Obsidian 外部编辑冲突"
+    )
+    sync_conflicts.add_argument("--project", required=True, dest="project_id")
+    sync_reconcile = sync_commands.add_parser(
+        "reconcile", help="协调 Obsidian 外部编辑"
+    )
+    sync_reconcile.add_argument("conflict_id")
+    sync_reconcile.add_argument(
+        "--action",
+        required=True,
+        choices=("keep_database", "adopt_vault", "manual_edit"),
+    )
+
+    merge = commands.add_parser("merge", help="预览并应用受控 Obsidian 深度合并")
+    merge_commands = merge.add_subparsers(dest="merge_command", required=True)
+    merge_preview = merge_commands.add_parser("preview", help="查看完整合并计划")
+    merge_preview.add_argument("plan_id")
+    merge_apply = merge_commands.add_parser("apply", help="应用当前合并计划")
+    merge_apply.add_argument("plan_id")
+    merge_apply.add_argument("--apply", action="store_true", dest="merge_confirmed")
+    merge_apply.add_argument(
+        "--confirm-operation",
+        action="append",
+        default=[],
+        dest="confirmed_operations",
+    )
     return parser
 
 
@@ -167,6 +200,49 @@ def main(
                     + "\n"
                 )
             return 2
+        except ConfirmationRequiredError as exc:
+            data = {
+                "missing_operation_ids": list(exc.missing_operation_ids),
+                "recovery_command": "retro merge preview <plan-id>",
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_MERGE_CONFIRMATION_REQUIRED",
+                        "message": "Exact merge confirmation is required.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
+            return 2
+        except StalePlanError:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_MERGE_PLAN_STALE",
+                        "message": "Merge plan inputs changed; create a new plan.",
+                        "data": {},
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text("合并计划已过期，请重新生成。") + "\n")
+            return 2
+        except MergeIntegrityError:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_MERGE_PLAN_INVALID",
+                        "message": "Merge plan integrity validation failed.",
+                        "data": {},
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text("合并计划完整性校验失败。") + "\n")
+            return 2
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
             detail = Redactor().redact(str(exc))
             if args.json_output:
@@ -200,20 +276,94 @@ def _run_command(
     coordinator = build_projection_coordinator(settings, repository)
     resolver = ProjectResolver(repository.list_project_mappings())
     if args.command == "sync":
-        result = coordinator.retry(args.event_id)
-        data = {
-            "event_id": result.event_id,
-            "projection_status": result.status.value,
-            "warning": result.warning,
-            "recovery_command": result.recovery_command,
-            "reason": result.reason,
-        }
+        if args.sync_command == "retry":
+            result = coordinator.retry(args.event_id)
+            data = {
+                "event_id": result.event_id,
+                "projection_status": result.status.value,
+                "warning": result.warning,
+                "recovery_command": result.recovery_command,
+                "reason": result.reason,
+            }
+            code = "RETRO_SYNC_RETRIED"
+            message = "Obsidian projection retry completed."
+        else:
+            merge_service = MergeService(
+                repository,
+                settings.obsidian_root,
+                settings.backup_dir,
+            )
+            if args.sync_command == "conflicts":
+                conflicts = merge_service.find_external_edits(args.project_id)
+                data = {
+                    "conflicts": [
+                        {
+                            "id": item.id,
+                            "project_id": item.project_id,
+                            "path": item.path.as_posix(),
+                            "recorded_hash": item.recorded_hash,
+                            "vault_hash": item.vault_hash,
+                            "status": item.status,
+                        }
+                        for item in conflicts
+                    ]
+                }
+                code = "RETRO_SYNC_CONFLICTS"
+                message = "Obsidian external-edit conflicts inspected."
+            else:
+                reconciled = merge_service.reconcile(
+                    args.conflict_id, args.action, actor="user"
+                )
+                data = {
+                    "conflict_id": reconciled.conflict_id,
+                    "status": reconciled.status,
+                    "candidate_id": reconciled.candidate_id,
+                    "plan_id": reconciled.plan_id,
+                }
+                code = "RETRO_SYNC_RECONCILED"
+                message = "Obsidian external edit reconciliation recorded."
         if args.json_output:
             write_json(
                 {
                     "status": "ok",
-                    "code": "RETRO_SYNC_RETRIED",
-                    "message": "Obsidian projection retry completed.",
+                    "code": code,
+                    "message": message,
+                    "data": data,
+                }
+            )
+        else:
+            sys.stdout.write(safe_text(json_text(data)) + "\n")
+        return 0
+    if args.command == "merge":
+        merge_service = MergeService(
+            repository,
+            settings.obsidian_root,
+            settings.backup_dir,
+        )
+        if args.merge_command == "preview":
+            plan = merge_service.preview(args.plan_id)
+            data = _merge_plan_data(plan)
+            code = "RETRO_MERGE_PREVIEW"
+            message = "Current complete merge plan preview."
+        else:
+            result = merge_service.apply(
+                args.plan_id,
+                confirmed=args.merge_confirmed,
+                confirmed_operations=tuple(args.confirmed_operations),
+            )
+            data = {
+                "plan_id": result.plan_id,
+                "status": result.status,
+                "reason": result.reason,
+            }
+            code = "RETRO_MERGE_APPLIED"
+            message = "Confirmed merge apply completed."
+        if args.json_output:
+            write_json(
+                {
+                    "status": "ok",
+                    "code": code,
+                    "message": message,
                     "data": data,
                 }
             )
@@ -347,6 +497,50 @@ def _mapping_data(mapping) -> dict[str, object]:
         "remote_identity": mapping.remote_identity,
         "obsidian_project": mapping.obsidian_project,
         "active": mapping.active,
+    }
+
+
+def _merge_plan_data(plan) -> dict[str, object]:
+    from agent_retro.infrastructure.obsidian import sha256_bytes
+
+    return {
+        "id": plan.id,
+        "project_id": plan.project_id,
+        "authority_hash": plan.authority_hash,
+        "targets": [
+            {
+                "path": item.path.as_posix(),
+                "input_hash": item.input_hash,
+                "output_hash": sha256_bytes(item.output_bytes),
+                "unified_diff": item.unified_diff,
+            }
+            for item in plan.targets
+        ],
+        "deletes": [
+            {
+                "operation_id": item.operation_id,
+                "path": item.path.as_posix(),
+                "input_hash": item.input_hash,
+            }
+            for item in plan.deletes
+        ],
+        "renames": [
+            {
+                "operation_id": item.operation_id,
+                "source": item.source.as_posix(),
+                "target": item.target.as_posix(),
+                "source_hash": item.source_hash,
+                "target_hash": item.target_hash,
+            }
+            for item in plan.renames
+        ],
+        "conflicts": [
+            {
+                "operation_id": item.operation_id,
+                "description": item.description,
+            }
+            for item in plan.conflicts
+        ],
     }
 
 

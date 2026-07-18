@@ -54,6 +54,14 @@ class RetroRepository(Protocol):
 
     def save_candidates(self, candidates: Sequence[Candidate]) -> None: ...
 
+    def save_manual_edit_candidate(
+        self,
+        candidate: Candidate,
+        *,
+        relative_path: Path,
+        content_hash: str,
+    ) -> Candidate: ...
+
     def get_candidate(self, candidate_id: str) -> Candidate | None: ...
 
     def list_candidates(self, status: CandidateStatus) -> list[Candidate]: ...
@@ -143,6 +151,8 @@ class RetroRepository(Protocol):
 
     def finish_sync(self, job_id: str, status: str, error: str = "") -> None: ...
 
+    def get_sync_job(self, job_id: str) -> SyncJob | None: ...
+
     def complete_sync(
         self,
         event_id: str,
@@ -212,6 +222,10 @@ class RetroRepository(Protocol):
     ) -> None: ...
 
     def get_managed_file_state(self, path: Path) -> ManagedFileState | None: ...
+
+    def list_managed_file_states(
+        self, project_id: str
+    ) -> list[ManagedFileState]: ...
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 
