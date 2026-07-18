@@ -89,6 +89,15 @@ def test_apply_and_remove_preserve_every_outside_byte_and_keep_backup(tmp_path):
     codex_home, backup_root, target = _home(tmp_path)
     original = b"before\r\nafter\r\n"
     target.write_bytes(original)
+    native_memory = codex_home / "memories" / "memory.md"
+    native_memory.parent.mkdir()
+    native_memory.write_bytes(b"native memory must remain byte-identical\xff")
+    memory_settings = codex_home / "config.toml"
+    memory_settings.write_bytes(b"[memory]\nenabled = true\n")
+    native_state = {
+        native_memory: native_memory.read_bytes(),
+        memory_settings: memory_settings.read_bytes(),
+    }
     guidance = CodexGuidance(codex_home, backup_root)
 
     applied = guidance.apply(guidance.preview().id)
@@ -113,6 +122,7 @@ def test_apply_and_remove_preserve_every_outside_byte_and_keep_backup(tmp_path):
     assert applied.backup_path.exists()
     assert removed.backup_path is not None and removed.backup_path.exists()
     assert removed.backup_path.read_bytes() == after_apply
+    assert {path: path.read_bytes() for path in native_state} == native_state
 
 
 def test_missing_file_is_created_only_by_matching_apply_and_remove_restores_absence(

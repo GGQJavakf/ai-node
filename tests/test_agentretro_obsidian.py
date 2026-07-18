@@ -141,9 +141,7 @@ class KnowledgeRepository(SQLiteRetroRepository):
             event_id, project_id, cause, cause_entity_id, input_hash
         )
 
-    def projection_fence_matches(
-        self, event_id: str, expected_input_hash: str
-    ) -> bool:
+    def projection_fence_matches(self, event_id: str, expected_input_hash: str) -> bool:
         events = self.list_projection_events("NPKI")
         return (
             bool(events)
@@ -174,9 +172,7 @@ def _coordinator(
 ) -> tuple[KnowledgeRepository, ProjectionCoordinator]:
     vault = tmp_path / "vault"
     vault.mkdir()
-    repository = KnowledgeRepository(
-        tmp_path / "retro.db", tmp_path / "backups", items
-    )
+    repository = KnowledgeRepository(tmp_path / "retro.db", tmp_path / "backups", items)
     repository.migrate()
     repository.save_project_mapping(
         ProjectMapping(
@@ -281,9 +277,7 @@ def test_apply_preflights_all_targets_before_first_write(tmp_path: Path) -> None
     rule.write_bytes(b"old-rule")
     lesson.write_bytes(b"old-lesson")
     event = repository.save_projection_event("event", "NPKI", "accept", "k", "h")
-    plan = coordinator.projection.plan(
-        "NPKI", repository.items, event_id=event
-    )
+    plan = coordinator.projection.plan("NPKI", repository.items, event_id=event)
     lesson.write_bytes(b"external-change")
 
     result = coordinator.sync.apply(plan, event_id=event)
@@ -474,9 +468,12 @@ def test_repository_finalize_failure_restores_files_and_states(tmp_path: Path) -
     assert result.warning == "RETRO_SYNC_PENDING"
     assert "secret" not in result.warning
     assert not (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
-    assert repository.get_managed_file_state(
-        vault / "项目" / "NPKI" / "AgentRetro" / "规则.md"
-    ) is None
+    assert (
+        repository.get_managed_file_state(
+            vault / "项目" / "NPKI" / "AgentRetro" / "规则.md"
+        )
+        is None
+    )
 
 
 def test_backup_enumeration_and_confirmed_removal_are_hash_bound(
@@ -487,9 +484,7 @@ def test_backup_enumeration_and_confirmed_removal_are_hash_bound(
     backup.parent.mkdir(parents=True, exist_ok=True)
     backup.write_bytes(b"sensitive-copy")
     expected = hashlib.sha256(b"sensitive-copy").hexdigest()
-    service = SyncService(
-        repository, tmp_path / "vault", tmp_path / "backups"
-    )
+    service = SyncService(repository, tmp_path / "vault", tmp_path / "backups")
 
     assert service.enumerate_backups_containing(expected) == (backup,)
     with pytest.raises(ValueError):
@@ -593,9 +588,7 @@ def test_cli_edit_and_archive_each_trigger_one_post_commit_projection(
     capsys.readouterr()
     assert repository.projection_event_count("NPKI") == 1
     knowledge = repository.knowledge_for_candidate("candidate-rule")
-    assert main(
-        ["--json", "review", "archive", knowledge.id], home=home, env=env
-    ) == 0
+    assert main(["--json", "review", "archive", knowledge.id], home=home, env=env) == 0
     capsys.readouterr()
     assert repository.projection_event_count("NPKI") == 2
     aggregate = (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").read_text(
@@ -617,9 +610,7 @@ def test_cli_conflict_resolution_triggers_one_post_commit_projection(
         ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
     )
     _seed_pending_candidate(repository, "candidate-active")
-    active = repository.accept_candidate(
-        "candidate-active", "旧规则", "user", 0.98
-    )
+    active = repository.accept_candidate("candidate-active", "旧规则", "user", 0.98)
     evidence = repository.list_evidence("session-1")[0]
     repository.save_candidates(
         [
@@ -772,8 +763,18 @@ def test_same_batch_updates_summary_and_index_only_inside_valid_markers(
     assert any(
         path.read_bytes() == summary_before for path in backup_dir.rglob("项目_NPKI.md")
     )
-    assert any(path.read_bytes() == index_before for path in backup_dir.rglob("项目索引.md"))
+    assert any(
+        path.read_bytes() == index_before for path in backup_dir.rglob("项目索引.md")
+    )
     assert event is not None and event.status is ProjectionStatus.SYNCED
+    job = repository.get_sync_job(result.event_id)
+    assert job is not None and job.status == ProjectionStatus.SYNCED.value
+    journal = json.loads(job.plan_json)
+    assert journal["writes"]
+    for write in journal["writes"]:
+        assert len(write["before_hash"]) == 64
+        assert len(write["after_hash"]) == 64
+        assert write["after_hash"] == sha256_bytes(Path(write["target"]).read_bytes())
 
 
 def test_unconfigured_vault_never_uses_preexisting_placeholder_directory(
@@ -790,7 +791,9 @@ def test_unconfigured_vault_never_uses_preexisting_placeholder_directory(
     )
     _seed_pending_candidate(repository)
 
-    assert main(["--json", "review", "accept", "candidate-rule"], home=home, env={}) == 0
+    assert (
+        main(["--json", "review", "accept", "candidate-rule"], home=home, env={}) == 0
+    )
     output = capsys.readouterr().out
     event = repository.list_projection_events("NPKI")[0]
 
@@ -800,11 +803,14 @@ def test_unconfigured_vault_never_uses_preexisting_placeholder_directory(
     assert "vault_not_configured" in output
     configured = tmp_path / "configured-vault"
     configured.mkdir()
-    assert main(
-        ["--json", "sync", "retry", event.id],
-        home=home,
-        env={"AGENTRETRO_OBSIDIAN_ROOT": str(configured)},
-    ) == 0
+    assert (
+        main(
+            ["--json", "sync", "retry", event.id],
+            home=home,
+            env={"AGENTRETRO_OBSIDIAN_ROOT": str(configured)},
+        )
+        == 0
+    )
     capsys.readouterr()
     assert repository.get_projection_event(event.id).status is ProjectionStatus.SYNCED
     assert (configured / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
@@ -885,9 +891,7 @@ def test_older_paused_projection_cannot_overwrite_newer_committed_knowledge(
     coordinator = ProjectionCoordinator(
         repository,
         projection,
-        SyncService(
-            repository, vault, tmp_path / "backups", replace=pausing_replace
-        ),
+        SyncService(repository, vault, tmp_path / "backups", replace=pausing_replace),
     )
     results: dict[str, object] = {}
     old_thread = threading.Thread(
@@ -1059,9 +1063,7 @@ def test_late_stale_event_does_not_poison_current_event_retry(tmp_path: Path) ->
     def save_late_old() -> None:
         old_ready.set()
         assert release_old.wait(5)
-        repository.save_projection_event(
-            "late-old", "NPKI", "accept", "old", old_hash
-        )
+        repository.save_projection_event("late-old", "NPKI", "accept", "old", old_hash)
 
     thread = threading.Thread(target=save_late_old)
     thread.start()
@@ -1133,7 +1135,11 @@ def test_begin_sync_sqlite_error_is_sanitized_and_writes_no_vault_file(
     result = coordinator.after_commit("accept", knowledge.id, "NPKI")
     event = repository.get_projection_event(result.event_id)
     serialized = json.dumps(
-        [result.__dict__, event.__dict__, [a.__dict__ for a in repository.list_audit_entries()]],
+        [
+            result.__dict__,
+            event.__dict__,
+            [a.__dict__ for a in repository.list_audit_entries()],
+        ],
         default=str,
     )
 
@@ -1168,9 +1174,7 @@ def test_finish_sync_sqlite_error_after_rollback_is_sanitized(tmp_path: Path) ->
     coordinator = ProjectionCoordinator(
         repository,
         ObsidianProjection(vault, tmp_path / "backups"),
-        SyncService(
-            repository, vault, tmp_path / "backups", replace=fail_replace
-        ),
+        SyncService(repository, vault, tmp_path / "backups", replace=fail_replace),
     )
 
     result = coordinator.after_commit("accept", knowledge.id, "NPKI")

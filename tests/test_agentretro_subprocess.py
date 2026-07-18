@@ -117,6 +117,34 @@ def test_retro_subprocess_smoke_has_defined_exits_and_strict_console_output(
         assert expected_marker in decoded
 
 
+def test_retro_help_does_not_import_todo_or_workitem_application_domain(
+    tmp_path: Path,
+) -> None:
+    probe = (
+        "import sys; "
+        "from agent_retro.presentation.cli import build_parser; "
+        "parser=build_parser(); "
+        "\ntry: parser.parse_args(['--help'])\n"
+        "except SystemExit as error:\n"
+        " assert error.code == 0\n"
+        "forbidden=[name for name in sys.modules "
+        "if name.startswith('ai_todo_assistant.application')]; "
+        "assert not forbidden, forbidden"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=tmp_path,
+        env=_isolated_environment(tmp_path, "utf-8"),
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+
+    assert completed.returncode == 0, (completed.stdout + completed.stderr).decode(
+        "utf-8", errors="replace"
+    )
+
+
 def test_existing_ai_todo_noninteractive_help_remains_gbk_safe(
     tmp_path: Path,
 ) -> None:

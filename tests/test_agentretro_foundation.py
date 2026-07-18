@@ -314,6 +314,37 @@ def test_legacy_and_retro_entry_points_are_independently_callable():
     todo_cli.return_value.run.assert_called_once_with()
 
 
+def test_agentretro_initialization_failure_does_not_block_ai_todo_or_touch_its_data(
+    tmp_path, capsys
+):
+    from ai_todo_assistant.presentation.cli import main as legacy_main
+
+    todo_db = tmp_path / "data" / "todos.db"
+    todo_db.parent.mkdir()
+    todo_db.write_bytes(b"existing-ai-todo-data")
+    before = todo_db.read_bytes()
+
+    assert (
+        main(
+            ["--json", "capture", "--last"],
+            home=tmp_path,
+            env={
+                "AGENTRETRO_HOME": str(tmp_path / "retro-state"),
+                "AGENTRETRO_DISCOVERY_MAX_FILES": "0",
+            },
+        )
+        == 2
+    )
+    capsys.readouterr()
+
+    with patch("ai_todo_assistant.presentation.cli.TodoCLI") as todo_cli:
+        legacy_main()
+
+    todo_cli.assert_called_once_with()
+    todo_cli.return_value.run.assert_called_once_with()
+    assert todo_db.read_bytes() == before
+
+
 def test_output_is_unicode_safe_and_json_remains_machine_readable():
     assert safe_text("Codex 会话复盘", "utf-8") == "Codex 会话复盘"
     assert "?" in safe_text("会话", "ascii")
