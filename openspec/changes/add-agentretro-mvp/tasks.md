@@ -9,15 +9,15 @@
 
 ## 2. Codex Session Capture and Evidence
 
-- [ ] 2.1 Add representative completed, active, malformed, changed-hash, and unknown-event Codex session fixtures without real credentials or user data.
-- [ ] 2.2 Implement effective Codex-home discovery and explicit `--last` / `--session` selection, including active-session and unavailable-source failures.
-- [ ] 2.3 Implement the versioned Codex session adapter and normalized session/event models with fail-closed required-field validation.
-- [ ] 2.4 Implement session, event, and content-hash idempotency plus source-integrity conflict detection, with duplicate-capture tests.
-- [ ] 2.5 Implement Git-root and normalized-remote project routing plus audited SQLite project mapping records, including unknown and ambiguous project states.
-- [ ] 2.6 Implement pre-model and pre-persistence redaction, minimal evidence excerpts, source locators, and tests proving captured instructions cannot trigger actions.
-- [ ] 2.7 Wire `retro capture` to one database transaction so parser or evidence failure creates no partial session, candidate, or knowledge state.
-- [ ] 2.8 Implement `retro project map/list/remove/reclassify` with containment checks, collision rejection, actor/time audit records, and reclassification of awaiting sessions without reparsing source events.
-- [ ] 2.9 Bound newest-first session discovery by configured candidate count and deadline, stream parsing, reject oversized files before model work, and preserve an explicit diagnostic for every skipped or timed-out source.
+- [x] 2.1 Add representative completed, active, malformed, changed-hash, and unknown-event Codex session fixtures without real credentials or user data.
+- [x] 2.2 Implement effective Codex-home discovery and explicit `--last` / `--session` selection, including active-session and unavailable-source failures.
+- [x] 2.3 Implement the versioned Codex session adapter and normalized session/event models with fail-closed required-field validation.
+- [x] 2.4 Implement session, event, and content-hash idempotency plus source-integrity conflict detection, with duplicate-capture tests.
+- [x] 2.5 Implement Git-root and normalized-remote project routing plus audited SQLite project mapping records, including unknown and ambiguous project states.
+- [x] 2.6 Implement pre-model and pre-persistence redaction, minimal evidence excerpts, source locators, and tests proving captured instructions cannot trigger actions.
+- [x] 2.7 Wire `retro capture` to one database transaction so parser or evidence failure creates no partial session, candidate, or knowledge state.
+- [x] 2.8 Implement `retro project map/list/remove/reclassify` with containment checks, collision rejection, actor/time audit records, and reclassification of awaiting sessions without reparsing source events.
+- [x] 2.9 Bound newest-first session discovery by configured candidate count and deadline, stream parsing, reject oversized files before model work, and preserve an explicit diagnostic for every skipped or timed-out source.
 - [ ] 2.10 Add tests whose names or metadata reference every Codex retrospective scenario `CR-01` through `CR-22`, and record the scenario-to-test mapping in verification evidence.
 
 ## 3. Knowledge Extraction, Review, and Lifecycle

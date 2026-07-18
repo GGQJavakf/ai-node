@@ -425,6 +425,36 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def find_session_by_source_id(
+        self, source_session_id: str
+    ) -> NormalizedSession | None:
+        """Return an existing source identity regardless of its content hash.
+
+        This concrete-adapter query lets capture distinguish a strict replay
+        from a changed source without widening the fixed application port.
+        """
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM sessions WHERE source_session_id = ? "
+                "ORDER BY captured_at LIMIT 1",
+                (source_session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            event_rows = connection.execute(
+                "SELECT * FROM session_events WHERE session_id = ? "
+                "ORDER BY ordinal",
+                (row["id"],),
+            ).fetchall()
+            return _session_from_row(
+                row,
+                tuple(_event_from_row(event_row) for event_row in event_rows),
+            )
+        finally:
+            connection.close()
+
     def save_capture(
         self, session: NormalizedSession, evidence: Sequence[Evidence]
     ) -> None:
