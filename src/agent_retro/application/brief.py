@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import Callable
 
 from agent_retro.application.ports import RetroRepository
+from agent_retro.application.purge import require_no_active_purge
 from agent_retro.domain.models import Knowledge, KnowledgeType, ProjectionStatus
 
 
@@ -294,6 +295,8 @@ class BriefService:
             raise ValueError("project_id must not be empty")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero")
+
+        require_no_active_purge(self.repository, project_id=project_id)
 
         deadline = self.monotonic() + self.timeout_seconds
         at = self.now()

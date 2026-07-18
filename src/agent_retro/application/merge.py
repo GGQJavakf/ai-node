@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from agent_retro.application.ports import RetroRepository
+from agent_retro.application.purge import require_no_active_purge
 from agent_retro.application.sync import ProjectionPersistenceError, SyncService
 from agent_retro.domain.models import (
     Candidate,
@@ -313,6 +314,7 @@ class MergeService:
             raise
         except ValueError as exc:
             raise StalePlanError("merge_plan_stale") from exc
+        require_no_active_purge(self.repository, project_id=plan.project_id)
         job = self._get_job(plan_id)
         if job is None:
             raise KeyError("merge_plan_not_found")
@@ -348,6 +350,7 @@ class MergeService:
     def find_external_edits(
         self, project_id: str
     ) -> tuple[ReconciliationConflict, ...]:
+        require_no_active_purge(self.repository, project_id=project_id)
         self._require_mapping(project_id)
         knowledge = self.repository.list_project_knowledge(project_id)
         authority_hash = projection_input_hash(knowledge)
@@ -538,6 +541,7 @@ class MergeService:
         ):
             raise MergeIntegrityError("reconciliation_plan_invalid")
         project_id = str(payload["project_id"])
+        require_no_active_purge(self.repository, project_id=project_id)
         relative = self._safe_relative(project_id, Path(payload["path"]))
         target = self.vault_root / relative
         vault_owned_bytes = _unb64(payload["vault_base64"])

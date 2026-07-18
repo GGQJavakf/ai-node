@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from agent_retro.application.ports import RetroRepository
-from agent_retro.domain.models import PurgeOperation, PurgePlan, PurgeStatus
+from agent_retro.domain.models import (
+    PurgeJournal,
+    PurgeJournalOperation,
+    PurgeOperation,
+    PurgePlan,
+    PurgeStatus,
+)
 
 
 class PurgeError(RuntimeError):
@@ -47,6 +53,27 @@ class StalePurgePlan(PurgeError):
 
 class UnknownPurgePlan(PurgeError):
     """The supplied plan identity is malformed or cannot be resolved."""
+
+
+class PurgeBlockedError(PurgeError):
+    """Projection and briefing are blocked by an active purge journal."""
+
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
+        self.recovery_command = "retro knowledge purge <id> --recover"
+
+
+class PurgeRecoveryNotFound(PurgeError):
+    """No purge journal exists for the requested identity."""
+
+
+class PurgeAlreadyComplete(PurgeError):
+    """The requested purge journal is already complete."""
+
+
+class PurgeRecoveryNotIncomplete(PurgeError):
+    """Only an incomplete purge journal can be recovered."""
 
 
 @dataclass(frozen=True)
@@ -134,13 +161,30 @@ class PurgeService:
             for copy in copies
             if copy.location_kind.startswith("sqlite_")
         }
+        recovery_payloads = {
+            operation.id: self._recovery_payload(copy, marker)
+            for operation, copy in zip(current.operations, copies, strict=True)
+            if copy.path is not None
+        }
         self.repository.begin_purge(
             current,
-            plan_hash=hashlib.sha256(current.id.encode("utf-8")).hexdigest(),
+            plan_hash=json.dumps(
+                {
+                    "manifest_hash": hashlib.sha256(
+                        current.id.encode("utf-8")
+                    ).hexdigest(),
+                    "marker_hash": hashlib.sha256(marker).hexdigest(),
+                    "marker_length": len(marker),
+                    "project_id": project_id,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
             actor=actor,
             marker=marker,
             journal_locations=journal_locations,
             database_expected_hashes=database_expected,
+            recovery_payloads=recovery_payloads,
             tombstone_json=tombstone,
         )
         failed_kinds: list[str] = []
@@ -166,6 +210,212 @@ class PurgeService:
             actor,
             failed_kinds,
         )
+
+    def recover(self, knowledge_id: str, actor: str = "user") -> PurgeStatus:
+        journal = self.repository.get_purge_journal(knowledge_id)
+        if journal is None:
+            raise PurgeRecoveryNotFound("purge recovery journal was not found")
+        if journal.status is PurgeStatus.PURGED:
+            raise PurgeAlreadyComplete("purge is already complete")
+        if journal.status is not PurgeStatus.PURGE_INCOMPLETE:
+            raise PurgeRecoveryNotIncomplete(
+                "purge recovery requires purge_incomplete state"
+            )
+
+        failed_kinds: list[str] = []
+        for operation in journal.operations:
+            if operation.status == "completed":
+                continue
+            if operation.location_kind.startswith("sqlite_"):
+                failed_kinds.append(operation.location_kind)
+                continue
+            try:
+                self._recover_operation(operation)
+            except (OSError, ValueError):
+                failed_kinds.append(operation.location_kind)
+                self.repository.mark_purge_operation(
+                    operation.id, "failed", "recovery_failed"
+                )
+            else:
+                self.repository.mark_purge_operation(operation.id, "completed")
+
+        residual_kinds = list(failed_kinds)
+        if self.repository.purge_database_has_fingerprint(
+            journal.marker_hash, journal.marker_length
+        ):
+            residual_kinds.append("sqlite")
+        try:
+            residual_kinds.extend(self._fingerprint_residual_kinds(journal))
+        except (OSError, ValueError):
+            residual_kinds.append("verification")
+
+        if residual_kinds:
+            self.repository.finish_purge_incomplete(
+                journal.id,
+                tombstone_json=self._updated_tombstone(
+                    journal.tombstone_json,
+                    PurgeStatus.PURGE_INCOMPLETE,
+                    len(residual_kinds),
+                ),
+                residual_kinds=tuple(sorted(set(residual_kinds))),
+                residual_operations=(),
+                actor=actor,
+            )
+            return PurgeStatus.PURGE_INCOMPLETE
+
+        counts: dict[str, int] = {}
+        for operation in journal.operations:
+            counts[operation.location_kind] = counts.get(operation.location_kind, 0) + 1
+        self.repository.complete_purge(
+            journal.id,
+            tombstone_json=self._updated_tombstone(
+                journal.tombstone_json, PurgeStatus.PURGED, 0
+            ),
+            kind_counts=counts,
+            actor=actor,
+        )
+        return PurgeStatus.PURGED
+
+    def _recover_operation(self, operation: PurgeJournalOperation) -> None:
+        try:
+            payload = json.loads(operation.recovery_json)
+            action = str(payload["action"])
+            after_hash = str(payload["after_hash"])
+            ranges = tuple(
+                (int(item[0]), int(item[1])) for item in payload.get("ranges", ())
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("purge recovery payload is invalid") from exc
+        if action not in {"delete", "remove_ranges"} or len(after_hash) != 64:
+            raise ValueError("purge recovery payload is invalid")
+
+        target = self._journal_target(operation)
+        if not target.exists():
+            return
+        before = target.read_bytes()
+        current_hash = hashlib.sha256(before).hexdigest()
+        if current_hash == after_hash:
+            return
+        if current_hash != operation.expected_hash:
+            raise ValueError("purge recovery target changed")
+        if action == "delete":
+            target.unlink()
+            if target.exists() or target.is_symlink():
+                raise OSError("purge recovery delete readback failed")
+            return
+
+        cursor = 0
+        chunks: list[bytes] = []
+        for start, length in ranges:
+            if start < cursor or length <= 0 or start + length > len(before):
+                raise ValueError("purge recovery ranges are invalid")
+            chunks.append(before[cursor:start])
+            cursor = start + length
+        chunks.append(before[cursor:])
+        after = b"".join(chunks)
+        if hashlib.sha256(after).hexdigest() != after_hash:
+            raise ValueError("purge recovery result is invalid")
+        self._atomic_write(target, after)
+
+    def _journal_target(self, operation: PurgeJournalOperation) -> Path:
+        relative = Path(operation.locator)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("purge recovery locator is invalid")
+        if operation.location_kind == "managed_vault":
+            if self.vault_root is None:
+                raise ValueError("managed vault is unavailable")
+            root = self._validated_root(self.vault_root, "managed vault")
+            target = root / relative
+        elif operation.location_kind in self.backup_roots:
+            root = self._validated_root(
+                self.backup_roots[operation.location_kind], operation.location_kind
+            )
+            target = root / relative
+        elif operation.location_kind in {"agentretro_log", "model_trace"}:
+            paths = (
+                self.log_paths
+                if operation.location_kind == "agentretro_log"
+                else self.trace_paths
+            )
+            try:
+                index = int(operation.locator.removeprefix("registered-")) - 1
+                target = sorted(paths, key=str)[index]
+            except (IndexError, ValueError) as exc:
+                raise ValueError("purge recovery locator is invalid") from exc
+            if target.is_symlink():
+                raise ValueError("purge recovery target is a symlink")
+            return target.resolve() if target.exists() else target
+        else:
+            raise ValueError("purge recovery kind is invalid")
+
+        if target.is_symlink():
+            raise ValueError("purge recovery target is a symlink")
+        if target.exists():
+            return self._validated_child(root, target, operation.location_kind)
+        self._validate_absent_child(root, target, operation.location_kind)
+        return target
+
+    def _atomic_write(self, target: Path, after: bytes) -> None:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".agentretro-purge-", dir=target.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(after)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, target.stat().st_mode)
+            self._replace(temporary, target)
+            if target.read_bytes() != after:
+                raise OSError("purge recovery readback failed")
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _fingerprint_residual_kinds(self, journal: PurgeJournal) -> tuple[str, ...]:
+        kinds: set[str] = set()
+        if self.vault_root is not None:
+            root = self._validated_root(self.vault_root, "managed vault")
+            for state in self.repository.list_managed_file_states(journal.project_id):
+                target = Path(state.path)
+                if not target.exists() and not target.is_symlink():
+                    self._validate_absent_child(root, target, "managed vault")
+                    continue
+                resolved = self._validated_child(root, target, "managed vault")
+                if _has_sha256_window(
+                    resolved.read_bytes(), journal.marker_hash, journal.marker_length
+                ):
+                    kinds.add("managed_vault")
+
+        for kind, root_value in sorted(self.backup_roots.items()):
+            root = self._validated_root(root_value, kind)
+            if not root.exists():
+                continue
+            for directory, dirnames, filenames in os.walk(root, followlinks=False):
+                directory_path = Path(directory)
+                if any((directory_path / name).is_symlink() for name in dirnames):
+                    raise ValueError("registered recovery root contains a symlink")
+                for name in filenames:
+                    target = directory_path / name
+                    if target.is_symlink():
+                        raise ValueError("registered recovery root contains a symlink")
+                    if _has_sha256_window(
+                        target.read_bytes(), journal.marker_hash, journal.marker_length
+                    ):
+                        kinds.add(kind)
+        for kind, paths in (
+            ("agentretro_log", self.log_paths),
+            ("model_trace", self.trace_paths),
+        ):
+            for target in paths:
+                if target.is_symlink():
+                    raise ValueError("registered recovery file is a symlink")
+                if target.exists() and _has_sha256_window(
+                    target.read_bytes(), journal.marker_hash, journal.marker_length
+                ):
+                    kinds.add(kind)
+        return tuple(sorted(kinds))
 
     def _current_manifest(
         self, knowledge_id: str
@@ -263,7 +513,7 @@ class PurgeService:
                 kind_ordinals[operation.location_kind] = (
                     kind_ordinals.get(operation.location_kind, 0) + 1
                 )
-            additions: list[tuple[PurgeOperation, str]] = []
+            additions: list[tuple[PurgeOperation, str, str]] = []
             for copy in sorted(
                 residual_copies, key=lambda item: (item.location_kind, item.locator)
             ):
@@ -286,6 +536,7 @@ class PurgeService:
                             copy.expected_hash,
                         ),
                         copy.locator,
+                        self._recovery_payload(copy, marker),
                     )
                 )
             self.repository.finish_purge_incomplete(
@@ -313,6 +564,32 @@ class PurgeService:
             actor=actor,
         )
         return PurgeStatus.PURGED
+
+    @staticmethod
+    def _recovery_payload(copy: _ManifestCopy, marker: bytes) -> str:
+        ranges: list[list[int]] = []
+        offset = 0
+        while True:
+            found = copy.content.find(marker, offset)
+            if found < 0:
+                break
+            ranges.append([found, len(marker)])
+            offset = found + len(marker)
+        after = copy.content.replace(marker, b"")
+        action = (
+            "delete"
+            if copy.location_kind.endswith("_backup") or not after
+            else "remove_ranges"
+        )
+        return json.dumps(
+            {
+                "action": action,
+                "after_hash": hashlib.sha256(after).hexdigest(),
+                "ranges": ranges,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
 
     @staticmethod
     def _updated_tombstone(
@@ -544,3 +821,26 @@ class PurgeService:
                     f"{label} registration contains a symlink"
                 )
             current = current.parent
+
+
+def require_no_active_purge(
+    repository: RetroRepository,
+    *,
+    project_id: str | None = None,
+    knowledge_id: str | None = None,
+) -> None:
+    checker = getattr(repository, "active_purge_block", None)
+    if checker is None:
+        return
+    status = checker(project_id=project_id, knowledge_id=knowledge_id)
+    if status is not None:
+        raise PurgeBlockedError(status)
+
+
+def _has_sha256_window(content: bytes, expected_hash: str, length: int) -> bool:
+    if length <= 0 or len(expected_hash) != 64 or len(content) < length:
+        return False
+    return any(
+        hashlib.sha256(content[offset : offset + length]).hexdigest() == expected_hash
+        for offset in range(len(content) - length + 1)
+    )

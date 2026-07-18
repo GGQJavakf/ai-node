@@ -308,6 +308,28 @@ class PurgeTombstone:
 
 
 @dataclass(frozen=True)
+class PurgeJournalOperation:
+    id: str
+    location_kind: str
+    locator: str
+    expected_hash: str
+    status: str
+    recovery_json: str
+
+
+@dataclass(frozen=True)
+class PurgeJournal:
+    id: str
+    knowledge_id: str
+    project_id: str
+    marker_hash: str
+    marker_length: int
+    status: PurgeStatus
+    tombstone_json: str
+    operations: tuple[PurgeJournalOperation, ...]
+
+
+@dataclass(frozen=True)
 class AuditEntry:
     id: str
     actor: str

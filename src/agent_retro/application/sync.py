@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from agent_retro.application.ports import RetroRepository
+from agent_retro.application.purge import require_no_active_purge
 from agent_retro.domain.models import (
     ManagedFileUpdate,
     ProjectionEvent,
@@ -91,6 +92,7 @@ class SyncService:
         event = self.repository.get_projection_event(event_id)
         if event is None:
             raise ProjectionPersistenceError("projection_event_not_found")
+        require_no_active_purge(self.repository, project_id=event.project_id)
         if (
             plan.event_id != event_id
             or plan.project_id != event.project_id
@@ -160,6 +162,7 @@ class SyncService:
         event = self.repository.get_projection_event(event_id)
         if event is None:
             raise KeyError(f"projection event not found: {event_id}")
+        require_no_active_purge(self.repository, project_id=event.project_id)
         try:
             with self._project_lock(event.project_id):
                 event = self.repository.get_projection_event(event_id)
@@ -225,6 +228,7 @@ class SyncService:
             initial_plan = load_persisted_merge_plan(initial_job, plan_id)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("merge_plan_invalid") from exc
+        require_no_active_purge(self.repository, project_id=initial_plan.project_id)
         try:
             with self._project_lock(initial_plan.project_id):
                 try:
@@ -878,6 +882,7 @@ class ProjectionCoordinator:
     def after_commit(
         self, cause: str, entity_id: str, project_id: str
     ) -> ProjectionResult:
+        require_no_active_purge(self.repository, project_id=project_id)
         try:
             event_id = self.repository.save_current_projection_event(
                 project_id, cause, entity_id
@@ -893,6 +898,7 @@ class ProjectionCoordinator:
         event = self.repository.get_projection_event(event_id)
         if event is None:
             raise KeyError(f"projection event not found: {event_id}")
+        require_no_active_purge(self.repository, project_id=event.project_id)
         if event.status is ProjectionStatus.ROLLBACK_REQUIRED:
             return ProjectionResult(
                 event_id=event.id,

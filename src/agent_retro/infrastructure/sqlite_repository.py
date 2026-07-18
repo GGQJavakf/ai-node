@@ -38,6 +38,8 @@ from agent_retro.domain.models import (
     PurgePlan,
     PurgeCopy,
     PurgeInspection,
+    PurgeJournal,
+    PurgeJournalOperation,
     PurgeStatus,
     PurgeTombstone,
     ReviewAttempt,
@@ -2682,6 +2684,7 @@ class SQLiteRetroRepository(RetroRepository):
         marker: bytes,
         journal_locations: Mapping[str, str],
         database_expected_hashes: Mapping[str, str],
+        recovery_payloads: Mapping[str, str],
         tombstone_json: str,
     ) -> None:
         """Journal and scrub SQLite-owned copies in one transaction."""
@@ -2730,7 +2733,7 @@ class SQLiteRetroRepository(RetroRepository):
                             if operation.location_kind.startswith("sqlite_")
                             else "pending"
                         ),
-                        "",
+                        recovery_payloads.get(operation.id, ""),
                     ),
                 )
 
@@ -2798,13 +2801,121 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def get_purge_journal(self, knowledge_id: str) -> PurgeJournal | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT * FROM purge_jobs WHERE knowledge_id = ?
+                ORDER BY updated_at DESC, id DESC LIMIT 1""",
+                (knowledge_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                metadata = json.loads(str(row["plan_hash"]))
+            except json.JSONDecodeError:
+                metadata = {}
+            operation_rows = connection.execute(
+                """SELECT * FROM purge_operations WHERE purge_job_id = ?
+                ORDER BY location_kind, id""",
+                (row["id"],),
+            ).fetchall()
+            return PurgeJournal(
+                id=str(row["id"]),
+                knowledge_id=str(row["knowledge_id"]),
+                project_id=str(metadata.get("project_id", "")),
+                marker_hash=str(metadata.get("marker_hash", "")),
+                marker_length=int(metadata.get("marker_length", 0)),
+                status=PurgeStatus(row["status"]),
+                tombstone_json=str(row["tombstone_json"]),
+                operations=tuple(
+                    PurgeJournalOperation(
+                        id=str(item["id"]),
+                        location_kind=str(item["location_kind"]),
+                        locator=str(item["location"]),
+                        expected_hash=str(item["expected_hash"]),
+                        status=str(item["status"]),
+                        recovery_json=str(item["error"]),
+                    )
+                    for item in operation_rows
+                ),
+            )
+        finally:
+            connection.close()
+
+    def active_purge_block(
+        self, *, project_id: str | None = None, knowledge_id: str | None = None
+    ) -> str | None:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT knowledge_id, plan_hash, status FROM purge_jobs
+                WHERE status IN (?, ?) ORDER BY updated_at, id""",
+                (
+                    PurgeStatus.PURGE_IN_PROGRESS.value,
+                    PurgeStatus.PURGE_INCOMPLETE.value,
+                ),
+            ).fetchall()
+            for row in rows:
+                if (
+                    knowledge_id is not None
+                    and str(row["knowledge_id"]) != knowledge_id
+                ):
+                    continue
+                if project_id is not None:
+                    try:
+                        metadata = json.loads(str(row["plan_hash"]))
+                    except json.JSONDecodeError:
+                        continue
+                    if str(metadata.get("project_id", "")) != project_id:
+                        continue
+                return str(row["status"])
+            return None
+        finally:
+            connection.close()
+
+    def purge_database_has_fingerprint(
+        self, marker_hash: str, marker_length: int
+    ) -> bool:
+        connection = self._connect()
+        try:
+            for _, table, _, column in _PURGE_SQLITE_FIELDS:
+                rows = connection.execute(f"SELECT {column} AS content FROM {table}")
+                for row in rows:
+                    value = row["content"]
+                    content = (
+                        bytes(value)
+                        if isinstance(value, bytes)
+                        else str(value).encode("utf-8")
+                    )
+                    if _has_sha256_window(content, marker_hash, marker_length):
+                        return True
+            return False
+        finally:
+            connection.close()
+
     def mark_purge_operation(
         self, operation_id: str, status: str, error: str = ""
     ) -> None:
         with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT error FROM purge_operations WHERE id = ?", (operation_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"purge operation not found: {operation_id}")
+            stored_error = ""
+            if status == "failed" and row["error"]:
+                try:
+                    payload = json.loads(str(row["error"]))
+                except json.JSONDecodeError:
+                    payload = {}
+                payload["last_error"] = error or "cleanup_failed"
+                stored_error = json.dumps(
+                    payload, separators=(",", ":"), sort_keys=True
+                )
             cursor = connection.execute(
                 "UPDATE purge_operations SET status = ?, error = ? WHERE id = ?",
-                (status, error, operation_id),
+                (status, stored_error, operation_id),
             )
             _require_row(cursor, "purge operation", operation_id)
 
@@ -2828,13 +2939,13 @@ class SQLiteRetroRepository(RetroRepository):
         *,
         tombstone_json: str,
         residual_kinds: Sequence[str],
-        residual_operations: Sequence[tuple[PurgeOperation, str]],
+        residual_operations: Sequence[tuple[PurgeOperation, str, str]],
         actor: str,
     ) -> None:
         safe_kinds = tuple(sorted(set(str(item) for item in residual_kinds)))
         residual_count = int(json.loads(tombstone_json)["residual_count"])
         with self.transaction() as connection:
-            for operation, locator in residual_operations:
+            for operation, locator, recovery_json in residual_operations:
                 connection.execute(
                     """INSERT INTO purge_operations(
                         id, purge_job_id, location_kind, location,
@@ -2848,7 +2959,7 @@ class SQLiteRetroRepository(RetroRepository):
                         locator,
                         operation.expected_hash,
                         "pending",
-                        "",
+                        recovery_json,
                     ),
                 )
             cursor = connection.execute(
@@ -3304,3 +3415,12 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _has_sha256_window(content: bytes, expected_hash: str, length: int) -> bool:
+    if length <= 0 or len(expected_hash) != 64 or len(content) < length:
+        return False
+    return any(
+        hashlib.sha256(content[offset : offset + length]).hexdigest() == expected_hash
+        for offset in range(len(content) - length + 1)
+    )

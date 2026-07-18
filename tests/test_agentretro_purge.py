@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,11 +14,18 @@ from agent_retro.application.purge import (
     IncompletePurgeConfirmation,
     KnowledgeAlreadyPurged,
     KnowledgeSyncPending,
+    PurgeAlreadyComplete,
+    PurgeBlockedError,
     PurgeKnowledgeNotFound,
+    PurgeRecoveryNotFound,
+    PurgeRecoveryNotIncomplete,
     PurgeService,
     StalePurgePlan,
     UnsafePurgeRegistration,
 )
+from agent_retro.application.brief import BriefRequest, BriefService
+from agent_retro.application.merge import MergeService
+from agent_retro.application.sync import ProjectionCoordinator, SyncService
 from agent_retro.domain.models import PurgeStatus
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 
@@ -577,6 +585,218 @@ def test_registered_backup_symlink_is_rejected_without_following_it(purge_fixtur
         service.plan(KNOWLEDGE_ID)
 
     assert outside.read_text(encoding="utf-8") == MARKER
+
+
+def test_interrupted_cleanup_recovers_from_persisted_journal_only(purge_fixture):
+    repository, service, *_ = purge_fixture
+    replace_count = 0
+
+    def fail_second_replace(source: Path, target: Path) -> None:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise OSError("injected second replace failure")
+        source.replace(target)
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_second_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+    before = _table_rows(repository, "purge_operations")
+    assert any(row["status"] == "completed" for row in before)
+    assert any(row["status"] == "failed" for row in before)
+    completed_ids = {row["id"] for row in before if row["status"] == "completed"}
+
+    recovery_writes: list[Path] = []
+
+    def record_replace(source: Path, target: Path) -> None:
+        recovery_writes.append(target)
+        source.replace(target)
+
+    restarted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=record_replace,
+    )
+    status = restarted.recover(KNOWLEDGE_ID, actor="recovery-user")
+
+    assert status is PurgeStatus.PURGED
+    assert len(recovery_writes) == 1
+    after = _table_rows(repository, "purge_operations")
+    assert completed_ids <= {row["id"] for row in after if row["status"] == "completed"}
+    assert all(row["location"] == "" and row["expected_hash"] == "" for row in after)
+    assert MARKER.encode() not in repository.db_path.read_bytes()
+    assert all(
+        MARKER.encode() not in path.read_bytes()
+        for path in (*restarted.log_paths, *restarted.trace_paths)
+        if path.exists()
+    )
+    assert all(
+        MARKER.encode() not in path.read_bytes()
+        for root in restarted.backup_roots.values()
+        for path in root.rglob("*")
+        if path.is_file()
+    )
+    brief = BriefService(repository).build(
+        BriefRequest(task="post purge", project_id=PROJECT_ID)
+    )
+    assert KNOWLEDGE_ID not in {item.id for item in brief.items}
+
+
+def test_recover_rejects_missing_complete_and_non_incomplete_journals(purge_fixture):
+    repository, service, *_ = purge_fixture
+
+    with pytest.raises(PurgeRecoveryNotFound):
+        service.recover("knowledge-without-journal")
+
+    plan = service.plan(KNOWLEDGE_ID)
+    assert (
+        service.apply(plan.id, frozenset(operation.id for operation in plan.operations))
+        is PurgeStatus.PURGED
+    )
+    with pytest.raises(PurgeAlreadyComplete):
+        service.recover(KNOWLEDGE_ID)
+
+    with sqlite3.connect(repository.db_path) as connection:
+        connection.execute(
+            "UPDATE purge_jobs SET status = ? WHERE knowledge_id = ?",
+            (PurgeStatus.PURGE_IN_PROGRESS.value, KNOWLEDGE_ID),
+        )
+    with pytest.raises(PurgeRecoveryNotIncomplete):
+        service.recover(KNOWLEDGE_ID)
+
+
+def test_failed_recovery_remains_incomplete(purge_fixture):
+    repository, service, *_ = purge_fixture
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected cleanup failure")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+
+    assert interrupted.recover(KNOWLEDGE_ID) is PurgeStatus.PURGE_INCOMPLETE
+    journal = repository.get_purge_journal(KNOWLEDGE_ID)
+    assert journal is not None
+    assert journal.status is PurgeStatus.PURGE_INCOMPLETE
+    assert any(operation.status == "failed" for operation in journal.operations)
+
+
+def test_incomplete_purge_blocks_brief_and_projection_before_writes(purge_fixture):
+    repository, service, *_ = purge_fixture
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected cleanup failure")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=service.vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+    events_before = repository.projection_event_count(PROJECT_ID)
+
+    with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
+        BriefService(repository).build(
+            BriefRequest(task="blocked", project_id=PROJECT_ID)
+        )
+    with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
+        ProjectionCoordinator(repository, None, None).after_commit(
+            "blocked", KNOWLEDGE_ID, PROJECT_ID
+        )
+
+    assert repository.projection_event_count(PROJECT_ID) == events_before
+
+
+def test_incomplete_purge_blocks_sync_reconcile_and_merge_entrypoints(
+    purge_fixture, monkeypatch
+):
+    repository, service, *_ = purge_fixture
+    vault_root = service.vault_root
+    assert vault_root is not None
+
+    def fail_replace(source: Path, target: Path) -> None:
+        raise OSError("injected cleanup failure")
+
+    interrupted = PurgeService(
+        repository,
+        vault_root=vault_root,
+        backup_roots=service.backup_roots,
+        log_paths=service.log_paths,
+        trace_paths=service.trace_paths,
+        replace=fail_replace,
+    )
+    plan = interrupted.plan(KNOWLEDGE_ID)
+    assert (
+        interrupted.apply(
+            plan.id, frozenset(operation.id for operation in plan.operations)
+        )
+        is PurgeStatus.PURGE_INCOMPLETE
+    )
+    event_id = repository.save_current_projection_event(
+        PROJECT_ID, "test-fixture-bypass", KNOWLEDGE_ID
+    )
+
+    sync = SyncService(repository, vault_root, vault_root.parent / "sync-backups")
+    merge = MergeService(repository, vault_root, vault_root.parent / "merge-backups")
+    with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
+        sync.synchronize(event_id, None)  # type: ignore[arg-type]
+    with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
+        merge.find_external_edits(PROJECT_ID)
+
+    monkeypatch.setattr(
+        merge, "_load_plan", lambda _: SimpleNamespace(project_id=PROJECT_ID)
+    )
+    with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
+        merge.apply("merge-plan", confirmed=True)
+
+    conflict_id = "reconcile-test"
+    payload = json.dumps(
+        {"id": conflict_id, "kind": "reconciliation", "project_id": PROJECT_ID},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    monkeypatch.setattr(
+        merge, "_get_job", lambda _: SimpleNamespace(plan_json=payload)
+    )
+    with pytest.raises(PurgeBlockedError, match="purge_incomplete"):
+        merge.reconcile(conflict_id, "manual_edit", actor="user")
 
 
 def test_sqlite_stage_failure_rolls_back_the_journal_and_every_scrub(purge_fixture):

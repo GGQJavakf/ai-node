@@ -27,6 +27,7 @@ from agent_retro.domain.models import (
     PurgeOperation,
     PurgePlan,
     PurgeInspection,
+    PurgeJournal,
     PurgeStatus,
     PurgeTombstone,
     ReviewAttempt,
@@ -273,6 +274,7 @@ class RetroRepository(Protocol):
         marker: bytes,
         journal_locations: Mapping[str, str],
         database_expected_hashes: Mapping[str, str],
+        recovery_payloads: Mapping[str, str],
         tombstone_json: str,
     ) -> None: ...
 
@@ -290,9 +292,19 @@ class RetroRepository(Protocol):
         *,
         tombstone_json: str,
         residual_kinds: Sequence[str],
-        residual_operations: Sequence[tuple[PurgeOperation, str]],
+        residual_operations: Sequence[tuple[PurgeOperation, str, str]],
         actor: str,
     ) -> None: ...
+
+    def get_purge_journal(self, knowledge_id: str) -> PurgeJournal | None: ...
+
+    def active_purge_block(
+        self, *, project_id: str | None = None, knowledge_id: str | None = None
+    ) -> str | None: ...
+
+    def purge_database_has_fingerprint(
+        self, marker_hash: str, marker_length: int
+    ) -> bool: ...
 
     def complete_purge(
         self,
