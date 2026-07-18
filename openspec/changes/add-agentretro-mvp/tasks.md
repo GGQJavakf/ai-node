@@ -61,9 +61,9 @@
 
 ## 6. End-to-End and Regression Verification
 
-- [ ] 6.1 Add a temporary Codex-home and temporary Obsidian-vault integration test covering capture, extraction, review, acceptance, synchronization, and briefing.
-- [ ] 6.2 Add security fixtures and repository-wide output assertions proving test secrets never reach logs, SQLite, model traces, backups, or vault files.
-- [ ] 6.3 Add Windows GBK and UTF-8 subprocess smoke tests for `retro --help`, capture, review, and brief, and isolate any legacy output compatibility patch from business behavior.
-- [ ] 6.4 Run the complete existing `ai-todo` suite and verify AgentRetro tests do not modify the existing Todo database or configuration behavior.
+- [x] 6.1 Add a temporary Codex-home and temporary Obsidian-vault integration test covering capture, extraction, review, acceptance, synchronization, and briefing.
+- [x] 6.2 Add security fixtures and repository-wide output assertions proving test secrets never reach logs, SQLite, model traces, backups, or vault files.
+- [x] 6.3 Add Windows GBK and UTF-8 subprocess smoke tests for `retro --help`, capture, review, and brief, and isolate any legacy output compatibility patch from business behavior.
+- [x] 6.4 Run the complete existing `ai-todo` suite and verify AgentRetro tests do not modify the existing Todo database or configuration behavior.
 - [ ] 6.5 Verify that every `CR-01..CR-22`, `KR-01..KR-24`, `OS-01..OS-24`, and `BR-01..BR-28` ID has at least one passing automated test or an explicitly justified manual check, with no orphan scenario or test reference.
 - [ ] 6.6 Run `openspec validate add-agentretro-mvp --strict`, full tests, CLI smoke checks, and a final scope/security self-review before declaring implementation complete.
