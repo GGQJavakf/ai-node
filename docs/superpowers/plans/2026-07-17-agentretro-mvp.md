@@ -602,7 +602,7 @@ git commit -m "Make AgentRetro state versioned and recoverable"
 **Interfaces:**
 - Produces: `CodexSessionSource`, `Redactor`, `ProjectResolver`, `ProjectMappingService.map/list/remove/reclassify`, `CaptureService.capture_last()`, `CaptureService.capture_session()`.
 - Consumes: `RetroRepository` from Task 2.
-- Closes OpenSpec tasks: `2.1` through `2.9`; scenario trace task `2.10` remains for Task 10.
+- Closes OpenSpec tasks: `2.1` through `2.7` and `2.9`; review-dependent reclassification `2.8` moves to Task 4, and scenario trace task `2.10` remains for Task 10.
 
 - [ ] **Step 1: Add synthetic JSONL fixtures and failing parser tests**
 
@@ -705,7 +705,7 @@ class Redactor:
 
 Normalize HTTPS and SSH Git remotes to `host/path-without-dot-git`. Resolve in this order: exact Git-root plus remote mapping, exact Git-root mapping, unique remote mapping. Return `ProjectResolution(status="unknown")` or `status="ambiguous"` rather than guessing.
 
-`ProjectMappingService.map()` resolves the Git root, rejects path/symlink escape for the configured vault project, rejects an active root or remote mapped to an incompatible target, and persists `ProjectMapping`. `list()` returns no embedded remote credentials. `remove()` deactivates only the mapping. `reclassify()` updates an awaiting session to an existing mapping and calls review over stored redacted evidence without parsing the JSONL again.
+`ProjectMappingService.map()` resolves the Git root, rejects path/symlink escape for the configured vault project, rejects an active root or remote mapped to an incompatible target, and persists `ProjectMapping`. `list()` returns no embedded remote credentials. `remove()` deactivates only the mapping. Add the repository-level audited `reclassify_session()` primitive and a service method that requires an injected stored-evidence review callback; Task 4 wires that callback to the real `ReviewService` before exposing successful CLI reclassification. No Task 3 code may silently skip the callback or report success without review.
 
 ```python
 class ProjectMappingService:
@@ -719,7 +719,7 @@ class ProjectMappingService:
 
 `CaptureService` checks `find_session()` before writing. A known session ID with a changed hash raises `SourceIntegrityError`. A new capture constructs redacted evidence, saves session and evidence in one repository transaction, and returns a result with `captured`, `reused`, `warnings`, and `project_status`.
 
-Add argparse subcommands with mutually exclusive `--last` and `--session`, plus `retro project map --root ... --vault-project ...`, `list`, `remove`, and `reclassify`. No capture command may create a hook or watcher. A parser or evidence error occurs before `save_capture()` commits anything.
+Add argparse subcommands with mutually exclusive `--last` and `--session`, plus `retro project map --root ... --vault-project ...`, `list`, and `remove`. Task 4 adds `reclassify` only when its real review callback can be wired. No capture command may create a hook or watcher. A parser or evidence error occurs before `save_capture()` commits anything.
 
 - [ ] **Step 7: Run capture, security, idempotency, and regression tests**
 
@@ -733,7 +733,7 @@ Expected: all tests pass.
 
 - [ ] **Step 8: Mark covered OpenSpec tasks complete**
 
-Change `2.1` through `2.9` to `[x]`; leave `2.10` open for the scenario coverage gate.
+Change `2.1` through `2.7` and `2.9` to `[x]`; leave `2.8` for Task 4 and `2.10` for the scenario coverage gate.
 
 - [ ] **Step 9: Commit explicit evidence-backed capture**
 
@@ -757,7 +757,7 @@ git commit -m "Capture completed Codex sessions with traceable evidence"
 **Interfaces:**
 - Produces: `ExtractionGateway`, `ReviewGateway`, `ReviewService.review_session/retry_candidate/retry_session`, `KnowledgeService`, `GateResult`.
 - Consumes: captured evidence and repository methods from Tasks 2 and 3.
-- Closes OpenSpec tasks: `3.1` through `3.9`; sensitive purge `3.10` is Task 9 and trace task `3.11` is Task 10.
+- Closes OpenSpec tasks: `2.8` and `3.1` through `3.9`; sensitive purge `3.10` is Task 9 and trace task `3.11` is Task 10.
 
 - [ ] **Step 1: Write failing type-contract and threshold tests**
 
@@ -845,7 +845,7 @@ def threshold_passes(kind: KnowledgeType, confidence: float) -> bool:
 
 `ReviewService.review_session()` saves extracted candidates before calling the independent reviewer, records a failed attempt when the model is unavailable or reaches the effective timeout, evaluates gates, and automatically accepts only `ACCEPT` results that pass type threshold and all gates. `accept()`, `edit()`, and `reject()` always append actor and before/after hashes.
 
-Add `retro review`, `show`, `accept`, `edit`, and `reject` commands. Evidence excerpts displayed by review are already redacted.
+Add `retro review`, `show`, `accept`, `edit`, and `reject` commands. Evidence excerpts displayed by review are already redacted. Wire `retro project reclassify` here: load only stored redacted evidence, invoke `ReviewService.review_stored_evidence()` successfully, then call the repository's typed audited reclassification mutation; callback failure leaves the session awaiting and returns a stable retryable error. Never re-read the source JSONL.
 
 - [ ] **Step 6: Implement conflicts, scope, expiry, and archive**
 
@@ -890,7 +890,7 @@ Expected: all tests pass.
 
 - [ ] **Step 9: Mark covered OpenSpec tasks complete**
 
-Change `3.1` through `3.9` to `[x]`; leave `3.10` and `3.11` open.
+Change `2.8` and `3.1` through `3.9` to `[x]`; leave `3.10` and `3.11` open.
 
 - [ ] **Step 10: Commit review and lifecycle behavior**
 
