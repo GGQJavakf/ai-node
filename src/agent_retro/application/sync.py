@@ -37,6 +37,13 @@ class ProjectionResult:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class _MergeSnapshot:
+    exists: bool
+    kind: str
+    content: bytes
+
+
 class ProjectionLockBusy(RuntimeError):
     """A project projection is already active in another thread/process."""
 
@@ -180,7 +187,13 @@ class SyncService:
                 event_id, ProjectionStatus.SYNC_PENDING, "sync_lock_busy"
             )
 
-    def apply_confirmed_merge(self, plan, *, plan_json: str) -> ProjectionResult:
+    def apply_confirmed_merge(
+        self,
+        plan_id: str,
+        *,
+        confirmed_operations: tuple[str, ...] = (),
+        actor: str = "user",
+    ) -> ProjectionResult:
         """Apply a separately confirmed deep-merge plan through the journal.
 
         This deliberately does not call or relax ``apply``: automatic projection
@@ -189,16 +202,47 @@ class SyncService:
         project lock.
         """
 
+        from agent_retro.application.merge import (
+            load_persisted_merge_plan,
+            required_merge_operation_ids,
+        )
+
+        if actor != "user":
+            raise ValueError("merge_actor_must_be_user")
         try:
-            with self._project_lock(plan.project_id):
-                job = self.repository.get_sync_job(plan.id)
-                if job is None or job.project_id != plan.project_id:
+            initial_job = self.repository.get_sync_job(plan_id)
+        except sqlite3.Error as exc:
+            raise ProjectionPersistenceError("merge_state_unavailable") from exc
+        if initial_job is None:
+            raise ProjectionPersistenceError("merge_plan_not_found")
+        try:
+            initial_plan = load_persisted_merge_plan(initial_job, plan_id)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("merge_plan_invalid") from exc
+        try:
+            with self._project_lock(initial_plan.project_id):
+                try:
+                    job = self.repository.get_sync_job(plan_id)
+                except sqlite3.Error as exc:
+                    raise ProjectionPersistenceError("merge_state_unavailable") from exc
+                if job is None:
                     raise ProjectionPersistenceError("merge_plan_not_found")
-                if job.plan_json != plan_json:
-                    raise ProjectionPersistenceError("merge_plan_changed")
+                try:
+                    plan = load_persisted_merge_plan(job, plan_id)
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError("merge_plan_invalid") from exc
+                if plan.project_id != initial_plan.project_id:
+                    raise ValueError("merge_plan_changed")
+                required = required_merge_operation_ids(plan)
+                supplied = frozenset(confirmed_operations)
+                missing = required - supplied
+                if missing:
+                    raise ValueError("merge_operation_confirmation_required")
+                if supplied - required:
+                    raise ValueError("unknown_merge_operation_confirmation")
                 if job.status == ProjectionStatus.SYNCED.value:
                     return ProjectionResult(
-                        plan.id, ProjectionStatus.SYNCED, reason="already_applied"
+                        plan_id, ProjectionStatus.SYNCED, reason="already_applied"
                     )
                 if self.repository.has_rollback_required_sync():
                     return self._finish_merge(
@@ -213,35 +257,46 @@ class SyncService:
                 backup_dir = self.backup_root / plan.id
                 try:
                     self._backup_snapshots(backup_dir, snapshots)
+                    self._assert_merge_inputs(plan)
                     self.repository.begin_sync(
                         SyncJob(
                             id=plan.id,
                             project_id=plan.project_id,
                             status=ProjectionStatus.SYNC_PENDING.value,
-                            plan_json=plan_json,
+                            plan_json=job.plan_json,
                             backup_path=backup_dir,
                         )
                     )
                 except sqlite3.Error as exc:
                     raise ProjectionPersistenceError("journal_start_failed") from exc
+                except ValueError as exc:
+                    raise ValueError("merge_plan_stale") from exc
                 except OSError:
                     return self._finish_merge(
                         plan.id, ProjectionStatus.SYNC_PENDING, "backup_failed"
                     )
                 try:
+                    changed_paths: set[Path] = set()
+                    self._assert_merge_inputs(plan)
                     for target in plan.targets:
+                        self._assert_merge_inputs(plan, exclude=changed_paths)
                         path = self.vault_root / target.path
+                        changed_paths.add(path)
                         self._atomic_replace(path, target.output_bytes)
                         if path.read_bytes() != target.output_bytes:
                             raise OSError("merge_target_readback_failed")
                     for delete in plan.deletes:
+                        self._assert_merge_inputs(plan, exclude=changed_paths)
                         path = self.vault_root / delete.path
+                        changed_paths.add(path)
                         path.unlink()
                         if path.exists():
                             raise OSError("merge_delete_readback_failed")
                     for rename in plan.renames:
+                        self._assert_merge_inputs(plan, exclude=changed_paths)
                         source = self.vault_root / rename.source
                         target = self.vault_root / rename.target
+                        changed_paths.update((source, target))
                         target.parent.mkdir(parents=True, exist_ok=True)
                         self.replace(source, target)
                         if source.exists() or not target.exists():
@@ -250,7 +305,7 @@ class SyncService:
                             raise OSError("merge_rename_hash_failed")
                     self.repository.finish_sync(plan.id, ProjectionStatus.SYNCED.value)
                 except sqlite3.Error:
-                    rollback_error = self._restore_snapshots(snapshots)
+                    rollback_error = self._restore_snapshots(snapshots, changed_paths)
                     status = (
                         ProjectionStatus.ROLLBACK_REQUIRED
                         if rollback_error
@@ -260,8 +315,17 @@ class SyncService:
                         "rollback_failed" if rollback_error else "journal_update_failed"
                     )
                     return self._finish_merge(plan.id, status, reason)
+                except ValueError:
+                    rollback_error = self._restore_snapshots(snapshots, changed_paths)
+                    status = (
+                        ProjectionStatus.ROLLBACK_REQUIRED
+                        if rollback_error
+                        else ProjectionStatus.SYNC_PENDING
+                    )
+                    reason = "rollback_failed" if rollback_error else "merge_plan_stale"
+                    return self._finish_merge(plan.id, status, reason)
                 except (OSError, RuntimeError):
-                    rollback_error = self._restore_snapshots(snapshots)
+                    rollback_error = self._restore_snapshots(snapshots, changed_paths)
                     status = (
                         ProjectionStatus.ROLLBACK_REQUIRED
                         if rollback_error
@@ -272,10 +336,12 @@ class SyncService:
                 return ProjectionResult(plan.id, ProjectionStatus.SYNCED)
         except ProjectionLockBusy:
             return self._finish_merge(
-                plan.id, ProjectionStatus.SYNC_PENDING, "sync_lock_busy"
+                plan_id, ProjectionStatus.SYNC_PENDING, "sync_lock_busy"
             )
 
-    def _preflight_merge(self, plan) -> dict[Path, bytes | None]:
+    def _preflight_merge(
+        self, plan, *, exclude: set[Path] | None = None
+    ) -> dict[Path, _MergeSnapshot]:
         if self.vault_root is None:
             raise ValueError("vault is disabled")
         if not self.vault_root.exists() or not self.vault_root.is_dir():
@@ -295,26 +361,69 @@ class SyncService:
         ):
             raise ValueError("authoritative knowledge changed after planning")
         self._validate_backup_dir(self.backup_root / plan.id)
-        expected: list[tuple[Path, str]] = []
+        expected: list[tuple[Path, bool, str, str]] = []
         expected.extend(
-            (self.vault_root / target.path, target.input_hash)
+            (
+                self.vault_root / target.path,
+                target.input_exists,
+                target.input_kind,
+                target.input_hash,
+            )
             for target in plan.targets
         )
         expected.extend(
-            (self.vault_root / delete.path, delete.input_hash)
+            (
+                self.vault_root / delete.path,
+                delete.input_exists,
+                delete.input_kind,
+                delete.input_hash,
+            )
             for delete in plan.deletes
         )
         for rename in plan.renames:
-            expected.append((self.vault_root / rename.source, rename.source_hash))
-            expected.append((self.vault_root / rename.target, rename.target_hash))
-        snapshots: dict[Path, bytes | None] = {}
-        for target, expected_hash in expected:
+            expected.append(
+                (
+                    self.vault_root / rename.source,
+                    rename.source_exists,
+                    rename.source_kind,
+                    rename.source_hash,
+                )
+            )
+            expected.append(
+                (
+                    self.vault_root / rename.target,
+                    rename.target_exists,
+                    rename.target_kind,
+                    rename.target_hash,
+                )
+            )
+        snapshots: dict[Path, _MergeSnapshot] = {}
+        excluded = exclude or set()
+        for target, expected_exists, expected_kind, expected_hash in expected:
+            if target in excluded:
+                continue
             self._validate_merge_target(target)
-            before = target.read_bytes() if target.exists() else None
-            if sha256_bytes(before or b"") != expected_hash:
+            snapshot = self._merge_snapshot(target)
+            if (
+                snapshot.exists != expected_exists
+                or snapshot.kind != expected_kind
+                or sha256_bytes(snapshot.content) != expected_hash
+            ):
                 raise ValueError("merge target changed after planning")
-            snapshots[target] = before
+            snapshots[target] = snapshot
         return snapshots
+
+    def _assert_merge_inputs(self, plan, *, exclude: set[Path] | None = None) -> None:
+        self._preflight_merge(plan, exclude=exclude)
+
+    @staticmethod
+    def _merge_snapshot(target: Path) -> _MergeSnapshot:
+        if not target.exists():
+            return _MergeSnapshot(False, "missing", b"")
+        if not target.is_file():
+            kind = "directory" if target.is_dir() else "other"
+            return _MergeSnapshot(True, kind, b"")
+        return _MergeSnapshot(True, "file", target.read_bytes())
 
     def _validate_merge_target(self, target: Path) -> None:
         if self.vault_root is None:
@@ -332,29 +441,39 @@ class SyncService:
                 raise UnsafeVaultPathError("merge target contains a symlink")
 
     def _backup_snapshots(
-        self, backup_dir: Path, snapshots: dict[Path, bytes | None]
+        self, backup_dir: Path, snapshots: dict[Path, _MergeSnapshot]
     ) -> None:
         self._validate_backup_dir(backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
-        for target, before in snapshots.items():
-            if before is None:
+        for target, snapshot in snapshots.items():
+            if not snapshot.exists or snapshot.kind != "file":
                 continue
+            before = snapshot.content
             backup = self._backup_path(backup_dir, target)
             backup.parent.mkdir(parents=True, exist_ok=True)
             backup.write_bytes(before)
             if backup.read_bytes() != before:
                 raise OSError("merge backup readback failed")
 
-    def _restore_snapshots(self, snapshots: dict[Path, bytes | None]) -> str:
+    def _restore_snapshots(
+        self, snapshots: dict[Path, _MergeSnapshot], changed_paths: set[Path]
+    ) -> str:
         errors = []
-        for target, before in snapshots.items():
+        for target in changed_paths:
+            snapshot = snapshots[target]
             try:
-                if before is None:
+                if not snapshot.exists:
                     target.unlink(missing_ok=True)
+                elif snapshot.kind == "file":
+                    self._atomic_replace(target, snapshot.content)
                 else:
-                    self._atomic_replace(target, before)
-                restored = target.read_bytes() if target.exists() else b""
-                if sha256_bytes(restored) != sha256_bytes(before or b""):
+                    raise OSError("unsupported merge rollback kind")
+                restored = self._merge_snapshot(target)
+                if (
+                    restored.exists != snapshot.exists
+                    or restored.kind != snapshot.kind
+                    or sha256_bytes(restored.content) != sha256_bytes(snapshot.content)
+                ):
                     raise OSError("merge rollback readback failed")
             except OSError:
                 errors.append("rollback_failed")

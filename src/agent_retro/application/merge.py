@@ -7,6 +7,7 @@ import difflib
 import hashlib
 import json
 import sqlite3
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -48,6 +49,9 @@ class ConfirmationRequiredError(ValueError):
 @dataclass(frozen=True)
 class MergeTarget:
     path: Path
+    path_identity: str
+    input_exists: bool
+    input_kind: str
     input_hash: str
     output_bytes: bytes
     unified_diff: str
@@ -57,6 +61,9 @@ class MergeTarget:
 class MergeDelete:
     operation_id: str
     path: Path
+    path_identity: str
+    input_exists: bool
+    input_kind: str
     input_hash: str
 
 
@@ -65,6 +72,12 @@ class MergeRename:
     operation_id: str
     source: Path
     target: Path
+    source_identity: str
+    target_identity: str
+    source_exists: bool
+    source_kind: str
+    target_exists: bool
+    target_kind: str
     source_hash: str
     target_hash: str
 
@@ -139,31 +152,48 @@ class MergeService:
         conflicts: Sequence[str] = (),
     ) -> MergePlan:
         self._require_mapping(project_id)
-        targets = tuple(
-            MergeTarget(
-                path=relative,
-                input_hash=sha256_bytes(before),
-                output_bytes=bytes(output),
-                unified_diff=_unified_diff(relative, before, bytes(output)),
+        target_values = []
+        for relative, output in sorted(
+            (
+                (self._safe_relative(project_id, path), output)
+                for path, output in replacements.items()
+            ),
+            key=lambda item: item[0].as_posix(),
+        ):
+            exists, kind, before = self._read_state(relative)
+            if kind not in ("missing", "file"):
+                raise StalePlanError("merge_target_not_file")
+            target_values.append(
+                MergeTarget(
+                    path=relative,
+                    path_identity=_windows_path_identity(relative),
+                    input_exists=exists,
+                    input_kind=kind,
+                    input_hash=sha256_bytes(before),
+                    output_bytes=bytes(output),
+                    unified_diff=_unified_diff(relative, before, bytes(output)),
+                )
             )
-            for relative, output in sorted(
-                (
-                    (self._safe_relative(project_id, path), output)
-                    for path, output in replacements.items()
-                ),
-                key=lambda item: item[0].as_posix(),
-            )
-            for before in [self._read(relative)]
-        )
+        targets = tuple(target_values)
         delete_values = []
         for path in sorted(deletes, key=lambda item: item.as_posix()):
             relative = self._safe_relative(project_id, path)
-            before = self._read(relative)
-            if not (self.vault_root / relative).exists():
+            exists, kind, before = self._read_state(relative)
+            if not exists:
                 raise StalePlanError("merge_delete_source_missing")
-            identity = ["delete", relative.as_posix(), sha256_bytes(before)]
+            if kind != "file":
+                raise StalePlanError("merge_delete_source_not_file")
+            path_identity = _windows_path_identity(relative)
+            identity = ["delete", path_identity, exists, kind, sha256_bytes(before)]
             delete_values.append(
-                MergeDelete(_operation_id(identity), relative, sha256_bytes(before))
+                MergeDelete(
+                    _operation_id(identity),
+                    relative,
+                    path_identity,
+                    exists,
+                    kind,
+                    sha256_bytes(before),
+                )
             )
         rename_values = []
         for source, target in sorted(
@@ -171,15 +201,24 @@ class MergeService:
         ):
             source_relative = self._safe_relative(project_id, source)
             target_relative = self._safe_relative(project_id, target)
-            source_path = self.vault_root / source_relative
-            if not source_path.exists():
+            source_exists, source_kind, source_bytes = self._read_state(source_relative)
+            target_exists, target_kind, target_bytes = self._read_state(target_relative)
+            if not source_exists:
                 raise StalePlanError("merge_rename_source_missing")
-            source_hash = sha256_bytes(self._read(source_relative))
-            target_hash = sha256_bytes(self._read(target_relative))
+            if source_kind != "file" or target_kind not in ("missing", "file"):
+                raise StalePlanError("merge_rename_target_not_file")
+            source_hash = sha256_bytes(source_bytes)
+            target_hash = sha256_bytes(target_bytes)
+            source_identity = _windows_path_identity(source_relative)
+            target_identity = _windows_path_identity(target_relative)
             identity = [
                 "rename",
-                source_relative.as_posix(),
-                target_relative.as_posix(),
+                source_identity,
+                target_identity,
+                source_exists,
+                source_kind,
+                target_exists,
+                target_kind,
                 source_hash,
                 target_hash,
             ]
@@ -188,6 +227,12 @@ class MergeService:
                     _operation_id(identity),
                     source_relative,
                     target_relative,
+                    source_identity,
+                    target_identity,
+                    source_exists,
+                    source_kind,
+                    target_exists,
+                    target_kind,
                     source_hash,
                     target_hash,
                 )
@@ -264,7 +309,11 @@ class MergeService:
         if supplied - required:
             raise MergeIntegrityError("unknown_merge_operation_confirmation")
         try:
-            result = self.sync.apply_confirmed_merge(plan, plan_json=job.plan_json)
+            result = self.sync.apply_confirmed_merge(
+                plan.id,
+                confirmed_operations=tuple(sorted(supplied)),
+                actor="user",
+            )
         except ValueError as exc:
             if str(exc) == "merge_plan_stale":
                 raise StalePlanError("merge_plan_stale") from exc
@@ -444,27 +493,9 @@ class MergeService:
         if job is None:
             raise KeyError("merge_plan_not_found")
         try:
-            data = json.loads(job.plan_json)
-            plan = _plan_from_data(data)
+            plan = load_persisted_merge_plan(job, plan_id)
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise MergeIntegrityError("merge_plan_invalid") from exc
-        if plan.id != plan_id or job.project_id != plan.project_id:
-            raise MergeIntegrityError("merge_plan_identity_mismatch")
-        without_id = MergePlan(
-            "",
-            plan.project_id,
-            plan.authority_hash,
-            plan.targets,
-            plan.deletes,
-            plan.renames,
-            plan.conflicts,
-        )
-        expected = (
-            "merge-"
-            + hashlib.sha256(_plan_json(without_id).encode("utf-8")).hexdigest()[:24]
-        )
-        if expected != plan.id or _plan_json(plan) != job.plan_json:
-            raise MergeIntegrityError("merge_plan_integrity_mismatch")
         self._validate_unique_paths(plan)
         for path in _all_plan_paths(plan):
             self._safe_relative(plan.project_id, path)
@@ -494,6 +525,7 @@ class MergeService:
                 raise ValueError("merge_target_outside_vault") from exc
         if not path.parts or ".." in path.parts:
             raise ValueError("merge_target_outside_vault")
+        _windows_path_identity(path)
         if len(path.parts) >= 2 and path.parts[0] == "项目":
             if path.parts[1] not in (project_id, "项目索引.md"):
                 raise ValueError("merge_target_cross_project")
@@ -517,12 +549,20 @@ class MergeService:
         target = self.vault_root / relative
         return target.read_bytes() if target.exists() else b""
 
+    def _read_state(self, relative: Path) -> tuple[bool, str, bytes]:
+        target = self.vault_root / relative
+        if not target.exists():
+            return False, "missing", b""
+        if not target.is_file():
+            return True, "directory" if target.is_dir() else "other", b""
+        return True, "file", target.read_bytes()
+
     @staticmethod
     def _validate_unique_paths(plan: MergePlan) -> None:
-        paths = [target.path for target in plan.targets]
-        paths.extend(item.path for item in plan.deletes)
+        paths = [target.path_identity for target in plan.targets]
+        paths.extend(item.path_identity for item in plan.deletes)
         for item in plan.renames:
-            paths.extend((item.source, item.target))
+            paths.extend((item.source_identity, item.target_identity))
         if len(paths) != len(set(paths)):
             raise MergeIntegrityError("merge_plan_paths_overlap")
 
@@ -554,6 +594,31 @@ def _operation_id(identity: object) -> str:
     return (
         "merge-op-" + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
     )
+
+
+def _windows_path_identity(path: Path) -> str:
+    """Return the identity Windows would use, rejecting unsafe aliases."""
+
+    reserved = {"con", "prn", "aux", "nul"}
+    reserved.update(f"com{number}" for number in range(1, 10))
+    reserved.update(f"lpt{number}" for number in range(1, 10))
+    identities = []
+    for raw_part in Path(path).parts:
+        part = unicodedata.normalize("NFKC", raw_part)
+        folded = part.casefold()
+        stem = folded.split(".", 1)[0]
+        if (
+            not part
+            or part.endswith((".", " "))
+            or ":" in part
+            or any(character in part for character in '<>"|?*')
+            or stem in reserved
+        ):
+            raise ValueError("merge_target_windows_incompatible")
+        identities.append(folded)
+    if not identities:
+        raise ValueError("merge_target_windows_incompatible")
+    return "/".join(identities)
 
 
 def _reconciliation_id(
@@ -595,6 +660,9 @@ def _plan_json(plan: MergePlan) -> str:
             "targets": [
                 {
                     "path": item.path.as_posix(),
+                    "path_identity": item.path_identity,
+                    "input_exists": item.input_exists,
+                    "input_kind": item.input_kind,
                     "input_hash": item.input_hash,
                     "output_base64": _b64(item.output_bytes),
                     "unified_diff": item.unified_diff,
@@ -605,6 +673,9 @@ def _plan_json(plan: MergePlan) -> str:
                 {
                     "operation_id": item.operation_id,
                     "path": item.path.as_posix(),
+                    "path_identity": item.path_identity,
+                    "input_exists": item.input_exists,
+                    "input_kind": item.input_kind,
                     "input_hash": item.input_hash,
                 }
                 for item in plan.deletes
@@ -614,6 +685,12 @@ def _plan_json(plan: MergePlan) -> str:
                     "operation_id": item.operation_id,
                     "source": item.source.as_posix(),
                     "target": item.target.as_posix(),
+                    "source_identity": item.source_identity,
+                    "target_identity": item.target_identity,
+                    "source_exists": item.source_exists,
+                    "source_kind": item.source_kind,
+                    "target_exists": item.target_exists,
+                    "target_kind": item.target_kind,
                     "source_hash": item.source_hash,
                     "target_hash": item.target_hash,
                 }
@@ -640,6 +717,9 @@ def _plan_from_data(data: object) -> MergePlan:
         targets=tuple(
             MergeTarget(
                 Path(item["path"]),
+                str(item["path_identity"]),
+                bool(item["input_exists"]),
+                str(item["input_kind"]),
                 str(item["input_hash"]),
                 _unb64(item["output_base64"]),
                 str(item["unified_diff"]),
@@ -650,6 +730,9 @@ def _plan_from_data(data: object) -> MergePlan:
             MergeDelete(
                 str(item["operation_id"]),
                 Path(item["path"]),
+                str(item["path_identity"]),
+                bool(item["input_exists"]),
+                str(item["input_kind"]),
                 str(item["input_hash"]),
             )
             for item in data["deletes"]
@@ -659,6 +742,12 @@ def _plan_from_data(data: object) -> MergePlan:
                 str(item["operation_id"]),
                 Path(item["source"]),
                 Path(item["target"]),
+                str(item["source_identity"]),
+                str(item["target_identity"]),
+                bool(item["source_exists"]),
+                str(item["source_kind"]),
+                bool(item["target_exists"]),
+                str(item["target_kind"]),
                 str(item["source_hash"]),
                 str(item["target_hash"]),
             )
@@ -669,6 +758,79 @@ def _plan_from_data(data: object) -> MergePlan:
             for item in data["conflicts"]
         ),
     )
+
+
+def required_merge_operation_ids(plan: MergePlan) -> frozenset[str]:
+    return frozenset(
+        item.operation_id for item in (*plan.deletes, *plan.renames, *plan.conflicts)
+    )
+
+
+def load_persisted_merge_plan(job: SyncJob, plan_id: str) -> MergePlan:
+    """Reload and fully authenticate the canonical plan stored in SQLite."""
+
+    data = json.loads(job.plan_json)
+    plan = _plan_from_data(data)
+    if plan.id != plan_id or job.id != plan_id or job.project_id != plan.project_id:
+        raise MergeIntegrityError("merge_plan_identity_mismatch")
+    without_id = MergePlan(
+        "",
+        plan.project_id,
+        plan.authority_hash,
+        plan.targets,
+        plan.deletes,
+        plan.renames,
+        plan.conflicts,
+    )
+    expected = (
+        "merge-"
+        + hashlib.sha256(_plan_json(without_id).encode("utf-8")).hexdigest()[:24]
+    )
+    if expected != plan.id or _plan_json(plan) != job.plan_json:
+        raise MergeIntegrityError("merge_plan_integrity_mismatch")
+    for target in plan.targets:
+        if target.path_identity != _windows_path_identity(target.path):
+            raise MergeIntegrityError("merge_plan_path_identity_mismatch")
+    for item in plan.deletes:
+        identity = [
+            "delete",
+            item.path_identity,
+            item.input_exists,
+            item.input_kind,
+            item.input_hash,
+        ]
+        if item.path_identity != _windows_path_identity(
+            item.path
+        ) or item.operation_id != _operation_id(identity):
+            raise MergeIntegrityError("merge_operation_identity_mismatch")
+    for item in plan.renames:
+        identity = [
+            "rename",
+            item.source_identity,
+            item.target_identity,
+            item.source_exists,
+            item.source_kind,
+            item.target_exists,
+            item.target_kind,
+            item.source_hash,
+            item.target_hash,
+        ]
+        if (
+            item.source_identity != _windows_path_identity(item.source)
+            or item.target_identity != _windows_path_identity(item.target)
+            or item.operation_id != _operation_id(identity)
+        ):
+            raise MergeIntegrityError("merge_operation_identity_mismatch")
+    for item in plan.conflicts:
+        if item.operation_id != _operation_id(["conflict", item.description]):
+            raise MergeIntegrityError("merge_operation_identity_mismatch")
+    identities = [target.path_identity for target in plan.targets]
+    identities.extend(item.path_identity for item in plan.deletes)
+    for item in plan.renames:
+        identities.extend((item.source_identity, item.target_identity))
+    if len(identities) != len(set(identities)):
+        raise MergeIntegrityError("merge_plan_paths_overlap")
+    return plan
 
 
 def _json(value: object) -> str:

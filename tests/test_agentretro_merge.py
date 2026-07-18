@@ -375,6 +375,31 @@ def test_general_apply_does_not_authorize_destructive_operations(
     assert delete.read_text(encoding="utf-8") == "old"
 
 
+def test_direct_merge_executor_requires_exact_persisted_confirmations(
+    tmp_path: Path,
+) -> None:
+    _, service, vault = _service(tmp_path)
+    delete = vault / "old.md"
+    delete.write_text("old", encoding="utf-8")
+    plan = service.create_plan("NPKI", replacements={}, deletes=(Path("old.md"),))
+    operation_id = plan.deletes[0].operation_id
+
+    with pytest.raises(ValueError, match="merge_operation_confirmation_required"):
+        service.sync.apply_confirmed_merge(plan.id, confirmed_operations=())
+    with pytest.raises(ValueError, match="unknown_merge_operation_confirmation"):
+        service.sync.apply_confirmed_merge(
+            plan.id,
+            confirmed_operations=(operation_id, "merge-op-forged"),
+        )
+
+    assert delete.read_text(encoding="utf-8") == "old"
+    result = service.sync.apply_confirmed_merge(
+        plan.id, confirmed_operations=(operation_id,)
+    )
+    assert result.status.value == "synced"
+    assert not delete.exists()
+
+
 def test_exact_confirmations_apply_delete_rename_and_acknowledged_conflict(
     tmp_path: Path,
 ) -> None:
@@ -451,6 +476,119 @@ def test_missing_target_and_rename_destination_drift_are_stale(
 
     assert source.exists()
     assert destination.read_text(encoding="utf-8") == "new user file"
+
+
+def test_missing_target_becoming_empty_file_is_stale(tmp_path: Path) -> None:
+    _, service, vault = _service(tmp_path)
+    target = vault / "new.md"
+    plan = service.create_plan("NPKI", replacements={Path("new.md"): b"planned"})
+    target.write_bytes(b"")
+
+    with pytest.raises(StalePlanError):
+        service.apply(plan.id, confirmed=True)
+
+    assert target.read_bytes() == b""
+
+
+def test_file_type_change_is_stale(tmp_path: Path) -> None:
+    _, service, vault = _service(tmp_path)
+    target = vault / "guide.md"
+    target.write_text("before", encoding="utf-8")
+    plan = service.create_plan("NPKI", replacements={Path("guide.md"): b"after"})
+    target.unlink()
+    target.mkdir()
+
+    with pytest.raises(StalePlanError):
+        service.apply(plan.id, confirmed=True)
+
+    assert target.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (Path("foo"), Path("foo.")),
+        (Path("A.md"), Path("a.md")),
+        (
+            Path("caf\N{LATIN SMALL LETTER E WITH ACUTE}.md"),
+            Path("cafe\N{COMBINING ACUTE ACCENT}.md"),
+        ),
+    ],
+)
+def test_windows_compatible_path_aliases_are_rejected(
+    tmp_path: Path, first: Path, second: Path
+) -> None:
+    _, service, vault = _service(tmp_path)
+    (vault / first).write_bytes(b"one")
+
+    with pytest.raises((MergeIntegrityError, ValueError)):
+        service.create_plan("NPKI", replacements={second: b"two"}, deletes=(first,))
+
+    assert (vault / first).read_bytes() == b"one"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [Path("CON.md"), Path("note.md:stream"), Path("trailing "), Path("LPT1")],
+)
+def test_windows_invalid_merge_paths_are_rejected(tmp_path: Path, path: Path) -> None:
+    _, service, vault = _service(tmp_path)
+
+    with pytest.raises(ValueError, match="merge_target_windows_incompatible"):
+        service.create_plan("NPKI", replacements={path: b"bad"})
+
+    assert not (vault / path).exists()
+
+
+def test_drift_after_backup_is_stale_before_journal_or_vault_write(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    target = vault / "guide.md"
+    target.write_text("before", encoding="utf-8")
+    plan = service.create_plan("NPKI", replacements={Path("guide.md"): b"after"})
+    original_backup = service.sync._backup_snapshots
+
+    def backup_then_edit(backup_dir, snapshots) -> None:
+        original_backup(backup_dir, snapshots)
+        target.write_text("external", encoding="utf-8")
+
+    monkeypatch.setattr(service.sync, "_backup_snapshots", backup_then_edit)
+
+    with pytest.raises(StalePlanError):
+        service.apply(plan.id, confirmed=True)
+
+    assert target.read_text(encoding="utf-8") == "external"
+    assert repository.get_sync_job(plan.id).status == "planned"
+
+
+def test_later_target_drift_rolls_back_only_batch_changed_paths(tmp_path: Path) -> None:
+    calls = 0
+    second: Path
+
+    def edit_second_after_first(source: Path, target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        os.replace(source, target)
+        if calls == 1:
+            second.write_text("external-second", encoding="utf-8")
+
+    _, service, vault = _service(tmp_path, replace=edit_second_after_first)
+    first = vault / "one.md"
+    second = vault / "two.md"
+    first.write_text("one-before", encoding="utf-8")
+    second.write_text("two-before", encoding="utf-8")
+    plan = service.create_plan(
+        "NPKI",
+        replacements={Path("one.md"): b"one-after", Path("two.md"): b"two-after"},
+    )
+
+    result = service.apply(plan.id, confirmed=True)
+
+    assert result.status == "sync_pending"
+    assert result.reason == "merge_plan_stale"
+    assert first.read_text(encoding="utf-8") == "one-before"
+    assert second.read_text(encoding="utf-8") == "external-second"
 
 
 def test_plan_tampering_fails_closed_before_vault_write(tmp_path: Path) -> None:
