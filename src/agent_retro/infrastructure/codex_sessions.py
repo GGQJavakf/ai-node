@@ -335,8 +335,11 @@ class CodexSessionSource:
         self._check_deadline(deadline)
         try:
             with candidate.path.open("r", encoding="utf-8") as stream:
-                for line in stream:
-                    self._check_deadline(deadline)
+                self._check_deadline(deadline)
+                while True:
+                    line = self._readline_with_deadline(stream, deadline)
+                    if line == "":
+                        break
                     if not line.strip():
                         continue
                     value = json.loads(line)
@@ -348,6 +351,12 @@ class CodexSessionSource:
         except (OSError, UnicodeError, json.JSONDecodeError):
             return None
         return None
+
+    def _readline_with_deadline(self, stream, deadline: float):
+        self._check_deadline(deadline)
+        line = stream.readline()
+        self._check_deadline(deadline)
+        return line
 
     def _check_size(self, candidate: _SessionCandidate) -> None:
         if candidate.size > self.max_session_bytes:
@@ -373,8 +382,13 @@ class CodexSessionSource:
         saw_meta = False
         try:
             with path.open("rb") as stream:
-                for line_number, raw_line in enumerate(stream, start=1):
-                    self._check_deadline(deadline)
+                self._check_deadline(deadline)
+                line_number = 0
+                while True:
+                    raw_line = self._readline_with_deadline(stream, deadline)
+                    if raw_line == b"":
+                        break
+                    line_number += 1
                     digest.update(raw_line)
                     if not raw_line.strip():
                         continue
@@ -439,15 +453,20 @@ class CodexSessionSource:
         if completion_state is None:
             completion_state = False
         if completed_at is None:
-            completed_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+            self._check_deadline(deadline)
+            stat = path.stat()
+            self._check_deadline(deadline)
+            completed_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
         source_hash = digest.hexdigest()
         internal_id = "session-" + hashlib.sha256(
             f"{session_id}:{source_hash}".encode("utf-8")
         ).hexdigest()[:24]
+        source_path = path.resolve()
+        self._check_deadline(deadline)
         return NormalizedSession(
             id=internal_id,
             source_session_id=session_id,
-            source_path=path.resolve(),
+            source_path=source_path,
             source_hash=source_hash,
             project_id=project_id,
             completed=completion_state,

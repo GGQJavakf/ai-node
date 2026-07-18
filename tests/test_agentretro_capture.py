@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import inspect
 import os
@@ -160,6 +161,46 @@ def _track_jsonl_io(monkeypatch):
     monkeypatch.setattr(Path, "stat", tracked_stat)
     monkeypatch.setattr(Path, "open", tracked_open)
     return stated, opened
+
+
+class _ControlledClock:
+    now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def expire(self):
+        self.now = 11.0
+
+
+class _ExpireAtEof:
+    def __init__(self, stream, clock: _ControlledClock | None):
+        self._stream = stream
+        self._clock = clock
+
+    def __enter__(self):
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._stream.__exit__(*args)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._stream)
+        except StopIteration:
+            if self._clock is not None:
+                self._clock.expire()
+            raise
+
+    def readline(self):
+        value = self._stream.readline()
+        if not value and self._clock is not None:
+            self._clock.expire()
+        return value
 
 
 def _ignore_review(session_id, project_id, evidence):
@@ -417,6 +458,102 @@ def test_partial_namespace_enumeration_timeout_never_stats_or_opens_candidates(
     assert opened_jsonl == []
     assert source.last_discovery.inspected_count == 0
     assert source.last_discovery.diagnostics == ("会话发现超过配置时限",)
+
+
+def test_parse_timeout_after_final_line_eof_is_fail_closed(
+    fixtures_dir, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    session_path = _copy_fixture(fixtures_dir, codex_home, "completed")
+    clock = _ControlledClock()
+    real_open = Path.open
+
+    def expire_at_eof(path, *args, **kwargs):
+        stream = real_open(path, *args, **kwargs)
+        if path == session_path and "b" in kwargs.get("mode", args[0] if args else "r"):
+            return _ExpireAtEof(stream, clock)
+        return stream
+
+    monkeypatch.setattr(Path, "open", expire_at_eof)
+    source = CodexSessionSource(
+        codex_home, discovery_timeout_seconds=10.0, monotonic=clock
+    )
+
+    with pytest.raises(SessionDiscoveryTimeout, match="配置时限"):
+        source.latest_completed()
+
+    assert source.last_discovery.diagnostics[-1] == "会话发现超过配置时限"
+
+
+def test_missing_timestamp_fallback_stat_timeout_is_fail_closed(
+    fixtures_dir, tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    session_path = _copy_fixture(fixtures_dir, codex_home, "completed")
+    records = [
+        {key: value for key, value in json.loads(line).items() if key != "timestamp"}
+        for line in session_path.read_text(encoding="utf-8").splitlines()
+    ]
+    session_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    clock = _ControlledClock()
+    real_stat = Path.stat
+    session_stats = 0
+
+    def expire_during_fallback_stat(path, *args, **kwargs):
+        nonlocal session_stats
+        result = real_stat(path, *args, **kwargs)
+        if path == session_path:
+            session_stats += 1
+            if session_stats == 2:
+                clock.expire()
+        return result
+
+    monkeypatch.setattr(Path, "stat", expire_during_fallback_stat)
+    source = CodexSessionSource(
+        codex_home, discovery_timeout_seconds=10.0, monotonic=clock
+    )
+
+    with pytest.raises(SessionDiscoveryTimeout, match="配置时限"):
+        source.latest_completed()
+
+    assert session_stats == 2
+
+
+@pytest.mark.parametrize("expiry_phase", ["open", "eof"])
+def test_empty_peek_timeout_after_open_or_eof_is_not_not_found(
+    tmp_path, monkeypatch, expiry_phase
+):
+    codex_home = tmp_path / "codex"
+    session_path = _standard_session_path(
+        codex_home,
+        "empty",
+        timestamp="2026-07-18T12-00-00",
+    )
+    session_path.parent.mkdir(parents=True)
+    session_path.write_text("", encoding="utf-8")
+    clock = _ControlledClock()
+    real_open = Path.open
+
+    def controlled_empty_open(path, *args, **kwargs):
+        if path != session_path:
+            return real_open(path, *args, **kwargs)
+        if expiry_phase == "open":
+            clock.expire()
+        eof_clock = clock if expiry_phase == "eof" else None
+        return _ExpireAtEof(io.StringIO(""), eof_clock)
+
+    monkeypatch.setattr(Path, "open", controlled_empty_open)
+    source = CodexSessionSource(
+        codex_home, discovery_timeout_seconds=10.0, monotonic=clock
+    )
+
+    with pytest.raises(SessionDiscoveryTimeout, match="配置时限"):
+        source.load("session-empty")
+
+    assert source.last_discovery.diagnostics[-1] == "会话发现超过配置时限"
 
 
 def test_deadline_interrupts_directory_enumeration(
