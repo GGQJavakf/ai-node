@@ -221,7 +221,7 @@ class ReviewService:
         existing = self.repository.candidates_for_session(session_id)
         pending = self.repository.pending_model_candidates_for_session(session_id)
         if pending:
-            return [self.retry_candidate(item.id) for item in pending]
+            return self._review_candidates(pending)
         if existing:
             return [self.repository.get_review_result(item.id) for item in existing]
         evidence = self.repository.list_evidence(session.id)
@@ -241,7 +241,7 @@ class ReviewService:
             if pending
             else self._extract_candidates(session_id, project_id, evidence)
         )
-        results = [self.retry_candidate(item.id) for item in candidates]
+        results = self._review_candidates(candidates)
         if any(result is None for result in results):
             raise ReviewUnavailableError(
                 "model review failed; retry is available for stored candidates",
@@ -250,6 +250,17 @@ class ReviewService:
         return [result for result in results if result is not None]
 
     def retry_candidate(self, candidate_id: str) -> ReviewResult | None:
+        try:
+            return self._retry_candidate(candidate_id)
+        except ReviewUnavailableError:
+            raise
+        except Exception as exc:
+            raise ReviewUnavailableError(
+                f"model review failed; retry is available ({safe_error(exc)})",
+                candidate_ids=(candidate_id,),
+            ) from exc
+
+    def _retry_candidate(self, candidate_id: str) -> ReviewResult | None:
         candidate = self.repository.get_candidate(candidate_id)
         if candidate is None:
             raise KeyError(f"candidate not found: {candidate_id}")
@@ -295,12 +306,9 @@ class ReviewService:
         return result
 
     def retry_session(self, session_id: str) -> list[ReviewResult | None]:
-        return [
-            self.retry_candidate(candidate.id)
-            for candidate in self.repository.pending_model_candidates_for_session(
-                session_id
-            )
-        ]
+        return self._review_candidates(
+            self.repository.pending_model_candidates_for_session(session_id)
+        )
 
     def _extract_then_review(
         self,
@@ -309,7 +317,29 @@ class ReviewService:
         evidence: Sequence[Evidence],
     ) -> list[ReviewResult | None]:
         candidates = self._extract_candidates(session_id, project_id, evidence)
-        return [self.retry_candidate(candidate.id) for candidate in candidates]
+        return self._review_candidates(candidates)
+
+    def _review_candidates(
+        self, candidates: Sequence[Candidate]
+    ) -> list[ReviewResult | None]:
+        candidate_ids = tuple(candidate.id for candidate in candidates)
+        try:
+            return [
+                self.retry_candidate(candidate_id) for candidate_id in candidate_ids
+            ]
+        except ReviewUnavailableError as exc:
+            if exc.candidate_ids == candidate_ids:
+                raise
+            cause = exc.__cause__ or exc
+            raise ReviewUnavailableError(
+                f"model review failed; retry is available ({safe_error(cause)})",
+                candidate_ids=candidate_ids,
+            ) from cause
+        except Exception as exc:
+            raise ReviewUnavailableError(
+                f"model review failed; retry is available ({safe_error(exc)})",
+                candidate_ids=candidate_ids,
+            ) from exc
 
     def _extract_candidates(
         self,
@@ -330,7 +360,13 @@ class ReviewService:
             self._candidate_from_extraction(session_id, project_id, item, evidence)
             for item in extracted
         )
-        self.repository.save_candidates(candidates)
+        try:
+            self.repository.save_candidates(candidates)
+        except Exception as exc:
+            raise ReviewUnavailableError(
+                f"candidate persistence failed; retry is available ({safe_error(exc)})",
+                candidate_ids=tuple(candidate.id for candidate in candidates),
+            ) from exc
         return candidates
 
     def _candidate_from_extraction(

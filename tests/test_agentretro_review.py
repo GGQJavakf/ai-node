@@ -1111,6 +1111,96 @@ def test_reclassify_rolls_back_candidates_created_only_in_failed_second_phase(
     assert len(reviewer.calls) == 5
 
 
+def test_reclassify_wraps_finish_failure_with_new_second_phase_candidate_ids(
+    tmp_path, monkeypatch
+):
+    awaiting = "awaiting:unknown"
+    repository, evidence = _repository_with_evidence(tmp_path, project_id=awaiting)
+    mapping = _save_review_mapping(repository)
+
+    class PhasedExtractor:
+        def __init__(self):
+            self.calls = 0
+
+        def extract(self, input_json: str, *, timeout: int):
+            self.calls += 1
+            return () if self.calls == 1 else (_extracted(),)
+
+    reviewer = _SequenceReviewer([_review(), _review()])
+    service = _service(repository, PhasedExtractor(), reviewer)
+    original_finish = repository.finish_review_attempt
+    injected = False
+
+    def finish_then_fail(attempt_id, status, result_json="", error=""):
+        nonlocal injected
+        original_finish(attempt_id, status, result_json, error)
+        if status == "completed" and not injected:
+            injected = True
+            raise RuntimeError("api_key=must-not-leak")
+
+    monkeypatch.setattr(repository, "finish_review_attempt", finish_then_fail)
+    mapping_service = ProjectMappingService(
+        repository,
+        vault_root=tmp_path / "vault",
+        review_stored_evidence=service.review_stored_evidence,
+    )
+
+    caught = None
+    try:
+        mapping_service.reclassify("source-session-1", mapping.id)
+    except Exception as exc:  # asserted below after checking compensated state
+        caught = exc
+
+    session = repository.find_session_by_source_id("source-session-1")
+    candidates = repository.candidates_for_session("source-session-1")
+    assert session is not None and session.project_id == awaiting
+    assert len(candidates) == 1
+    assert candidates[0].project_id == awaiting
+    assert candidates[0].status is CandidateStatus.PENDING_REVIEW
+    assert repository.knowledge_for_candidate(candidates[0].id) is None
+    assert len(repository.review_attempts_for_candidate(candidates[0].id)) == 1
+    assert isinstance(caught, ReviewUnavailableError)
+    assert caught.candidate_ids == (candidates[0].id,)
+    assert isinstance(caught.__cause__, RuntimeError)
+    assert "must-not-leak" not in str(caught)
+
+    mapping_service.reclassify("source-session-1", mapping.id)
+
+    converged = repository.get_candidate(candidates[0].id)
+    assert converged is not None
+    assert converged.project_id == "project-1"
+    assert converged.status is CandidateStatus.AUTO_ACCEPTED
+    assert repository.knowledge_for_candidate(converged.id) is not None
+    assert evidence
+
+
+def test_pending_review_wraps_finish_failure_with_exact_candidate_ids(
+    tmp_path, monkeypatch
+):
+    repository, evidence = _repository_with_evidence(
+        tmp_path, project_id="awaiting:unknown"
+    )
+    pending = _candidate(project_id="awaiting:unknown")
+    repository.save_candidates([pending])
+    service = _service(repository, _Extractor(()), _Reviewer(_review()))
+    original_finish = repository.finish_review_attempt
+
+    def finish_then_fail(attempt_id, status, result_json="", error=""):
+        original_finish(attempt_id, status, result_json, error)
+        raise RuntimeError("Authorization: Bearer must-not-leak")
+
+    monkeypatch.setattr(repository, "finish_review_attempt", finish_then_fail)
+
+    with pytest.raises(ReviewUnavailableError) as raised:
+        service.review_stored_evidence(
+            "source-session-1", "awaiting:unknown", (evidence,)
+        )
+
+    assert raised.value.candidate_ids == (pending.id,)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert "must-not-leak" not in str(raised.value)
+
+
 def test_retry_session_only_calls_model_for_pending_model_dependent_candidates(
     tmp_path,
 ):

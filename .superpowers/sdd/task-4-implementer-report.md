@@ -32,6 +32,14 @@ Status: complete for the explicitly scoped milestone; Task 4 as a whole remains 
 - No OpenSpec task was marked complete because `2.8` and `3.1` through `3.9` require the remaining milestones.
 - No purge, Obsidian, briefing, global `AGENTS.md`, memory, external write, or `.playbook/` change was made.
 
+## Task 4 follow-up: post-candidate exception context
+
+- Added real `ReviewService` plus temporary SQLite RED coverage for both candidate paths: phase-one extraction returns zero and phase two fails after a newly saved candidate's review attempt is completed; a preexisting pending candidate fails at the same persistence boundary.
+- Once a candidate batch is known, pending retry and extract-then-review now wrap every subsequent exception in `ReviewUnavailableError` with that exact batch's candidate IDs. Candidate persistence failures after IDs are deterministically known use the same boundary; extraction failures before candidates exist retain empty IDs.
+- Wrapping preserves the original exception as `__cause__` while the outer message contains only the stable `safe_error` code. Secret-like injected exception text is neither exposed by the outer exception nor persisted as diagnostics.
+- The exact IDs feed typed reclassification rollback, so target candidates return to awaiting/pending, attempts/audits remain, and a later reclassification converges through canonical hash reuse/retry without selecting unrelated candidates.
+- RED: `2 failed`. GREEN: new target `2 passed`; all reclassification tests `5 passed`; focused `133 passed`; full `343 passed`; scoped Ruff format/check, OpenSpec strict validation, and diff check passed.
+
 ## Task 4 follow-up: second-phase candidate compensation
 
 - A real `ReviewService` plus temporary SQLite regression covers awaiting extraction returning no candidates, target extraction creating two candidates, the first accepting and the second failing review.
