@@ -35,6 +35,8 @@ from agent_retro.domain.models import (
     ProjectionEvent,
     ProjectionStatus,
     PurgePlan,
+    PurgeCopy,
+    PurgeInspection,
     PurgeStatus,
     ReviewAttempt,
     ReviewResult,
@@ -2610,6 +2612,81 @@ class SQLiteRetroRepository(RetroRepository):
                 )
                 for row in rows
             ]
+        finally:
+            connection.close()
+
+    def inspect_purge_database(self, knowledge_id: str) -> PurgeInspection:
+        """Inspect only registered SQLite fields without mutating purge state."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """SELECT item.* FROM knowledge AS item
+                JOIN (
+                    SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
+                ) AS latest ON latest.id = item.id AND latest.version = item.version
+                WHERE item.id = ?""",
+                (knowledge_id,),
+            ).fetchone()
+            knowledge = (
+                None if row is None else self._knowledge_from_row(connection, row)
+            )
+            purged = connection.execute(
+                "SELECT 1 FROM purge_jobs WHERE knowledge_id = ? AND status = ? LIMIT 1",
+                (knowledge_id, PurgeStatus.PURGED.value),
+            ).fetchone()
+            sync_pending = connection.execute(
+                """SELECT 1 FROM projection_events
+                WHERE cause_entity_id = ? AND status = ? LIMIT 1""",
+                (knowledge_id, ProjectionStatus.SYNC_PENDING.value),
+            ).fetchone()
+            if knowledge is None:
+                return PurgeInspection(
+                    None, purged is not None, sync_pending is not None, ()
+                )
+
+            marker = knowledge.text.encode("utf-8")
+            copies: list[PurgeCopy] = []
+            fields = (
+                ("sqlite_knowledge", "knowledge", "id || ':' || version", "text"),
+                ("sqlite_candidate", "candidates", "id", "proposed_text"),
+                ("sqlite_candidate", "candidates", "id", "review_json"),
+                ("sqlite_evidence", "evidence", "id", "excerpt"),
+                ("sqlite_review", "review_attempts", "id", "result_json"),
+                ("sqlite_review", "review_attempts", "id", "error"),
+                ("sqlite_conflict", "conflicts", "id", "reason"),
+                ("sqlite_conflict", "conflicts", "id", "merge_text"),
+                ("sqlite_projection", "sync_jobs", "id", "plan_json"),
+                ("sqlite_projection", "sync_jobs", "id", "error"),
+                ("sqlite_projection", "managed_file_snapshots", "path", "owned_bytes"),
+                ("sqlite_audit", "audit_log", "id", "detail_json"),
+            )
+            for kind, table, key_expression, column in fields:
+                rows = connection.execute(
+                    f"SELECT {key_expression} AS record_key, {column} AS content FROM {table} ORDER BY record_key"
+                ).fetchall()
+                for stored in rows:
+                    value = stored["content"]
+                    content = (
+                        bytes(value)
+                        if isinstance(value, bytes)
+                        else str(value).encode("utf-8")
+                    )
+                    if marker in content:
+                        copies.append(
+                            PurgeCopy(
+                                kind,
+                                f"{table}:{stored['record_key']}:{column}",
+                                content,
+                            )
+                        )
+            copies.sort(key=lambda item: (item.location_kind, item.locator))
+            return PurgeInspection(
+                knowledge,
+                purged is not None,
+                sync_pending is not None,
+                tuple(copies),
+            )
         finally:
             connection.close()
 

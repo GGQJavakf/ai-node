@@ -25,6 +25,7 @@ from agent_retro.domain.models import (
     ManagedFileUpdate,
     Reclassification,
     PurgePlan,
+    PurgeInspection,
     PurgeStatus,
     ReviewAttempt,
     ReviewResult,
@@ -258,6 +259,8 @@ class RetroRepository(Protocol):
     def get_managed_file_snapshot(self, path: Path) -> ManagedFileSnapshot | None: ...
 
     def list_managed_file_states(self, project_id: str) -> list[ManagedFileState]: ...
+
+    def inspect_purge_database(self, knowledge_id: str) -> PurgeInspection: ...
 
     def save_purge_plan(self, plan: PurgePlan, plan_hash: str, actor: str) -> None: ...
 

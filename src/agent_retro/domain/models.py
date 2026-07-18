@@ -275,6 +275,25 @@ class PurgePlan:
 
 
 @dataclass(frozen=True)
+class PurgeCopy:
+    """One ephemeral AgentRetro-owned SQLite copy considered by purge planning."""
+
+    location_kind: str
+    locator: str
+    content: bytes
+
+
+@dataclass(frozen=True)
+class PurgeInspection:
+    """Read-only database facts used to construct a purge manifest."""
+
+    knowledge: Knowledge | None
+    already_purged: bool
+    sync_pending: bool
+    copies: tuple[PurgeCopy, ...]
+
+
+@dataclass(frozen=True)
 class AuditEntry:
     id: str
     actor: str
