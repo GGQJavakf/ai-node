@@ -518,6 +518,130 @@ def test_model_composition_fails_stably_before_client_build_when_model_is_missin
         retro_cli._build_review_service(settings, repository)
 
 
+def test_merge_planner_composition_reuses_model_client_and_bounded_settings(
+    tmp_path, monkeypatch
+):
+    state_home = tmp_path / "state"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _seed_repository(state_home)
+    settings = load_retro_settings(
+        home=tmp_path,
+        env={
+            "AGENTRETRO_HOME": str(state_home),
+            "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+        },
+    )
+    client = object()
+    legacy = {"model": "test-model", "request_timeout": 37}
+    built = []
+    monkeypatch.setattr(
+        retro_cli,
+        "load_legacy_model_config",
+        lambda: legacy,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retro_cli,
+        "build_retro_llm_client_from_config",
+        lambda config: built.append(dict(config)) or client,
+        raising=False,
+    )
+
+    planner = retro_cli._build_merge_planner(settings, repository)
+
+    assert built == [legacy]
+    assert planner.gateway.client is client
+    assert planner.gateway.model == "test-model"
+    assert planner.timeout_seconds == 37
+    assert planner.max_files == 200
+    assert planner.max_bytes == 4 * 1024 * 1024
+
+
+def test_merge_planner_composition_fails_before_client_when_model_is_missing(
+    tmp_path, monkeypatch
+):
+    state_home = tmp_path / "state"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _seed_repository(state_home)
+    settings = load_retro_settings(
+        home=tmp_path,
+        env={
+            "AGENTRETRO_HOME": str(state_home),
+            "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+        },
+    )
+    monkeypatch.setattr(
+        retro_cli,
+        "load_legacy_model_config",
+        lambda: {"model": "", "request_timeout": 37},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retro_cli,
+        "build_retro_llm_client_from_config",
+        lambda config: pytest.fail("client must not build without a model"),
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="merge_proposal_unavailable"):
+        retro_cli._build_merge_planner(settings, repository)
+
+
+def test_cli_merge_plan_model_unavailable_is_stable_and_writes_no_plan(
+    tmp_path, capsys, monkeypatch
+):
+    state_home = tmp_path / "state"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = _seed_repository(state_home)
+    monkeypatch.setattr(
+        retro_cli,
+        "load_legacy_model_config",
+        lambda: {"model": "", "request_timeout": 37},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        retro_cli,
+        "build_retro_llm_client_from_config",
+        lambda config: pytest.fail("client must not build without a model"),
+        raising=False,
+    )
+
+    result = retro_cli.main(
+        [
+            "--json",
+            "merge",
+            "plan",
+            "--project",
+            "project-1",
+            "--instruction",
+            "organize",
+        ],
+        home=tmp_path,
+        env={
+            "AGENTRETRO_HOME": str(state_home),
+            "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+        },
+    )
+
+    assert result == 2
+    assert _json_output(capsys) == {
+        "status": "error",
+        "code": "RETRO_MERGE_MODEL_UNAVAILABLE",
+        "message": "Semantic merge model is unavailable.",
+        "data": {"retryable": True},
+    }
+    with repository._connect() as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
 class _UnavailableReviewService:
     def retry_candidate(self, candidate_id):
         return None

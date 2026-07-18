@@ -31,6 +31,7 @@ from agent_retro.infrastructure.obsidian import (
     replace_managed_block_bytes,
     sha256_bytes,
 )
+from agent_retro.infrastructure.redaction import Redactor
 
 
 class MergeIntegrityError(ValueError):
@@ -52,6 +53,10 @@ class ConfirmationRequiredError(ValueError):
             else "merge_operation_confirmation_required"
         )
         super().__init__(reason)
+
+
+class SensitiveMergeContentError(ValueError):
+    """A merge plan would persist or expose a credential-shaped value."""
 
 
 @dataclass(frozen=True)
@@ -159,6 +164,9 @@ class MergeService:
         renames: Sequence[tuple[Path, Path]] = (),
         conflicts: Sequence[str] = (),
     ) -> MergePlan:
+        self._validate_sensitive_plan_inputs(
+            project_id, replacements, deletes, renames, conflicts
+        )
         self._require_mapping(project_id)
         target_values = []
         for relative, output in sorted(
@@ -408,6 +416,41 @@ class MergeService:
                 )
                 continue
             database_bytes = snapshot.owned_bytes
+            try:
+                database_text = database_bytes.decode("utf-8", errors="strict")
+                vault_owned_text = vault_owned_bytes.decode("utf-8", errors="strict")
+            except UnicodeDecodeError:
+                conflicts.append(
+                    ReconciliationConflict(
+                        _diagnostic_id(
+                            project_id, relative, "managed_snapshot_invalid"
+                        ),
+                        project_id,
+                        relative,
+                        state.managed_hash,
+                        current_managed_hash,
+                        "managed_snapshot_invalid",
+                    )
+                )
+                continue
+            redactor = Redactor()
+            if redactor.contains_sensitive_value(database_text):
+                conflicts.append(
+                    ReconciliationConflict(
+                        _diagnostic_id(
+                            project_id, relative, "managed_snapshot_sensitive"
+                        ),
+                        project_id,
+                        relative,
+                        state.managed_hash,
+                        current_managed_hash,
+                        "managed_snapshot_sensitive",
+                    )
+                )
+                continue
+            redacted_vault_bytes = redactor.redact(vault_owned_text).encode("utf-8")
+            vault_owned_hash = sha256_bytes(vault_owned_bytes)
+            sensitive_blocker = redacted_vault_bytes != vault_owned_bytes
             current_full_hash = sha256_bytes(current)
             conflict_id = _reconciliation_id(
                 project_id,
@@ -418,6 +461,7 @@ class MergeService:
                 database_bytes,
                 snapshot.snapshot_kind,
                 current_full_hash,
+                vault_owned_hash,
             )
             payload = _json(
                 {
@@ -430,8 +474,12 @@ class MergeService:
                     "authority_hash": authority_hash,
                     "snapshot_kind": snapshot.snapshot_kind,
                     "vault_full_hash": current_full_hash,
+                    "vault_owned_hash": vault_owned_hash,
+                    "sensitive_blocker": (
+                        "sensitive_value_redacted" if sensitive_blocker else ""
+                    ),
                     "database_base64": _b64(database_bytes),
-                    "vault_base64": _b64(vault_owned_bytes),
+                    "vault_base64": _b64(redacted_vault_bytes),
                 }
             )
             existing = self._get_job(conflict_id)
@@ -466,6 +514,7 @@ class MergeService:
         for diagnostic in (
             "managed_snapshot_unavailable",
             "managed_snapshot_invalid",
+            "managed_snapshot_sensitive",
             "managed_boundary_invalid",
         ):
             if conflict_id.startswith(f"reconcile-diagnostic-{diagnostic}-"):
@@ -491,6 +540,7 @@ class MergeService:
         database_bytes = _unb64(payload["database_base64"])
         snapshot_kind = str(payload["snapshot_kind"])
         vault_full_hash = str(payload["vault_full_hash"])
+        vault_owned_hash = str(payload["vault_owned_hash"])
         if (
             _reconciliation_id(
                 project_id,
@@ -501,6 +551,7 @@ class MergeService:
                 database_bytes,
                 snapshot_kind,
                 vault_full_hash,
+                vault_owned_hash,
             )
             != conflict_id
         ):
@@ -521,7 +572,7 @@ class MergeService:
         except BoundaryError as exc:
             raise StalePlanError("reconciliation_target_changed") from exc
         if (
-            current_owned != vault_owned_bytes
+            sha256_bytes(current_owned) != vault_owned_hash
             or sha256_bytes(current_full) != vault_full_hash
         ):
             raise StalePlanError("reconciliation_target_changed")
@@ -599,9 +650,10 @@ class MergeService:
                 original_version=original.version,
                 original_text_hash=sha256_bytes(original.text.encode("utf-8")),
                 relative_path=relative,
-                vault_managed_hash=sha256_bytes(vault_owned_bytes),
+                vault_managed_hash=vault_owned_hash,
                 vault_full_hash=vault_full_hash,
                 authority_hash=str(payload["authority_hash"]),
+                blocker=str(payload.get("sensitive_blocker", "")),
             ),
         )
         self.repository.finish_sync(conflict_id, "pending_review")
@@ -728,6 +780,29 @@ class MergeService:
         return True, "file", target.read_bytes()
 
     @staticmethod
+    def _validate_sensitive_plan_inputs(
+        project_id: str,
+        replacements: Mapping[Path, bytes],
+        deletes: Sequence[Path],
+        renames: Sequence[tuple[Path, Path]],
+        conflicts: Sequence[str],
+    ) -> None:
+        redactor = Redactor()
+        text_values = [project_id, *(str(item) for item in deletes), *conflicts]
+        text_values.extend(str(path) for path in replacements)
+        for source, target in renames:
+            text_values.extend((str(source), str(target)))
+        if any(redactor.contains_sensitive_value(value) for value in text_values):
+            raise SensitiveMergeContentError("sensitive_merge_content")
+        for content in replacements.values():
+            try:
+                text = bytes(content).decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise SensitiveMergeContentError("sensitive_merge_content") from exc
+            if redactor.contains_sensitive_value(text):
+                raise SensitiveMergeContentError("sensitive_merge_content")
+
+    @staticmethod
     def _validate_unique_paths(plan: MergePlan) -> None:
         paths = [target.path_identity for target in plan.targets]
         paths.extend(item.path_identity for item in plan.deletes)
@@ -791,6 +866,12 @@ def _windows_path_identity(path: Path) -> str:
     return "/".join(identities)
 
 
+def canonical_merge_path_identity(path: Path) -> str:
+    """Return the Windows-compatible identity used by persisted merge plans."""
+
+    return _windows_path_identity(Path(path))
+
+
 def _reconciliation_id(
     project_id: str,
     relative: Path,
@@ -800,6 +881,7 @@ def _reconciliation_id(
     database_bytes: bytes,
     snapshot_kind: str,
     vault_full_hash: str,
+    vault_owned_hash: str,
 ) -> str:
     identity = [
         project_id,
@@ -810,6 +892,7 @@ def _reconciliation_id(
         sha256_bytes(database_bytes),
         snapshot_kind,
         vault_full_hash,
+        vault_owned_hash,
     ]
     return (
         "reconcile-" + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]

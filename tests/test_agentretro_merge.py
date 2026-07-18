@@ -11,13 +11,16 @@ from pathlib import Path
 import pytest
 
 import _path  # noqa: F401
+import agent_retro.presentation.cli as retro_cli
 
 from agent_retro.application.merge import (
     ConfirmationRequiredError,
     MergeIntegrityError,
     MergeService,
     StalePlanError,
+    SensitiveMergeContentError,
 )
+from agent_retro.application.merge_planner import MergePlanner, MergeProposal
 from agent_retro.application.knowledge import KnowledgeService
 from agent_retro.application.sync import ProjectionCoordinator, SyncService
 from agent_retro.application.sync import ProjectionPersistenceError
@@ -32,6 +35,11 @@ from agent_retro.domain.models import (
     SourceLocator,
 )
 from agent_retro.infrastructure.obsidian import ObsidianProjection, sha256_bytes
+from agent_retro.infrastructure.llm_merge import (
+    LLMMergeProposalGateway,
+    MergeProposalResponseError,
+    MergeProposalUnavailableError,
+)
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 from agent_retro.presentation.cli import main
 
@@ -796,6 +804,466 @@ def test_create_plan_is_immutable_persistent_complete_and_does_not_write_vault(
     assert persisted["id"] == plan.id
     assert persisted["targets"][0]["output_base64"]
     assert not any(str(vault) in value for value in _walk_strings(persisted))
+
+
+@pytest.mark.parametrize("location", ["replacement", "path", "conflict"])
+def test_sensitive_merge_plan_fails_before_persistence_or_output(
+    tmp_path: Path, location: str
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    token = "TOKEN_REVIEW_UNIQUE_9347"
+    replacements = {Path("guide.md"): b"safe"}
+    conflicts = ()
+    if location == "replacement":
+        replacements = {Path("guide.md"): f"token={token}".encode()}
+    elif location == "path":
+        replacements = {Path(f"token={token}.md"): b"safe"}
+    else:
+        conflicts = (f"password={token}",)
+
+    with pytest.raises(SensitiveMergeContentError, match="sensitive_merge_content"):
+        service.create_plan("NPKI", replacements=replacements, conflicts=conflicts)
+
+    assert token.encode() not in repository.db_path.read_bytes()
+    assert not any(path.name.startswith("merge-") for path in vault.rglob("*"))
+
+
+def test_sensitive_vault_adoption_persists_only_redacted_text_and_blocker(
+    tmp_path: Path, capsys
+) -> None:
+    repository, service, vault, target = _synchronize_rule(tmp_path)
+    token = "TOKEN_REVIEW_UNIQUE_8291"
+    target.write_text(
+        target.read_text(encoding="utf-8").replace("数据库规则", f"token={token}"),
+        encoding="utf-8",
+    )
+
+    conflict = service.find_external_edits("NPKI")[0]
+    env = {
+        "AGENTRETRO_HOME": str(tmp_path),
+        "AGENTRETRO_DB_PATH": str(repository.db_path),
+        "AGENTRETRO_BACKUP_DIR": str(tmp_path / "backups"),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+    }
+    assert (
+        main(
+            ["--json", "sync", "conflicts", "--project", "NPKI"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    assert token not in capsys.readouterr().out
+    assert token.encode() not in repository.db_path.read_bytes()
+    candidate_id = service.reconcile(
+        conflict.id, "adopt_vault", actor="user"
+    ).candidate_id
+    candidate = repository.get_candidate(candidate_id)
+    adoption = repository.get_vault_adoption(candidate_id)
+
+    assert token not in candidate.proposed_text
+    assert "[REDACTED]" in candidate.proposed_text
+    assert adoption.blocker == "sensitive_value_redacted"
+    assert token not in repository.evidence_for_candidate(candidate_id)[0].excerpt
+    assert token.encode() not in repository.db_path.read_bytes()
+    with pytest.raises((StalePlanError, ValueError)):
+        KnowledgeService(repository, adoption_service=service).accept(
+            candidate_id, actor="user"
+        )
+    assert repository.knowledge_for_candidate(candidate_id) is None
+    for state_file in (tmp_path / "backups").rglob("*"):
+        if state_file.is_file():
+            assert token.encode() not in state_file.read_bytes()
+
+
+class _ProposalGateway:
+    def __init__(self, proposal: MergeProposal) -> None:
+        self.proposal = proposal
+        self.calls = []
+
+    def propose(self, project_id, instruction, documents, *, timeout):
+        self.calls.append((project_id, instruction, dict(documents), timeout))
+        return self.proposal
+
+
+class _MergeLLMClient:
+    def __init__(self, response_content: str) -> None:
+        self.response_content = response_content
+        self.calls = []
+
+    def request(self, payload, stream=False, timeout=30):
+        self.calls.append((payload, stream, timeout))
+        return {"choices": [{"message": {"content": self.response_content}}]}
+
+
+def test_semantic_merge_planner_redacts_bounded_project_markdown_and_only_plans(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    token = "TOKEN_REVIEW_UNIQUE_7123"
+    source = project_root / "source.md"
+    source.write_text(f"token={token}\nproject notes\n", encoding="utf-8")
+    gateway = _ProposalGateway(
+        MergeProposal(
+            replacements={Path("项目/NPKI/merged.md"): "# merged\n"},
+            deletes=(),
+            renames=(),
+            conflicts=(),
+        )
+    )
+    planner = MergePlanner(
+        service,
+        vault,
+        gateway,
+        max_files=10,
+        max_bytes=4096,
+        timeout_seconds=17,
+    )
+
+    plan = planner.plan("NPKI", f"organize token={token}")
+
+    _, instruction, documents, timeout = gateway.calls[0]
+    assert token not in instruction
+    assert token not in json.dumps(documents)
+    assert "[REDACTED]" in instruction
+    assert timeout == 17
+    assert plan == service.preview(plan.id)
+    assert not (project_root / "merged.md").exists()
+    assert source.read_text(encoding="utf-8").endswith("project notes\n")
+
+
+def test_semantic_merge_planner_enforces_file_limit_before_gateway(
+    tmp_path: Path,
+) -> None:
+    _, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    (project_root / "one.md").write_text("one", encoding="utf-8")
+    (project_root / "two.md").write_text("two", encoding="utf-8")
+    gateway = _ProposalGateway(MergeProposal({}, (), (), ()))
+    planner = MergePlanner(
+        service, vault, gateway, max_files=1, max_bytes=4096, timeout_seconds=10
+    )
+
+    with pytest.raises(ValueError, match="merge_planner_input_limit"):
+        planner.plan("NPKI", "organize")
+
+    assert gateway.calls == []
+
+
+def test_semantic_merge_planner_enforces_discovery_deadline_before_gateway(
+    tmp_path: Path,
+) -> None:
+    _, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    (project_root / "one.md").write_text("one", encoding="utf-8")
+    gateway = _ProposalGateway(MergeProposal({}, (), (), ()))
+    clock_values = iter((0.0, 2.0))
+    planner = MergePlanner(
+        service,
+        vault,
+        gateway,
+        max_files=10,
+        max_bytes=4096,
+        timeout_seconds=10,
+        discovery_timeout_seconds=1,
+        monotonic=lambda: next(clock_values),
+    )
+
+    with pytest.raises(ValueError, match="merge_planner_discovery_timeout"):
+        planner.plan("NPKI", "organize")
+
+    assert gateway.calls == []
+
+
+def test_semantic_merge_planner_rejects_sensitive_source_path_before_gateway(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    token = "TOKEN_REVIEW_UNIQUE_5378"
+    (project_root / f"token={token}.md").write_text("safe", encoding="utf-8")
+    gateway = _ProposalGateway(MergeProposal({}, (), (), ()))
+    planner = MergePlanner(
+        service,
+        vault,
+        gateway,
+        max_files=10,
+        max_bytes=4096,
+        timeout_seconds=10,
+    )
+
+    with pytest.raises(SensitiveMergeContentError, match="sensitive_merge_content"):
+        planner.plan("NPKI", "organize")
+
+    assert gateway.calls == []
+    assert token.encode() not in repository.db_path.read_bytes()
+
+
+def test_llm_merge_gateway_receives_only_redacted_inputs_and_returns_typed_plan(
+    tmp_path: Path,
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    token = "TOKEN_REVIEW_UNIQUE_4491"
+    source = project_root / "source.md"
+    source.write_text(f"token={token}\nproject notes\n", encoding="utf-8")
+    client = _MergeLLMClient(
+        json.dumps(
+            {
+                "replacements": [
+                    {
+                        "path": "项目/NPKI/merged.md",
+                        "content": "# merged\n",
+                    }
+                ],
+                "deletes": [],
+                "renames": [],
+                "conflicts": [],
+            }
+        )
+    )
+    planner = MergePlanner(
+        service,
+        vault,
+        LLMMergeProposalGateway(client, model="test-model"),
+        max_files=10,
+        max_bytes=4096,
+        timeout_seconds=19,
+    )
+
+    plan = planner.plan("NPKI", f"organize token={token}")
+
+    payload, stream, timeout = client.calls[0]
+    serialized_request = json.dumps(payload, ensure_ascii=False)
+    assert token not in serialized_request
+    assert "[REDACTED]" in serialized_request
+    assert stream is False
+    assert timeout == 19
+    assert payload["response_format"]["json_schema"]["strict"] is True
+    assert plan == service.preview(plan.id)
+    assert token.encode() not in repository.db_path.read_bytes()
+    assert not (project_root / "merged.md").exists()
+
+
+def test_llm_merge_gateway_rejects_windows_alias_replacement_paths() -> None:
+    client = _MergeLLMClient(
+        json.dumps(
+            {
+                "replacements": [
+                    {"path": "项目/NPKI/A.md", "content": "one"},
+                    {"path": "项目/NPKI/a.md", "content": "two"},
+                ],
+                "deletes": [],
+                "renames": [],
+                "conflicts": [],
+            }
+        )
+    )
+
+    with pytest.raises(
+        MergeProposalResponseError, match="merge_proposal_response_invalid"
+    ):
+        LLMMergeProposalGateway(client, model="test-model").propose(
+            "NPKI", "organize", {}, timeout=10
+        )
+
+
+def test_secret_from_llm_proposal_never_reaches_state_logs_or_exception(
+    tmp_path: Path, caplog
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    input_token = "TOKEN_REVIEW_UNIQUE_4762"
+    output_token = "TOKEN_REVIEW_UNIQUE_7764"
+    (project_root / "source.md").write_text(
+        f"token={input_token}\nproject notes\n", encoding="utf-8"
+    )
+    client = _MergeLLMClient(
+        json.dumps(
+            {
+                "replacements": [
+                    {
+                        "path": "项目/NPKI/merged.md",
+                        "content": f"token={output_token}",
+                    }
+                ],
+                "deletes": [],
+                "renames": [],
+                "conflicts": [],
+            }
+        )
+    )
+    planner = MergePlanner(
+        service,
+        vault,
+        LLMMergeProposalGateway(client, model="test-model"),
+        max_files=10,
+        max_bytes=4096,
+        timeout_seconds=10,
+    )
+
+    with pytest.raises(SensitiveMergeContentError) as error:
+        planner.plan("NPKI", f"organize token={input_token}")
+
+    assert input_token not in json.dumps(client.calls, ensure_ascii=False)
+    assert output_token not in str(error.value)
+    assert output_token not in caplog.text
+    assert output_token.encode() not in repository.db_path.read_bytes()
+    assert not (project_root / "merged.md").exists()
+
+
+def test_llm_merge_gateway_sanitizes_model_transport_failure() -> None:
+    token = "TOKEN_REVIEW_UNIQUE_6419"
+
+    class FailingClient:
+        def request(self, payload, stream=False, timeout=30):
+            raise RuntimeError(f"upstream token={token}")
+
+    with pytest.raises(MergeProposalUnavailableError) as error:
+        LLMMergeProposalGateway(FailingClient(), model="test-model").propose(
+            "NPKI", "organize", {}, timeout=10
+        )
+
+    assert str(error.value) == "merge_proposal_unavailable"
+    assert error.value.__cause__ is None
+    assert token not in repr(error.value)
+
+
+def test_cli_merge_plan_is_preview_only_and_returns_complete_diff(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    repository, service, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    (project_root / "source.md").write_text("project notes\n", encoding="utf-8")
+    gateway = _ProposalGateway(
+        MergeProposal(
+            replacements={Path("项目/NPKI/merged.md"): "# merged\n"},
+            deletes=(),
+            renames=(),
+            conflicts=(),
+        )
+    )
+
+    def build(settings, current_repository):
+        return MergePlanner(
+            MergeService(
+                current_repository,
+                settings.obsidian_root,
+                settings.backup_dir,
+            ),
+            settings.obsidian_root,
+            gateway,
+            max_files=10,
+            max_bytes=4096,
+            timeout_seconds=10,
+        )
+
+    monkeypatch.setattr(retro_cli, "_build_merge_planner", build, raising=False)
+    env = {
+        "AGENTRETRO_HOME": str(tmp_path),
+        "AGENTRETRO_DB_PATH": str(repository.db_path),
+        "AGENTRETRO_BACKUP_DIR": str(tmp_path / "backups"),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+    }
+
+    assert (
+        main(
+            [
+                "--json",
+                "merge",
+                "plan",
+                "--project",
+                "NPKI",
+                "--instruction",
+                "organize",
+            ],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert output["code"] == "RETRO_MERGE_PLANNED"
+    assert output["data"]["project_id"] == "NPKI"
+    assert output["data"]["targets"][0]["path"] == "项目/NPKI/merged.md"
+    assert output["data"]["targets"][0]["unified_diff"]
+    assert service.preview(output["data"]["id"]).id == output["data"]["id"]
+    assert not (project_root / "merged.md").exists()
+
+
+def test_cli_secret_model_proposal_is_sanitized_and_persists_no_plan(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    repository, _, vault = _service(tmp_path)
+    project_root = vault / "项目" / "NPKI"
+    project_root.mkdir(parents=True)
+    (project_root / "source.md").write_text("project notes\n", encoding="utf-8")
+    token = "TOKEN_REVIEW_UNIQUE_9042"
+    gateway = _ProposalGateway(
+        MergeProposal(
+            replacements={Path("项目/NPKI/merged.md"): f"token={token}\n"},
+            deletes=(),
+            renames=(),
+            conflicts=(),
+        )
+    )
+
+    def build(settings, current_repository):
+        return MergePlanner(
+            MergeService(
+                current_repository,
+                settings.obsidian_root,
+                settings.backup_dir,
+            ),
+            settings.obsidian_root,
+            gateway,
+            max_files=10,
+            max_bytes=4096,
+            timeout_seconds=10,
+        )
+
+    monkeypatch.setattr(retro_cli, "_build_merge_planner", build, raising=False)
+    env = {
+        "AGENTRETRO_HOME": str(tmp_path),
+        "AGENTRETRO_DB_PATH": str(repository.db_path),
+        "AGENTRETRO_BACKUP_DIR": str(tmp_path / "backups"),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+    }
+
+    assert (
+        main(
+            [
+                "--json",
+                "merge",
+                "plan",
+                "--project",
+                "NPKI",
+                "--instruction",
+                "organize",
+            ],
+            home=tmp_path,
+            env=env,
+        )
+        == 2
+    )
+    output = capsys.readouterr().out
+    assert token not in output
+    assert token.encode() not in repository.db_path.read_bytes()
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_general_apply_does_not_authorize_destructive_operations(

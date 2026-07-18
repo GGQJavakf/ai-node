@@ -20,6 +20,7 @@ from agent_retro.application.merge import (
     MergeService,
     StalePlanError,
 )
+from agent_retro.application.merge_planner import MergePlanner
 from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.application.capture import CaptureResult, CaptureService
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
@@ -35,6 +36,10 @@ from agent_retro.infrastructure.legacy_model import (
 from agent_retro.infrastructure.llm_review import (
     LLMExtractionGateway,
     LLMReviewGateway,
+)
+from agent_retro.infrastructure.llm_merge import (
+    LLMMergeProposalGateway,
+    MergeProposalUnavailableError,
 )
 from agent_retro.infrastructure.project_mapping import (
     ProjectMappingService,
@@ -141,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     merge = commands.add_parser("merge", help="预览并应用受控 Obsidian 深度合并")
     merge_commands = merge.add_subparsers(dest="merge_command", required=True)
+    merge_plan = merge_commands.add_parser("plan", help="生成语义合并预览计划")
+    merge_plan.add_argument("--project", required=True, dest="project_id")
+    merge_plan.add_argument("--instruction", required=True)
     merge_preview = merge_commands.add_parser("preview", help="查看完整合并计划")
     merge_preview.add_argument("plan_id")
     merge_apply = merge_commands.add_parser("apply", help="应用当前合并计划")
@@ -243,6 +251,19 @@ def main(
             else:
                 sys.stderr.write(safe_text("合并计划完整性校验失败。") + "\n")
             return 2
+        except MergeProposalUnavailableError:
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_MERGE_MODEL_UNAVAILABLE",
+                        "message": "Semantic merge model is unavailable.",
+                        "data": {"retryable": True},
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text("语义合并模型暂不可用；可安全重试。") + "\n")
+            return 2
         except (KeyError, OSError, RuntimeError, ValueError) as exc:
             detail = Redactor().redact(str(exc))
             if args.json_output:
@@ -340,7 +361,14 @@ def _run_command(
             settings.obsidian_root,
             settings.backup_dir,
         )
-        if args.merge_command == "preview":
+        if args.merge_command == "plan":
+            plan = _build_merge_planner(settings, repository).plan(
+                args.project_id, args.instruction
+            )
+            data = _merge_plan_data(plan)
+            code = "RETRO_MERGE_PLANNED"
+            message = "Preview-only semantic merge plan created."
+        elif args.merge_command == "preview":
             plan = merge_service.preview(args.plan_id)
             data = _merge_plan_data(plan)
             code = "RETRO_MERGE_PREVIEW"
@@ -480,6 +508,27 @@ def _build_review_service(settings, repository):
         LLMReviewGateway(client, model=model),
         model_timeout_seconds=effective_model_timeout(settings, legacy),
         redact=Redactor().redact,
+    )
+
+
+def _build_merge_planner(settings, repository):
+    legacy = load_legacy_model_config()
+    model_value = legacy.get("model")
+    if not isinstance(model_value, str) or not model_value.strip():
+        raise MergeProposalUnavailableError("merge_proposal_unavailable")
+    model = model_value.strip()
+    try:
+        client = build_retro_llm_client_from_config(legacy)
+    except Exception:
+        raise MergeProposalUnavailableError("merge_proposal_unavailable") from None
+    return MergePlanner(
+        MergeService(repository, settings.obsidian_root, settings.backup_dir),
+        settings.obsidian_root,
+        LLMMergeProposalGateway(client, model=model),
+        max_files=min(settings.discovery_max_files, 200),
+        max_bytes=min(settings.session_max_bytes, 4 * 1024 * 1024),
+        timeout_seconds=effective_model_timeout(settings, legacy),
+        discovery_timeout_seconds=settings.discovery_timeout_seconds,
     )
 
 
