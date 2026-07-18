@@ -1481,6 +1481,48 @@ class SQLiteRetroRepository(RetroRepository):
         finally:
             connection.close()
 
+    def complete_sync(
+        self,
+        event_id: str,
+        project_id: str,
+        file_states: Sequence[tuple[Path, str, str]],
+    ) -> None:
+        """Atomically publish post-write hashes and finish both journal records."""
+
+        with self.transaction() as connection:
+            for path, managed_hash, full_hash in file_states:
+                connection.execute(
+                    """INSERT INTO managed_file_state(
+                        path, project_id, managed_hash, full_hash, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        project_id = excluded.project_id,
+                        managed_hash = excluded.managed_hash,
+                        full_hash = excluded.full_hash,
+                        updated_at = excluded.updated_at""",
+                    (str(path), project_id, managed_hash, full_hash, _now_text()),
+                )
+            sync_cursor = connection.execute(
+                "UPDATE sync_jobs SET status = ?, error = '', updated_at = ? WHERE id = ?",
+                (ProjectionStatus.SYNCED.value, _now_text(), event_id),
+            )
+            _require_row(sync_cursor, "sync job", event_id)
+            event_cursor = connection.execute(
+                """UPDATE projection_events SET status = ?, error = '', updated_at = ?
+                WHERE id = ?""",
+                (ProjectionStatus.SYNCED.value, _now_text(), event_id),
+            )
+            _require_row(event_cursor, "projection event", event_id)
+            self._append_audit_record(
+                connection,
+                self._audit_entry(
+                    action="sync_completed",
+                    entity_type="sync_job",
+                    entity_id=event_id,
+                    detail={"project_id": project_id, "file_count": len(file_states)},
+                ),
+            )
+
     def save_project_mapping(self, mapping: ProjectMapping, actor: str) -> None:
         with self.transaction() as connection:
             connection.execute(
@@ -1859,6 +1901,28 @@ class SQLiteRetroRepository(RetroRepository):
                 status=ProjectionStatus(str(row["status"])),
                 error=str(row["error"]),
             )
+        finally:
+            connection.close()
+
+    def list_projection_events(self, project_id: str) -> list[ProjectionEvent]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM projection_events WHERE project_id = ? ORDER BY created_at, id",
+                (project_id,),
+            ).fetchall()
+            return [
+                ProjectionEvent(
+                    id=str(row["id"]),
+                    project_id=str(row["project_id"]),
+                    cause=str(row["cause"]),
+                    cause_entity_id=str(row["cause_entity_id"]),
+                    input_hash=str(row["input_hash"]),
+                    status=ProjectionStatus(str(row["status"])),
+                    error=str(row["error"]),
+                )
+                for row in rows
+            ]
         finally:
             connection.close()
 

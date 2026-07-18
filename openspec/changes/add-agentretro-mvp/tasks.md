@@ -36,12 +36,12 @@
 
 ## 4. Obsidian Projection and Recovery
 
-- [ ] 4.1 Implement deterministic rendering and parsing for `规则.md`, `经验.md`, and `任务状态.md`, including stable item IDs and archived sections.
-- [ ] 4.2 Implement managed project-summary and index-link markers plus append-only log records, proving automatic sync preserves bytes outside managed regions.
-- [ ] 4.3 Implement vault-root containment, unexpected symlink rejection, marker validation, and mapped-project preflight checks.
-- [ ] 4.4 Implement sync planning, pre-write hashes, all-target backups, SQLite journals, same-directory temporary files, replacement, and post-write readback.
-- [ ] 4.5 Add multi-file failure-injection tests that prove all targets restore to exact pre-write hashes and restoration failure blocks future sync with `rollback_required`.
-- [ ] 4.6 Trigger one preflighted, idempotent same-command projection after every committed projection-changing SQLite transaction; on any preflight or write failure preserve SQLite as authoritative and mark affected knowledge `sync_pending` with a recovery diagnostic.
+- [x] 4.1 Implement deterministic rendering and parsing for `规则.md`, `经验.md`, and `任务状态.md`, including stable item IDs and archived sections.
+- [x] 4.2 Implement managed project-summary and index-link markers plus append-only log records, proving automatic sync preserves bytes outside managed regions.
+- [x] 4.3 Implement vault-root containment, unexpected symlink rejection, marker validation, and mapped-project preflight checks.
+- [x] 4.4 Implement sync planning, pre-write hashes, all-target backups, SQLite journals, same-directory temporary files, replacement, and post-write readback.
+- [x] 4.5 Add multi-file failure-injection tests that prove all targets restore to exact pre-write hashes and restoration failure blocks future sync with `rollback_required`.
+- [x] 4.6 Trigger one preflighted, idempotent same-command projection after every committed projection-changing SQLite transaction; on any preflight or write failure preserve SQLite as authoritative and mark affected knowledge `sync_pending` with a recovery diagnostic.
 - [ ] 4.7 Implement external managed-content hash detection and `retro sync reconcile` choices without silent bidirectional overwrite.
 - [ ] 4.8 Implement preview-only semantic merge planning with target hashes, complete diffs, conflicts, and destructive-operation disclosure.
 - [ ] 4.9 Implement explicit merge apply through the journaled write protocol, rejecting stale plans and requiring exact confirmation for delete, rename, move, or unresolved conflict.

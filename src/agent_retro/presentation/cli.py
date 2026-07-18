@@ -10,7 +10,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Mapping
 
-from agent_retro.application.bootstrap import build_retro_repository
+from agent_retro.application.bootstrap import (
+    build_projection_coordinator,
+    build_retro_repository,
+)
 from agent_retro.application.capture import CaptureResult, CaptureService
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
 from agent_retro.domain.models import CandidateStatus, KnowledgeType
@@ -111,6 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     promote.add_argument("knowledge_id")
     archive = review_commands.add_parser("archive", help="归档知识")
     archive.add_argument("knowledge_id")
+    sync = commands.add_parser("sync", help="恢复 Obsidian 知识投影")
+    sync_commands = sync.add_subparsers(dest="sync_command", required=True)
+    sync_retry = sync_commands.add_parser("retry", help="重试待同步投影")
+    sync_retry.add_argument("event_id")
     return parser
 
 
@@ -167,7 +174,28 @@ def _run_command(
     values = os.environ if env is None else env
     settings = load_retro_settings(home=home, env=values)
     repository = build_retro_repository(settings)
+    coordinator = build_projection_coordinator(settings, repository)
     resolver = ProjectResolver(repository.list_project_mappings())
+    if args.command == "sync":
+        result = coordinator.retry(args.event_id)
+        data = {
+            "event_id": result.event_id,
+            "projection_status": result.status.value,
+            "warning": result.warning,
+            "recovery_command": result.recovery_command,
+        }
+        if args.json_output:
+            write_json(
+                {
+                    "status": "ok",
+                    "code": "RETRO_SYNC_RETRIED",
+                    "message": "Obsidian projection retry completed.",
+                    "data": data,
+                }
+            )
+        else:
+            sys.stdout.write(safe_text(json_text(data)) + "\n")
+        return 0
     if args.command == "capture":
         source = CodexSessionSource(
             effective_codex_home(home=home, env=values),
@@ -190,6 +218,7 @@ def _run_command(
             settings,
             repository,
             build_review_service=_build_review_service,
+            projection_coordinator=coordinator,
         )
 
     review_stored_evidence = _review_unavailable

@@ -10,6 +10,7 @@ from collections.abc import Callable
 from agent_retro.application.knowledge import KnowledgeService
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
+from agent_retro.application.sync import ProjectionCoordinator, ProjectionResult
 from agent_retro.domain.models import CandidateStatus, KnowledgeType
 from agent_retro.infrastructure.settings import RetroSettings
 from agent_retro.presentation.output import safe_text, write_json
@@ -24,6 +25,7 @@ def run_review_command(
     repository: RetroRepository,
     *,
     build_review_service: ReviewServiceBuilder,
+    projection_coordinator: ProjectionCoordinator | None = None,
 ) -> int:
     command = args.review_command
     if command == "list":
@@ -69,12 +71,15 @@ def run_review_command(
     lifecycle = KnowledgeService(repository)
     if command == "accept":
         knowledge = lifecycle.accept(args.candidate_id, actor="user")
+        projection = _project(
+            projection_coordinator, "manual_accept", knowledge.id, knowledge.project_id
+        )
         _write_result(
             args.json_output,
             code="RETRO_CANDIDATE_ACCEPTED",
             message="Knowledge candidate accepted.",
             human=f"已接受知识候选 {args.candidate_id}",
-            data=_knowledge_data(knowledge),
+            data={**_knowledge_data(knowledge), "projection": projection},
         )
         return 0
     if command == "edit":
@@ -90,12 +95,15 @@ def run_review_command(
             scope=args.scope,
             valid_until=args.valid_until,
         )
+        projection = _project(
+            projection_coordinator, "manual_edit", knowledge.id, knowledge.project_id
+        )
         _write_result(
             args.json_output,
             code="RETRO_CANDIDATE_EDITED",
             message="Knowledge candidate edited and accepted.",
             human=f"已编辑并接受知识候选 {args.candidate_id}",
-            data=_knowledge_data(knowledge),
+            data={**_knowledge_data(knowledge), "projection": projection},
         )
         return 0
     if command == "reject":
@@ -112,12 +120,18 @@ def run_review_command(
         knowledge = lifecycle.resolve_conflict(
             args.conflict_id, text=args.text, actor="user"
         )
+        projection = _project(
+            projection_coordinator,
+            "conflict_resolve",
+            knowledge.id,
+            knowledge.project_id,
+        )
         _write_result(
             args.json_output,
             code="RETRO_CONFLICT_MERGED",
             message="Knowledge conflict merged.",
             human=f"已合并知识冲突 {args.conflict_id}",
-            data=_knowledge_data(knowledge),
+            data={**_knowledge_data(knowledge), "projection": projection},
         )
         return 0
     if command == "promote":
@@ -132,12 +146,15 @@ def run_review_command(
         return 0
     if command == "archive":
         knowledge = lifecycle.archive(args.knowledge_id, actor="user")
+        projection = _project(
+            projection_coordinator, "archive", knowledge.id, knowledge.project_id
+        )
         _write_result(
             args.json_output,
             code="RETRO_KNOWLEDGE_ARCHIVED",
             message="Knowledge archived.",
             human=f"已归档知识 {args.knowledge_id}",
-            data=_knowledge_data(knowledge),
+            data={**_knowledge_data(knowledge), "projection": projection},
         )
         return 0
     if command in {"run", "retry"}:
@@ -161,12 +178,38 @@ def run_review_command(
             raise ReviewUnavailableError(
                 "model review failed; retry is available for stored candidates"
             )
+        if command == "run":
+            candidates = repository.candidates_for_session(args.session_id)
+            cause_entity = args.session_id
+        elif args.retry_candidate_id:
+            candidate = repository.get_candidate(args.retry_candidate_id)
+            candidates = [] if candidate is None else [candidate]
+            cause_entity = args.retry_candidate_id
+        else:
+            candidates = repository.candidates_for_session(args.retry_session_id)
+            cause_entity = args.retry_session_id
+        projects = sorted(
+            {
+                knowledge.project_id
+                for candidate in candidates
+                if (knowledge := repository.knowledge_for_candidate(candidate.id))
+                is not None
+                and knowledge.status == "active"
+            }
+        )
+        projections = [
+            _project(projection_coordinator, "auto_accept", cause_entity, project)
+            for project in projects
+        ]
         _write_result(
             args.json_output,
             code=code,
             message=message,
             human=human,
-            data={"results": [_review_data(item) for item in results]},
+            data={
+                "results": [_review_data(item) for item in results],
+                "projections": projections,
+            },
         )
         return 0
     raise ValueError(f"unsupported review command: {command}")
@@ -183,7 +226,29 @@ def _write_result(
     if json_output:
         write_json({"status": "ok", "code": code, "message": message, "data": data})
     else:
-        sys.stdout.write(safe_text(human) + "\n")
+        sys.stdout.write(safe_text(human + _projection_human(data)) + "\n")
+
+
+def _projection_human(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    projections: list[dict[str, object]] = []
+    projection = data.get("projection")
+    if isinstance(projection, dict):
+        projections.append(projection)
+    listed = data.get("projections")
+    if isinstance(listed, list):
+        projections.extend(item for item in listed if isinstance(item, dict))
+    if not projections:
+        return ""
+    if all(item.get("status") == "synced" for item in projections):
+        return "；SQLite 已提交；Obsidian vault 已验证同步。"
+    blocked = next(item for item in projections if item.get("status") != "synced")
+    return (
+        "；SQLite 已提交，知识保持有效；"
+        f"{blocked.get('warning', 'RETRO_SYNC_PENDING')}；"
+        f"恢复命令: {blocked.get('recovery_command', '')}"
+    )
 
 
 def _candidate_data(candidate) -> dict[str, object]:
@@ -245,4 +310,24 @@ def _knowledge_data(knowledge) -> dict[str, object]:
         ),
         "updated_at": knowledge.updated_at.isoformat(),
         "supersedes": list(knowledge.supersedes),
+    }
+
+
+def _project(
+    coordinator: ProjectionCoordinator | None,
+    cause: str,
+    entity_id: str,
+    project_id: str,
+) -> dict[str, object] | None:
+    if coordinator is None:
+        return None
+    return _projection_data(coordinator.after_commit(cause, entity_id, project_id))
+
+
+def _projection_data(result: ProjectionResult) -> dict[str, object]:
+    return {
+        "event_id": result.event_id,
+        "status": result.status.value,
+        "warning": result.warning,
+        "recovery_command": result.recovery_command,
     }

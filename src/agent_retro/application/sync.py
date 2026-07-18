@@ -55,8 +55,8 @@ class SyncService:
             )
         try:
             snapshots = self._preflight(plan)
-        except (BoundaryError, OSError, RuntimeError, ValueError) as exc:
-            return self._finish(event_id, ProjectionStatus.SYNC_PENDING, str(exc))
+        except (BoundaryError, OSError, RuntimeError, ValueError):
+            return self._finish(event_id, ProjectionStatus.SYNC_PENDING, "preflight_failed")
 
         backup_dir = plan.backup_dir
         try:
@@ -67,8 +67,8 @@ class SyncService:
                 backup = self._backup_path(backup_dir, target)
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 backup.write_bytes(before)
-        except OSError as exc:
-            return self._finish(event_id, ProjectionStatus.SYNC_PENDING, str(exc))
+        except OSError:
+            return self._finish(event_id, ProjectionStatus.SYNC_PENDING, "backup_failed")
 
         job = SyncJob(
             id=event_id,
@@ -83,26 +83,38 @@ class SyncService:
                 self._atomic_replace(write.target, write.after_bytes)
                 if write.target.read_bytes() != write.after_bytes:
                     raise OSError(f"post-write readback mismatch: {write.target}")
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError):
             rollback_error = self._restore(plan, snapshots)
             status = (
                 ProjectionStatus.ROLLBACK_REQUIRED
                 if rollback_error
                 else ProjectionStatus.SYNC_PENDING
             )
-            error = str(exc) if not rollback_error else f"{exc}; {rollback_error}"
+            error = "write_failed" if not rollback_error else "rollback_failed"
             self.repository.finish_sync(event_id, status.value, error)
             return self._finish(event_id, status, error)
 
-        for write in plan.writes:
-            self.repository.save_managed_file_state(
-                plan.project_id,
+        states = [
+            (
                 write.target,
                 write.after_managed_hash or sha256_bytes(write.after_bytes),
                 sha256_bytes(write.after_bytes),
             )
-        self.repository.finish_sync(event_id, ProjectionStatus.SYNCED.value)
-        return self._finish(event_id, ProjectionStatus.SYNCED, "")
+            for write in plan.writes
+        ]
+        try:
+            self.repository.complete_sync(event_id, plan.project_id, states)
+        except (OSError, RuntimeError, ValueError):
+            rollback_error = self._restore(plan, snapshots)
+            status = (
+                ProjectionStatus.ROLLBACK_REQUIRED
+                if rollback_error
+                else ProjectionStatus.SYNC_PENDING
+            )
+            error = "rollback_failed" if rollback_error else "journal_finalize_failed"
+            self.repository.finish_sync(event_id, status.value, error)
+            return self._finish(event_id, status, error)
+        return ProjectionResult(event_id, ProjectionStatus.SYNCED)
 
     def enumerate_backups_containing(self, content_hash: str) -> tuple[Path, ...]:
         found = []
@@ -137,6 +149,7 @@ class SyncService:
         ]
         if len(mappings) != 1:
             raise ValueError("project does not have exactly one active vault mapping")
+        self._validate_backup_dir(plan.backup_dir)
         root = self.vault_root.resolve(strict=True)
         snapshots: dict[Path, bytes | None] = {}
         for write in plan.writes:
@@ -160,6 +173,24 @@ class SyncService:
                     raise ValueError(f"managed content changed externally: {write.target}")
             snapshots[write.target] = before
         return snapshots
+
+    def _validate_backup_dir(self, backup_dir: Path) -> None:
+        if self.backup_root.is_symlink():
+            raise ValueError("configured backup root must not be a symlink")
+        try:
+            relative = backup_dir.relative_to(self.backup_root)
+        except ValueError as exc:
+            raise ValueError("plan backup escapes configured backup root") from exc
+        current = self.backup_root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError("plan backup contains an unexpected symlink")
+        root = self.backup_root.resolve(strict=False)
+        try:
+            backup_dir.resolve(strict=False).relative_to(root)
+        except ValueError as exc:
+            raise ValueError("plan backup escapes configured backup root") from exc
 
     @staticmethod
     def _current_managed_hash(target: Path, content: bytes) -> str:
@@ -234,7 +265,12 @@ class SyncService:
             if status is ProjectionStatus.ROLLBACK_REQUIRED
             else f"retro sync retry {event_id}"
         )
-        return ProjectionResult(event_id, status, error, command)
+        warning = (
+            "RETRO_ROLLBACK_REQUIRED"
+            if status is ProjectionStatus.ROLLBACK_REQUIRED
+            else "RETRO_SYNC_PENDING"
+        )
+        return ProjectionResult(event_id, status, warning, command)
 
 
 class ProjectionCoordinator:

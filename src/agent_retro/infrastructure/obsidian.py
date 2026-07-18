@@ -63,6 +63,8 @@ def replace_managed_block(content: bytes, project_id: str, inner: str) -> bytes:
     if len(starts) != 1 or len(ends) != 1:
         raise BoundaryError("managed boundary must contain exactly one start/end pair")
     start, end = starts[0], ends[0]
+    if start.group(1) != end.group(1):
+        raise BoundaryError("managed boundary kinds do not match")
     if start.group(2).decode("utf-8") != project_id:
         raise BoundaryError("managed boundary project does not match mapping")
     if end.start() <= start.end():

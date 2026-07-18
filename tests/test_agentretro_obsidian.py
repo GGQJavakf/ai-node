@@ -9,10 +9,18 @@ import pytest
 
 from agent_retro.application.sync import ProjectionCoordinator, SyncService
 from agent_retro.domain.models import (
+    Candidate,
+    CandidateStatus,
+    Evidence,
     Knowledge,
+    KnowledgeConflict,
     KnowledgeType,
+    NormalizedSession,
     ProjectMapping,
     ProjectionStatus,
+    ReviewResult,
+    ReviewVerdict,
+    SourceLocator,
 )
 from agent_retro.infrastructure.obsidian import (
     BoundaryError,
@@ -21,6 +29,7 @@ from agent_retro.infrastructure.obsidian import (
     replace_managed_block,
 )
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
+from agent_retro.presentation.cli import main
 
 
 NOW = datetime(2026, 7, 18, 10, 0, tzinfo=timezone.utc)
@@ -64,6 +73,41 @@ def _repository(tmp_path: Path) -> SQLiteRetroRepository:
         "user",
     )
     return repository
+
+
+def _seed_pending_candidate(
+    repository: SQLiteRetroRepository,
+    candidate_id: str = "candidate-rule",
+    *,
+    kind: KnowledgeType = KnowledgeType.RULE,
+) -> None:
+    locator = SourceLocator("source-session", "event-1", "session.jsonl", "a" * 64)
+    session = NormalizedSession(
+        id="session-1",
+        source_session_id="source-session",
+        source_path=Path("session.jsonl"),
+        source_hash="b" * 64,
+        project_id="NPKI",
+        completed=True,
+        completed_at=NOW,
+        events=(),
+    )
+    evidence = Evidence("evidence-1", session.id, "user", locator, "用户明确要求")
+    repository.save_capture(session, [evidence])
+    repository.save_candidates(
+        [
+            Candidate(
+                id=candidate_id,
+                knowledge_type=kind,
+                project_id="NPKI",
+                scope="project",
+                proposed_text="保留明确证据。",
+                evidence_ids=(evidence.id,),
+                status=CandidateStatus.PENDING_REVIEW,
+                extraction_confidence=0.98,
+            )
+        ]
+    )
 
 
 class KnowledgeRepository(SQLiteRetroRepository):
@@ -158,6 +202,10 @@ def test_managed_block_replaces_only_inner_bytes() -> None:
             b"<!-- agentretro:summary:start project=OTHER -->\n"
             b"<!-- agentretro:summary:end -->\n"
         ),
+        (
+            b"<!-- agentretro:summary:start project=NPKI -->\n"
+            b"content\n<!-- agentretro:index:end -->\n"
+        ),
     ],
 )
 def test_managed_block_rejects_malformed_boundaries(content: bytes) -> None:
@@ -215,6 +263,40 @@ def test_symlink_escape_is_rejected_without_write(tmp_path: Path) -> None:
         ObsidianProjection(vault, tmp_path / "backups").plan(
             "NPKI", [_knowledge("rule", KnowledgeType.RULE)]
         )
+    assert list(outside.iterdir()) == []
+
+
+def test_broken_symlink_target_is_rejected(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    (vault / "项目").mkdir(parents=True)
+    try:
+        os.symlink(
+            tmp_path / "missing-target",
+            vault / "项目" / "NPKI",
+            target_is_directory=True,
+        )
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(UnsafeVaultPathError):
+        ObsidianProjection(vault, tmp_path / "backups").plan(
+            "NPKI", [_knowledge("rule", KnowledgeType.RULE)]
+        )
+
+
+def test_backup_symlink_escape_is_rejected_before_target_write(tmp_path: Path) -> None:
+    repository, coordinator = _coordinator(
+        tmp_path, [_knowledge("rule", KnowledgeType.RULE)]
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    backup_root = tmp_path / "backups"
+    try:
+        os.symlink(outside, backup_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    result = coordinator.after_commit("accept", "rule", "NPKI")
+    assert result.status is ProjectionStatus.SYNC_PENDING
+    assert not (tmp_path / "vault" / "项目").exists()
     assert list(outside.iterdir()) == []
 
 
@@ -314,6 +396,40 @@ def test_projection_failure_keeps_sqlite_authority_and_retry_succeeds(
     assert repository.items[0].status == "active"
     assert failed.recovery_command == f"retro sync retry {failed.event_id}"
     assert retried.status is ProjectionStatus.SYNCED
+    assert failed.warning == "RETRO_SYNC_PENDING"
+
+
+def test_repository_finalize_failure_restores_files_and_states(tmp_path: Path) -> None:
+    class FinalizeFailureRepository(KnowledgeRepository):
+        def complete_sync(self, *args, **kwargs) -> None:
+            raise OSError("secret finalize detail")
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    repository = FinalizeFailureRepository(
+        tmp_path / "retro.db",
+        tmp_path / "backups",
+        [_knowledge("rule", KnowledgeType.RULE)],
+    )
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    coordinator = ProjectionCoordinator(
+        repository,
+        ObsidianProjection(vault, tmp_path / "backups"),
+        SyncService(repository, vault, tmp_path / "backups"),
+    )
+
+    result = coordinator.after_commit("accept", "rule", "NPKI")
+
+    assert result.status is ProjectionStatus.SYNC_PENDING
+    assert result.warning == "RETRO_SYNC_PENDING"
+    assert "secret" not in result.warning
+    assert not (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
+    assert repository.get_managed_file_state(
+        vault / "项目" / "NPKI" / "AgentRetro" / "规则.md"
+    ) is None
 
 
 def test_backup_enumeration_and_confirmed_removal_are_hash_bound(
@@ -333,3 +449,281 @@ def test_backup_enumeration_and_confirmed_removal_are_hash_bound(
         service.remove_confirmed_backup_copy(backup, "0" * 64)
     service.remove_confirmed_backup_copy(backup, expected)
     assert not backup.exists()
+
+
+def test_cli_accept_commits_then_projects_once_in_same_command(
+    tmp_path: Path, capsys
+) -> None:
+    home = tmp_path / "home"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    state = home / ".agentretro"
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping(
+            "mapping-npki", tmp_path / "repo", "https://invalid/npki", "NPKI"
+        ),
+        "user",
+    )
+    _seed_pending_candidate(repository)
+
+    result = main(
+        ["--json", "review", "accept", "candidate-rule"],
+        home=home,
+        env={"AGENTRETRO_OBSIDIAN_ROOT": str(vault)},
+    )
+
+    assert result == 0
+    accepted = repository.knowledge_for_candidate("candidate-rule")
+    assert accepted is not None and accepted.status == "active"
+    assert repository.projection_event_count("NPKI") == 1
+    assert (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").exists()
+    assert '"projection"' in capsys.readouterr().out
+
+
+def test_cli_accept_keeps_knowledge_when_vault_unavailable_then_sync_retry(
+    tmp_path: Path, capsys
+) -> None:
+    home = tmp_path / "home"
+    vault = tmp_path / "missing-vault"
+    state = home / ".agentretro"
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping(
+            "mapping-npki", tmp_path / "repo", "https://invalid/npki", "NPKI"
+        ),
+        "user",
+    )
+    _seed_pending_candidate(repository)
+    env = {"AGENTRETRO_OBSIDIAN_ROOT": str(vault)}
+
+    accepted = main(
+        ["--json", "review", "accept", "candidate-rule"], home=home, env=env
+    )
+    output = capsys.readouterr().out
+    event = repository.list_projection_events("NPKI")[0]
+    vault.mkdir()
+    retried = main(["--json", "sync", "retry", event.id], home=home, env=env)
+
+    assert accepted == 0 and retried == 0
+    assert repository.knowledge_for_candidate("candidate-rule").status == "active"
+    assert "sync_pending" in output and "retro sync retry" in output
+    assert repository.get_projection_event(event.id).status is ProjectionStatus.SYNCED
+
+
+def test_cli_edit_and_archive_each_trigger_one_post_commit_projection(
+    tmp_path: Path, capsys
+) -> None:
+    home = tmp_path / "home"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    state = home / ".agentretro"
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+    env = {"AGENTRETRO_OBSIDIAN_ROOT": str(vault)}
+
+    assert (
+        main(
+            [
+                "--json",
+                "review",
+                "edit",
+                "candidate-rule",
+                "--text",
+                "编辑后的规则。",
+            ],
+            home=home,
+            env=env,
+        )
+        == 0
+    )
+    capsys.readouterr()
+    assert repository.projection_event_count("NPKI") == 1
+    knowledge = repository.knowledge_for_candidate("candidate-rule")
+    assert main(
+        ["--json", "review", "archive", knowledge.id], home=home, env=env
+    ) == 0
+    capsys.readouterr()
+    assert repository.projection_event_count("NPKI") == 2
+    aggregate = (vault / "项目" / "NPKI" / "AgentRetro" / "规则.md").read_text(
+        encoding="utf-8"
+    )
+    assert aggregate.index("## 已归档") < aggregate.index(knowledge.id)
+
+
+def test_cli_conflict_resolution_triggers_one_post_commit_projection(
+    tmp_path: Path, capsys
+) -> None:
+    home = tmp_path / "home"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    state = home / ".agentretro"
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository, "candidate-active")
+    active = repository.accept_candidate(
+        "candidate-active", "旧规则", "user", 0.98
+    )
+    evidence = repository.list_evidence("session-1")[0]
+    repository.save_candidates(
+        [
+            Candidate(
+                "candidate-new",
+                KnowledgeType.RULE,
+                "NPKI",
+                "project",
+                "新规则",
+                (evidence.id,),
+                CandidateStatus.PENDING_REVIEW,
+                0.98,
+            )
+        ]
+    )
+    repository.create_conflict(
+        KnowledgeConflict(
+            "conflict-1", active.id, "candidate-new", "冲突", "合并规则", "open"
+        )
+    )
+
+    result = main(
+        [
+            "--json",
+            "review",
+            "merge",
+            "conflict-1",
+            "--text",
+            "最终规则",
+        ],
+        home=home,
+        env={"AGENTRETRO_OBSIDIAN_ROOT": str(vault)},
+    )
+
+    assert result == 0
+    capsys.readouterr()
+    assert repository.projection_event_count("NPKI") == 1
+
+
+def test_cli_auto_acceptance_triggers_one_post_commit_projection(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    state = home / ".agentretro"
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+
+    class AutoAcceptReview:
+        def __init__(self, repo):
+            self.repo = repo
+
+        def review_session(self, session_id: str):
+            self.repo.accept_candidate(
+                "candidate-rule",
+                "自动接受规则",
+                "model-review",
+                0.99,
+                candidate_status=CandidateStatus.AUTO_ACCEPTED,
+            )
+            return [
+                ReviewResult(
+                    ReviewVerdict.ACCEPT,
+                    0.99,
+                    "evidence-bound",
+                    "自动接受规则",
+                    None,
+                    None,
+                )
+            ]
+
+    monkeypatch.setattr(
+        "agent_retro.presentation.cli._build_review_service",
+        lambda settings, repo: AutoAcceptReview(repo),
+    )
+    result = main(
+        ["--json", "review", "run", "--session", "source-session"],
+        home=home,
+        env={"AGENTRETRO_OBSIDIAN_ROOT": str(vault)},
+    )
+
+    assert result == 0
+    capsys.readouterr()
+    assert repository.projection_event_count("NPKI") == 1
+    assert repository.knowledge_for_candidate("candidate-rule").status == "active"
+
+
+def test_human_accept_reports_sqlite_commit_and_projection_recovery(
+    tmp_path: Path, capsys
+) -> None:
+    home = tmp_path / "home"
+    state = home / ".agentretro"
+    repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping("mapping", tmp_path / "repo", "remote", "NPKI"), "user"
+    )
+    _seed_pending_candidate(repository)
+
+    result = main(
+        ["review", "accept", "candidate-rule"],
+        home=home,
+        env={"AGENTRETRO_OBSIDIAN_ROOT": str(tmp_path / "missing-vault")},
+    )
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "SQLite 已提交，知识保持有效" in output
+    assert "RETRO_SYNC_PENDING" in output
+    assert "retro sync retry" in output
+
+
+def test_same_batch_updates_summary_and_index_only_inside_valid_markers(
+    tmp_path: Path,
+) -> None:
+    repository, coordinator = _coordinator(
+        tmp_path, [_knowledge("rule", KnowledgeType.RULE)]
+    )
+    vault = tmp_path / "vault"
+    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    index = vault / "项目" / "项目索引.md"
+    summary.parent.mkdir(parents=True)
+    summary_before = (
+        b"human-summary-before\n"
+        b"<!-- agentretro:summary:start project=NPKI -->\nold\n"
+        b"<!-- agentretro:summary:end -->\nhuman-summary-after\n"
+    )
+    index_before = (
+        b"human-index-before\n"
+        b"<!-- agentretro:index:start project=NPKI -->\nold\n"
+        b"<!-- agentretro:index:end -->\nhuman-index-after\n"
+    )
+    summary.write_bytes(summary_before)
+    index.write_bytes(index_before)
+
+    result = coordinator.after_commit("accept", "rule", "NPKI")
+
+    assert result.status is ProjectionStatus.SYNCED
+    assert summary.read_bytes().startswith(b"human-summary-before\n")
+    assert summary.read_bytes().endswith(b"human-summary-after\n")
+    assert index.read_bytes().startswith(b"human-index-before\n")
+    assert index.read_bytes().endswith(b"human-index-after\n")
+    event = repository.get_projection_event(result.event_id)
+    backup_dir = tmp_path / "backups"
+    assert any(
+        path.read_bytes() == summary_before for path in backup_dir.rglob("项目_NPKI.md")
+    )
+    assert any(path.read_bytes() == index_before for path in backup_dir.rglob("项目索引.md"))
+    assert event is not None and event.status is ProjectionStatus.SYNCED
