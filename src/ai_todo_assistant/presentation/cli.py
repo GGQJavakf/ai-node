@@ -26,7 +26,7 @@ try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-    from prompt_toolkit.completion import WordCompleter, Completer, Completion
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.styles import Style
     PROMPT_TOOLKIT_AVAILABLE = True
 except ImportError:
@@ -35,7 +35,6 @@ except ImportError:
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import Spinner
 from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt
@@ -1119,7 +1118,7 @@ TodoAgent CLI
     def _handle_natural_language(self, text):
         """处理自然语言命令 - 支持流式输出"""
         # 显示 Thinking 状态
-        with self.console.status("[cyan]Thinking...[/cyan]") as status:
+        with self.console.status("[cyan]Thinking...[/cyan]"):
             try:
                 # 准备流式输出
                 full_response = []

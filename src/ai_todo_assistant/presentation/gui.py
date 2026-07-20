@@ -793,7 +793,7 @@ class EditTodoDialog:
 def main():
     """主函数"""
     root = tk.Tk()
-    app = TodoGUI(root)
+    _app = TodoGUI(root)
     print("GUI 应用已启动。")
     root.mainloop()
 
