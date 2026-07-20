@@ -173,6 +173,29 @@ def test_existing_ai_todo_noninteractive_help_remains_gbk_safe(
     assert "日常主命令".encode("gbk") in combined
 
 
+def test_existing_ai_todo_noninteractive_exit_remains_gbk_safe(
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from ai_todo_assistant.presentation.cli import main; main()",
+        ],
+        cwd=tmp_path,
+        env=_isolated_environment(tmp_path, "gbk"),
+        input="/exit\n".encode("gbk"),
+        capture_output=True,
+        check=False,
+        timeout=20,
+    )
+    combined = completed.stdout + completed.stderr
+
+    assert completed.returncode == 0, combined.decode("gbk", errors="replace")
+    assert b"UnicodeEncodeError" not in combined
+    combined.decode("gbk", errors="strict")
+
+
 def test_ai_todo_display_response_uses_one_console_file_encoding_fallback() -> None:
     console = _RenderingConsole(rendered_text="📖 帮助")
     cli = object.__new__(TodoCLI)

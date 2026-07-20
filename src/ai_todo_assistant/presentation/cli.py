@@ -1229,7 +1229,7 @@ TodoAgent CLI
                 self.console.print("\n[yellow]EOF 退出[/yellow]")
                 break
 
-        self.console.print("\n👋 Goodbye!")
+        self._display_response("\n👋 Goodbye!")
 
 
 def main():

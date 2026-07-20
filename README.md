@@ -45,6 +45,62 @@ hook、watcher 或常驻服务。
 | `AGENTRETRO_OBSIDIAN_ROOT` | 明确选定的 Obsidian vault 根目录 |
 | `CODEX_HOME` | 明确选定的本地 Codex 会话源 |
 
+### 首次使用快速流程
+
+以下命令均为显式单次操作，不会安装 hook、watcher 或常驻服务。先在当前
+PowerShell 会话选择 Codex home 和 Obsidian vault；如果使用默认 Codex home，
+可以省略第一行：
+
+```powershell
+$env:CODEX_HOME = "$env:USERPROFILE\.codex"
+$env:AGENTRETRO_OBSIDIAN_ROOT = '<obsidian-vault>'
+```
+
+先创建 Git 项目到 Obsidian 项目的审计映射，再运行单命令就绪度检查。首次
+`project map` 会初始化独立的 AgentRetro 状态和数据库，但不会写入知识文件：
+
+```powershell
+retro project map --root '<git-root>' --vault-project '<project-name>'
+retro project list
+retro doctor
+```
+
+`retro doctor` 本身只读；它会分别检查 Codex 会话源、安全上限、数据库和迁移、
+模型配置、项目映射、vault、备份、同步/清除恢复状态、全局集成和控制台编码，
+并为 warning 或 error 给出恢复命令。若尚未执行任何状态命令，可先运行 doctor
+查看配置，但新数据库和项目映射会显示为尚未就绪。
+
+显式捕获一个已完成会话后，从 JSON 结果读取 `<session-id>`，再执行模型审核：
+
+```powershell
+retro --json capture --last
+retro --json review run --session '<session-id>'
+retro --json review list --status pending_review
+retro --json review show '<candidate-id>'
+```
+
+`review run` 会调用已配置的模型；达到阈值且通过确定性门禁的候选可能自动接受，
+并在同一命令内尝试投影到 vault。未自动接受的候选必须人工选择接受、编辑或拒绝：
+
+```powershell
+retro --json review accept '<candidate-id>'
+# 或：retro --json review edit '<candidate-id>' --text '<revised-text>'
+# 或：retro --json review reject '<candidate-id>'
+```
+
+接受或编辑会更新 AgentRetro SQLite，并对已映射项目尝试写入三个托管知识文件；
+写入前会执行路径、marker、哈希和恢复状态预检。随后可以只读生成任务简报，并
+预览全局 Codex 指引集成：
+
+```powershell
+retro brief '<current-task>' --project '<project-name>' --markdown
+retro integrate codex
+```
+
+最后一条命令只输出 `<codex-home>/AGENTS.md` 的完整预览；只有显式执行
+`retro integrate codex --apply` 才会备份并写入托管块。AgentRetro 的任何命令
+都不会写入 Codex 原生 memory。
+
 知识抽取和独立审核以只读方式复用现有 AI 配置中经过过滤的 model 与
 timeout；凭据、token 和完整原始配置不会写入 AgentRetro。`retro brief` 是确定性
 本地查询，不调用模型、向量库或 Codex 原生 memory。

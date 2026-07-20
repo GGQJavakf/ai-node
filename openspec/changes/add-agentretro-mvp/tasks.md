@@ -67,3 +67,4 @@
 - [x] 6.4 Run the complete existing `ai-todo` suite and verify AgentRetro tests do not modify the existing Todo database or configuration behavior.
 - [x] 6.5 Verify that every `CR-01..CR-22`, `KR-01..KR-24`, `OS-01..OS-24`, and `BR-01..BR-28` ID has at least one passing automated test or an explicitly justified manual check, with no orphan scenario or test reference.
 - [x] 6.6 Run `openspec validate add-agentretro-mvp --strict`, full tests, CLI smoke checks, and a final scope/security self-review before declaring implementation complete.
+- [x] 6.7 Close the preserved `ai-todo` Windows GBK `/exit` regression with a real subprocess test, document the executable AgentRetro first-use and read-only doctor workflow, and repeat the full compatibility gate without real user-state writes.
