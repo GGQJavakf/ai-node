@@ -120,3 +120,11 @@ APPROVE_WITH_NOTES
 ### Action
 
 提交当前已验证实现，从该干净提交运行真实 preview/apply 和单事件 retry；完成真实 readback 后补充任务 `4.14` 证据并从最终干净提交重建 runtime，确认安装清单 `source_dirty=false`。随后再进入独立 Ruff 清理批次。
+
+### 真实 Obsidian 回读
+
+- Preview plan：`obsidian-init-27a02b288c21baa1efdd663d`；唯一目标 `项目/NPKI/项目_NPKI.md`，输入哈希 `931dfb2181daae4ee159378ba9377e6c50fe93e6c087f3ede5b058da25a7fffd`，仅在文件末尾追加空 summary block；不存在的项目索引未列入写入。
+- Apply readback：项目页哈希等于计划输出 `697404bb7a361e302c4c84fe617626d6da39249cbdb299e5b86266e3a1459f58`，marker 数为 2；保留备份哈希等于原输入哈希；初始化 sync job 为 `synced`。
+- Retry readback：`projection-c685f0e7593b93630b2dc2b6` 的 projection event 与 sync job 均为 `synced`；摘要为规则 0、经验 0、任务状态 1；原项目页完整字节仍是当前文件的前缀。
+- 生成文件：`任务状态.md` 与 `变更日志.md` 存在，事件 marker 恰好 1 个；没有规则/经验知识，因此对应文件未创建；项目索引仍不存在。
+- 边界回读：`candidate-5ba38964b2b4d8f0f7328276` 与 `candidate-c30af78efb3b8b9779bdd83a` 仍为 `pending_review`；全局 `AGENTS.md` 哈希保持 `8e670d1fed2f079318a955da20c8570a3fa986f544e061bc472cd23ca9ac037d`。

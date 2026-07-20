@@ -49,7 +49,7 @@
 - [x] 4.11 Add tests whose names or metadata reference every Obsidian synchronization scenario `OS-01` through `OS-24`, and record the scenario-to-test mapping in verification evidence.
 - [x] 4.12 Add failing tests for `OS-25` through `OS-29`, covering zero-write preview, deterministic cross-process apply fencing, byte preservation, no missing-file creation, unsafe marker/path rejection, and multi-target rollback.
 - [x] 4.13 Implement `retro sync init --project <project> [--apply <plan-id>]` using contained target discovery, deterministic plans, retained backups, same-directory replacement, readback, and verified all-target restoration.
-- [ ] 4.14 Apply a confirmed real-vault initialization plan, retry only the known pending projection event, verify the rendered managed block and backup, and prove pending review candidates remain unchanged.
+- [x] 4.14 Apply a confirmed real-vault initialization plan, retry only the known pending projection event, verify the rendered managed block and backup, and prove pending review candidates remain unchanged.
 - [x] 4.15 Extend scenario verification evidence so `OS-25` through `OS-29` each map to a passing automated test or an explicitly justified manual check.
 
 ## 5. Briefing, Diagnostics, and Codex Integration
