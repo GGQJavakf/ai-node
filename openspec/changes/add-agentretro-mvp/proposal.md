@@ -9,6 +9,7 @@ Completed Codex sessions currently disappear into history instead of becoming du
 - Extract and independently review `RULE`, `LESSON`, and `TASK_STATE` candidates, with conservative automatic-acceptance thresholds and deterministic safety gates.
 - Store review state, accepted knowledge, conflicts, audit history, and synchronization state in a user-level SQLite database.
 - Commit accepted knowledge to SQLite and then attempt one same-command, preflight-gated synchronization into three managed Obsidian aggregate files and bounded summary blocks, retaining `sync_pending` when the vault is unavailable or unsafe.
+- Add an explicit, hash-bound preview/apply initializer for missing managed blocks in existing optional Obsidian project and index pages so fail-closed projection can be recovered without rewriting user prose.
 - Provide audited project mapping and reclassification commands so unknown or ambiguous sessions have a recoverable user path.
 - Provide idempotent model-review retry and an explicitly confirmed sensitive purge that covers every verifiable AgentRetro-owned copy, including affected backups.
 - Generate a deterministic, token-bounded task-scoped `retro brief` for later Codex work and provide an explicit preview/apply/remove integration for canonical global Codex guidance.
@@ -20,7 +21,7 @@ Completed Codex sessions currently disappear into history instead of becoming du
 
 - `codex-session-retrospective`: Explicit, idempotent, bounded capture and normalization of completed local Codex sessions with managed project mappings, evidence references, and redaction.
 - `retrospective-knowledge-review`: Candidate extraction, independent review and retry, deterministic auto-acceptance gates, lifecycle management, conflicts, expiry, sensitive purge, and auditability.
-- `obsidian-knowledge-sync`: Same-command three-file project projection, managed summary boundaries, synchronization journaling, external-edit detection, controlled deep merge, and rollback.
+- `obsidian-knowledge-sync`: Same-command three-file project projection, explicit managed-boundary initialization, synchronization journaling, external-edit detection, controlled deep merge, and rollback.
 - `retrospective-briefing`: Deterministic accepted-knowledge selection, token-bounded task briefs, health diagnostics, and previewed canonical global AGENTS integration.
 
 ### Modified Capabilities

@@ -46,6 +46,39 @@ The system SHALL automatically modify only the three aggregate files, marked Age
 - **WHEN** path traversal or a symlink would resolve a target outside configured AgentRetro state or vault roots
 - **THEN** the system SHALL reject the write
 
+### Requirement: Existing optional pages can initialize managed boundaries explicitly
+
+The system SHALL provide a zero-write managed-boundary initialization preview for existing optional project-summary and project-index pages, and SHALL apply only a matching, current, explicitly confirmed plan.
+
+#### Scenario: [OS-25] Preview missing managed boundaries
+
+- **WHEN** an existing optional project-summary or project-index page has no AgentRetro marker and the user runs `retro sync init --project <project>`
+- **THEN** the system SHALL report the canonical relative target, input hash, planned hash, complete diff, deterministic plan ID, and backup location
+- **AND** it SHALL NOT modify the vault, backups, SQLite knowledge, or candidate state
+
+#### Scenario: [OS-26] Apply a current initialization plan
+
+- **WHEN** the user supplies `--apply <plan-id>` and every target still matches the preview inputs
+- **THEN** the system SHALL back up every existing target, append only the correct empty managed block, atomically replace and read back every target, and preserve all previous bytes outside the appended blocks
+- **AND** missing optional pages SHALL remain missing
+
+#### Scenario: [OS-27] Initialization plan becomes stale
+
+- **WHEN** target existence, content hash, canonical path, marker state, or planned bytes differ from the confirmed initialization plan
+- **THEN** the system SHALL reject the complete apply without modifying any target
+- **AND** it SHALL require a fresh preview
+
+#### Scenario: [OS-28] Initialization encounters unsafe markers or paths
+
+- **WHEN** a target contains partial, duplicate, nested, mismatched, or foreign-project AgentRetro markers, is not a regular UTF-8 file, escapes the vault, or traverses a symlink
+- **THEN** the system SHALL reject the complete plan without writing or attempting repair
+
+#### Scenario: [OS-29] Initialization apply or recovery fails
+
+- **WHEN** backup, replacement, or readback fails after a confirmed initialization apply begins
+- **THEN** the system SHALL restore and verify every changed target from its pre-write content
+- **AND** a restoration failure SHALL report `rollback_required` and block later projection until recovery
+
 ### Requirement: Multi-file synchronization is journaled and recoverable
 
 The system SHALL hash and back up every target, journal the run, use same-directory temporary files and replacement, read back every result, and restore all pre-write files if any write or verification fails.

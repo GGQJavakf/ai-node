@@ -60,3 +60,35 @@ NONE
 - 场景审计：`CR-01..CR-22`、`KR-01..KR-24`、`OS-01..OS-24`、`BR-01..BR-28` 连续、无遗漏、无重复，共 98 条。
 - 回归验证：`python -m pytest -q`，`161 passed in 5.80s`。
 - 指纹复算：按设计稿、现有详细计划、proposal、design、tasks 和四份 spec 的固定路径顺序，先计算各文件 SHA-256，再对 UTF-8/LF 的 `path<TAB>hash` 清单计算 SHA-256；评审摘要自身不参与哈希。
+
+---
+
+## 2026-07-20 Obsidian 托管块初始化增量复审
+
+### Verdict
+
+APPROVE_WITH_NOTES
+
+`stage_fingerprint`: `agentretro-obsidian-init-design-approved:v1:sha256:3212305910e4a20a360e0ee726b5db55239f902b52bddfd9895256cb65bf2474`
+
+### 证据
+
+- 真实故障与既有规格一致：自动投影在现有项目页缺少 managed markers 时 fail-closed，并将 SQLite 权威状态保留为 `sync_pending`；现有 CLI 只有 `sync retry/conflicts/reconcile`，没有初始化入口。
+- 增量设计把授权面限定为两个已存在的可选目标；默认预览零写入，跨进程 apply 由确定性 plan ID、当前输入哈希和完整计划哈希共同约束。
+- 用户正文只允许在文件末尾追加空托管块；缺失文件不创建，错误/外来/重复/嵌套标记不自动修复，删除、移动、重命名和深度合并均不在本次授权内。
+- 写入复用现有备份、同目录替换、读回和全目标恢复原则；初始化不改变 SQLite 知识或候选状态，后续投影仍通过单独的 `retro sync retry <event-id>` 执行。
+- OpenSpec 新增 `OS-25..OS-29` 和任务 `4.12..4.15`，并把最终覆盖门更新到 `OS-01..OS-29`；`openspec validate add-agentretro-mvp --strict` 通过。
+
+### Notes
+
+- 在实现与自动化测试完成前，不对真实 Obsidian 执行 apply；真实 apply 必须先回读预览计划，并只重试已知事件。
+- 两条现有 pending 候选保持 pending，不得借初始化或投影重试改变其审核状态。
+- 运行时只能在完整回归通过且提交后重建，安装清单必须回读为 `source_dirty=false`；历史 Ruff 清理进入后续独立批次。
+
+### Action
+
+按 TDD 实现 `4.12` 和 `4.13`，完成临时 vault 验证后再执行 `4.14` 的真实预览、确认应用和单事件重试；随后补齐场景证据与最终回归。任何计划哈希漂移、真实文件边界异常、备份或回读失败均停止，不使用手工标记或 force overwrite 绕过。
+
+### 指纹算法
+
+按以下固定路径顺序读取 UTF-8 文本并统一为 LF，分别计算 SHA-256，再对 `path<TAB>hash` 的 LF 清单计算 SHA-256；本审核摘要不参与哈希：增量设计稿、proposal、design、tasks、四份 `specs/**/spec.md`。

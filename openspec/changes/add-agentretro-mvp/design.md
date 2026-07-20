@@ -97,6 +97,14 @@ SQLite acceptance is not rolled back when Obsidian is unavailable. The knowledge
 
 Every committed transition that changes a project projection—automatic/manual acceptance, edit, reviewed vault adoption, conflict resolution, archive, or completed purge—creates one deterministic event. The initiating command commits SQLite and then attempts one synchronous batched projection. Failed preflight or apply records `sync_pending`; retrying the same event produces identical target bytes and no duplicate log entry.
 
+### Explicit initialization of optional managed boundaries
+
+Keep missing or malformed managed boundaries fail-closed during automatic projection. Provide `retro sync init --project <project>` as a zero-write preview for existing optional project-summary and project-index pages, and require `--apply <plan-id>` to initialize the exact current plan. The deterministic plan ID binds project identity, canonical relative paths, target existence, pre-write hashes, and planned hashes, so a separate CLI invocation can reject stale previews without persisting preview state.
+
+Initialization appends only an empty managed block, preserves all existing bytes, and never creates a missing optional note. Partial, duplicate, nested, mismatched, foreign-project, non-UTF-8, non-regular, traversal, or symlinked targets invalidate the entire plan. Apply backs up all existing targets, uses same-directory replacement and exact readback, restores all changed targets on failure, and exposes `rollback_required` if restoration cannot be verified. It does not alter SQLite knowledge or candidate state; the existing explicit `retro sync retry <event-id>` performs the later projection.
+
+**Alternatives rejected:** silently creating markers during automatic projection would broaden a knowledge transition into an unreviewed user-note edit; manual marker insertion lacks hash fencing, backup, and readback; a SQLite-only workaround leaves the human-readable projection permanently stale.
+
 ### Sensitive purge supersedes backup retention
 
 Ordinary removals archive content and ordinary backups remain until explicit cleanup. Sensitive purge first generates an immutable impact plan over SQLite, audit detail, managed vault content, AgentRetro logs/traces, and affected migration/sync/merge backups. Apply requires exact confirmation for every operation and leaves only a content-free, non-reversible tombstone. Any known copy that cannot be removed or verified yields `purge_incomplete`; copies outside AgentRetro provenance are disclosed as residual risk rather than claimed as deleted.
@@ -123,6 +131,7 @@ Defaults are configurable: inspect the newest 1000 candidate session files withi
 - **Codex session format drift** -> Isolate parsing behind a source adapter, retain versioned fixtures, ignore unknown optional events, and fail closed on missing identity fields.
 - **Legacy configuration coupling** -> Limit coupling to one read-only adapter and keep capture/brief usable when the model client is unavailable.
 - **Obsidian external edits** -> Compare managed-block hashes, stop before overwrite, and require reconciliation.
+- **Existing Obsidian pages lack markers** -> Preview exact marker initialization, bind apply to current hashes, back up all targets, and retry projection separately.
 - **Filesystem transactions are not truly atomic across files** -> Use backups, a SQLite journal, same-directory replace, readback, and all-file restoration.
 - **Context bloat** -> Apply project/type/status filtering and a configurable 6000-token default budget.
 - **Stale task state** -> Expire `TASK_STATE` after 14 days and surface stale records only through explicit history views.
