@@ -13,6 +13,7 @@ from agent_retro.infrastructure.legacy_model import (
     MODEL_CONFIG_KEYS,
     build_retro_llm_client,
     load_legacy_model_config,
+    probe_legacy_model_config,
 )
 from agent_retro.infrastructure.settings import (
     effective_model_timeout,
@@ -269,6 +270,57 @@ def test_legacy_model_client_from_config_refilters_and_copies_allowlist(
     assert passed_config is not source
     assert set(passed_config) == set(MODEL_CONFIG_KEYS)
     assert "unrelated_secret" not in passed_config
+
+
+@patch("agent_retro.infrastructure.legacy_model.build_llm_client")
+def test_legacy_model_probe_is_non_app_server_bounded_and_structured(
+    build_llm_client,
+):
+    calls = []
+
+    class _Client:
+        def is_configured(self):
+            return True
+
+        def request(self, payload, stream=False, timeout=30):
+            calls.append((payload, stream, timeout))
+            return {"choices": [{"message": {"content": json.dumps({"status": "ok"})}}]}
+
+        def close(self):
+            calls.append(("closed",))
+
+    build_llm_client.return_value = _Client()
+
+    assert (
+        probe_legacy_model_config(
+            {"model": "test-model", "codex_use_app_server": True}, timeout=11
+        )
+        is True
+    )
+
+    passed_config = build_llm_client.call_args.args[0]
+    assert passed_config["codex_use_app_server"] is False
+    payload, stream, timeout = calls[0]
+    assert payload["model"] == "test-model"
+    assert payload["response_format"]["json_schema"]["strict"] is True
+    assert (stream, timeout) == (False, 11)
+    assert calls[-1] == ("closed",)
+
+
+@patch("agent_retro.infrastructure.legacy_model.build_llm_client")
+def test_legacy_model_probe_stops_before_request_when_client_is_unconfigured(
+    build_llm_client,
+):
+    class _Client:
+        def is_configured(self):
+            return False
+
+        def request(self, *args, **kwargs):
+            raise AssertionError("unconfigured client must not be requested")
+
+    build_llm_client.return_value = _Client()
+
+    assert probe_legacy_model_config({"model": "test-model"}, timeout=11) is False
 
 
 def test_parser_has_independent_program_name():

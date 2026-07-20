@@ -12,9 +12,14 @@ from typing import Mapping
 
 from agent_retro.application.bootstrap import (
     build_doctor_service,
+    build_managed_boundary_initializer,
     build_purge_service,
     build_projection_coordinator,
     build_retro_repository,
+)
+from agent_retro.application.obsidian_init import (
+    BoundaryInitError,
+    BoundaryInitStalePlan,
 )
 from agent_retro.application.brief import (
     BriefBudgetError,
@@ -45,7 +50,12 @@ from agent_retro.application.purge import (
 from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.application.capture import CaptureResult, CaptureService
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
-from agent_retro.domain.models import CandidateStatus, KnowledgeType, PurgeStatus
+from agent_retro.domain.models import (
+    CandidateStatus,
+    KnowledgeType,
+    ProjectionStatus,
+    PurgeStatus,
+)
 from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     effective_codex_home,
@@ -163,6 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
     sync_commands = sync.add_subparsers(dest="sync_command", required=True)
     sync_retry = sync_commands.add_parser("retry", help="重试待同步投影")
     sync_retry.add_argument("event_id")
+    sync_init = sync_commands.add_parser("init", help="预览或初始化 Obsidian 托管块")
+    sync_init.add_argument("--project", required=True, dest="project_id")
+    sync_init.add_argument("--apply", metavar="PLAN_ID", dest="init_plan_id")
     sync_conflicts = sync_commands.add_parser(
         "conflicts", help="列出 Obsidian 外部编辑冲突"
     )
@@ -285,6 +298,28 @@ def main(
                 sys.stderr.write(
                     safe_text(getattr(exc, "reason", "guidance_error")) + "\n"
                 )
+            return 2
+        except BoundaryInitError as exc:
+            code = (
+                "RETRO_SYNC_INIT_STALE"
+                if isinstance(exc, BoundaryInitStalePlan)
+                else "RETRO_SYNC_INIT_FAILED"
+            )
+            data = {
+                "reason": exc.reason,
+                "recovery_command": exc.recovery_command,
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": code,
+                        "message": "Obsidian managed-boundary initialization failed safely.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
             return 2
         except ReviewUnavailableError:
             if args.json_output:
@@ -553,7 +588,34 @@ def _run_command(
         )
     resolver = ProjectResolver(repository.list_project_mappings())
     if args.command == "sync":
-        if args.sync_command == "retry":
+        exit_code = 0
+        if args.sync_command == "init":
+            initializer = build_managed_boundary_initializer(settings, repository)
+            plan = initializer.preview(args.project_id)
+            data = _boundary_init_plan_data(plan)
+            if args.init_plan_id:
+                result = initializer.apply(args.project_id, args.init_plan_id)
+                data = _boundary_init_plan_data(result.plan)
+                data.update(
+                    {
+                        "status": result.status.value,
+                        "changed": result.changed,
+                        "reason": result.reason,
+                        "recovery_command": result.recovery_command,
+                    }
+                )
+                code = (
+                    "RETRO_SYNC_INIT_APPLIED"
+                    if result.status is ProjectionStatus.SYNCED
+                    else "RETRO_SYNC_INIT_FAILED"
+                )
+                if result.status is not ProjectionStatus.SYNCED:
+                    exit_code = 2
+                message = "Obsidian managed-boundary initialization applied."
+            else:
+                code = "RETRO_SYNC_INIT_PREVIEW"
+                message = "Obsidian managed-boundary initialization previewed."
+        elif args.sync_command == "retry":
             result = coordinator.retry(args.event_id)
             data = {
                 "event_id": result.event_id,
@@ -602,7 +664,7 @@ def _run_command(
         if args.json_output:
             write_json(
                 {
-                    "status": "ok",
+                    "status": "ok" if exit_code == 0 else "error",
                     "code": code,
                     "message": message,
                     "data": data,
@@ -610,7 +672,7 @@ def _run_command(
             )
         else:
             sys.stdout.write(safe_text(json_text(data)) + "\n")
-        return 0
+        return exit_code
     if args.command == "merge":
         merge_service = MergeService(
             repository,
@@ -952,6 +1014,30 @@ def _guidance_preview_data(preview) -> dict[str, object]:
         "target": "${CODEX_HOME}/AGENTS.md",
         "target_hash": preview.target_hash,
         "target_missing": preview.target_missing,
+    }
+
+
+def _boundary_init_plan_data(plan) -> dict[str, object]:
+    return {
+        "plan_id": plan.id,
+        "project_id": plan.project_id,
+        "changed": plan.changed,
+        "backup_location": f"${{AGENTRETRO_BACKUP_DIR}}/{plan.id}",
+        "targets": [
+            {
+                "path": target.relative_path.as_posix(),
+                "kind": target.kind,
+                "before_hash": target.before_hash,
+                "after_hash": target.after_hash,
+                "changed": target.changed,
+                "diff": target.diff,
+                "backup_path": (
+                    f"${{AGENTRETRO_BACKUP_DIR}}/{plan.id}/"
+                    f"{target.relative_path.as_posix()}"
+                ),
+            }
+            for target in plan.targets
+        ],
     }
 
 

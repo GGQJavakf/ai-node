@@ -443,12 +443,34 @@ class _RecordingClient:
         return self.responses[len(self.calls) - 1]
 
 
+class _RepairingClient:
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, dict, bool, int]] = []
+
+    def request(self, payload: dict, stream: bool = False, timeout: int = 30):
+        self.calls.append(("initial", payload, stream, timeout))
+        return self.responses.pop(0)
+
+    def retry_after_structured_failure(
+        self, payload: dict, stream: bool = False, timeout: int = 30
+    ):
+        self.calls.append(("repair", payload, stream, timeout))
+        return self.responses.pop(0)
+
+
+def _model_response(content) -> dict:
+    return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+
 def test_extraction_and_review_use_independent_requests_and_forward_timeout():
     client = _RecordingClient()
     extractor = LLMExtractionGateway(client, model="test-model")
     reviewer = LLMReviewGateway(client, model="test-model")
 
-    extracted = extractor.extract('{"evidence":[]}', timeout=17)
+    extracted = extractor.extract(
+        '{"evidence":[{"id":"evidence-1"}]}', timeout=17
+    )
     reviewed = reviewer.review('{"candidate":{}}', timeout=23)
 
     assert len(extracted) == 1
@@ -462,6 +484,103 @@ def test_extraction_and_review_use_independent_requests_and_forward_timeout():
     assert "extract" in extraction_prompt.lower()
     assert "review" in review_prompt.lower()
     assert "reasoning" not in client.calls[1][0]["messages"][1]["content"].lower()
+
+
+def test_extraction_retries_once_after_strict_validation_failure():
+    client = _RepairingClient(
+        [
+            _model_response([{"summary": "Use typed ports."}]),
+            _model_response(
+                [
+                    {
+                        "knowledge_type": "RULE",
+                        "proposed_text": "Use typed ports.",
+                        "evidence_ids": ["evidence-1"],
+                        "confidence": 0.98,
+                    }
+                ]
+            ),
+        ]
+    )
+
+    extracted = LLMExtractionGateway(client, model="test-model").extract(
+        '{"evidence":[{"id":"evidence-1"}]}', timeout=17
+    )
+
+    assert extracted[0].proposed_text == "Use typed ports."
+    assert [call[0] for call in client.calls] == ["initial", "repair"]
+    assert all(0 < call[3] <= 17 for call in client.calls)
+    repair_messages = client.calls[1][1]["messages"]
+    assert "failed local structured validation" in repair_messages[-1]["content"]
+    assert "summary" not in repair_messages[-1]["content"]
+
+
+def test_extraction_schema_restricts_evidence_refs_and_repairs_hash_confusion():
+    client = _RepairingClient(
+        [
+            _model_response(
+                [
+                    {
+                        "knowledge_type": "RULE",
+                        "proposed_text": "Use typed ports.",
+                        "evidence_ids": ["evidence-content-hash"],
+                        "confidence": 0.98,
+                    }
+                ]
+            ),
+            _model_response(
+                [
+                    {
+                        "knowledge_type": "RULE",
+                        "proposed_text": "Use typed ports.",
+                        "evidence_ids": ["evidence-1"],
+                        "confidence": 0.98,
+                    }
+                ]
+            ),
+        ]
+    )
+    input_json = json.dumps(
+        {
+            "evidence": [
+                {
+                    "id": "evidence-1",
+                    "content_hash": "content-hash",
+                    "kind": "user",
+                    "excerpt": "Use typed ports.",
+                }
+            ]
+        }
+    )
+
+    extracted = LLMExtractionGateway(client, model="test-model").extract(
+        input_json, timeout=17
+    )
+
+    assert extracted[0].evidence_ids == ["evidence-1"]
+    assert [call[0] for call in client.calls] == ["initial", "repair"]
+    item_schema = client.calls[0][1]["response_format"]["json_schema"]["schema"][
+        "items"
+    ]
+    assert item_schema["properties"]["evidence_ids"]["items"]["enum"] == [
+        "evidence-1"
+    ]
+
+
+def test_review_retries_once_then_fails_closed_on_invalid_structure():
+    client = _RepairingClient(
+        [
+            _model_response({"verdict": "ACCEPT"}),
+            _model_response({"verdict": "ACCEPT"}),
+        ]
+    )
+
+    with pytest.raises(StructuredModelResponseError, match="after one retry"):
+        LLMReviewGateway(client, model="test-model").review(
+            '{"candidate":{}}', timeout=23
+        )
+
+    assert [call[0] for call in client.calls] == ["initial", "repair"]
 
 
 class _Extractor:

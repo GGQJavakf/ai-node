@@ -17,7 +17,7 @@ SCENARIO_PATTERN = re.compile(
 EXPECTED_IDS = {
     *(f"CR-{number:02d}" for number in range(1, 23)),
     *(f"KR-{number:02d}" for number in range(1, 25)),
-    *(f"OS-{number:02d}" for number in range(1, 25)),
+    *(f"OS-{number:02d}" for number in range(1, 30)),
     *(f"BR-{number:02d}" for number in range(1, 29)),
 }
 
@@ -54,8 +54,8 @@ def test_all_openspec_scenarios_have_exact_collected_pytest_evidence():
     discovered = _discovered_scenario_ids()
     verification_rows = scenario_verification_rows()
     verification_report = "\n".join(verification_rows)
-    assert len(discovered) == 98
-    assert len(set(discovered)) == 98, "duplicate OpenSpec scenario IDs found"
+    assert len(discovered) == 103
+    assert len(set(discovered)) == 103, "duplicate OpenSpec scenario IDs found"
     assert set(discovered) == EXPECTED_IDS
     assert set(SCENARIO_TESTS) == set(discovered), verification_report
     assert all(SCENARIO_TESTS.values())
@@ -68,4 +68,4 @@ def test_all_openspec_scenarios_have_exact_collected_pytest_evidence():
     assert mapped_nodes <= collected, (
         f"stale node IDs: {sorted(mapped_nodes - collected)}\n{verification_report}"
     )
-    assert len(verification_rows) == 98
+    assert len(verification_rows) == 103

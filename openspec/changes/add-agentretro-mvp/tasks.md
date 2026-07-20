@@ -47,10 +47,10 @@
 - [x] 4.9 Implement explicit merge apply through the journaled write protocol, rejecting stale plans and requiring exact confirmation for delete, rename, move, or unresolved conflict.
 - [x] 4.10 Integrate sensitive purge with journaled vault and backup cleanup so retention never recreates sensitive content, and verify a residual scan before marking the purge complete.
 - [x] 4.11 Add tests whose names or metadata reference every Obsidian synchronization scenario `OS-01` through `OS-24`, and record the scenario-to-test mapping in verification evidence.
-- [ ] 4.12 Add failing tests for `OS-25` through `OS-29`, covering zero-write preview, deterministic cross-process apply fencing, byte preservation, no missing-file creation, unsafe marker/path rejection, and multi-target rollback.
-- [ ] 4.13 Implement `retro sync init --project <project> [--apply <plan-id>]` using contained target discovery, deterministic plans, retained backups, same-directory replacement, readback, and verified all-target restoration.
+- [x] 4.12 Add failing tests for `OS-25` through `OS-29`, covering zero-write preview, deterministic cross-process apply fencing, byte preservation, no missing-file creation, unsafe marker/path rejection, and multi-target rollback.
+- [x] 4.13 Implement `retro sync init --project <project> [--apply <plan-id>]` using contained target discovery, deterministic plans, retained backups, same-directory replacement, readback, and verified all-target restoration.
 - [ ] 4.14 Apply a confirmed real-vault initialization plan, retry only the known pending projection event, verify the rendered managed block and backup, and prove pending review candidates remain unchanged.
-- [ ] 4.15 Extend scenario verification evidence so `OS-25` through `OS-29` each map to a passing automated test or an explicitly justified manual check.
+- [x] 4.15 Extend scenario verification evidence so `OS-25` through `OS-29` each map to a passing automated test or an explicitly justified manual check.
 
 ## 5. Briefing, Diagnostics, and Codex Integration
 
@@ -69,6 +69,6 @@
 - [x] 6.2 Add security fixtures and repository-wide output assertions proving test secrets never reach logs, SQLite, model traces, backups, or vault files.
 - [x] 6.3 Add Windows GBK and UTF-8 subprocess smoke tests for `retro --help`, capture, review, and brief, and isolate any legacy output compatibility patch from business behavior.
 - [x] 6.4 Run the complete existing `ai-todo` suite and verify AgentRetro tests do not modify the existing Todo database or configuration behavior.
-- [ ] 6.5 Verify that every `CR-01..CR-22`, `KR-01..KR-24`, `OS-01..OS-29`, and `BR-01..BR-28` ID has at least one passing automated test or an explicitly justified manual check, with no orphan scenario or test reference.
+- [x] 6.5 Verify that every `CR-01..CR-22`, `KR-01..KR-24`, `OS-01..OS-29`, and `BR-01..BR-28` ID has at least one passing automated test or an explicitly justified manual check, with no orphan scenario or test reference.
 - [x] 6.6 Run `openspec validate add-agentretro-mvp --strict`, full tests, CLI smoke checks, and a final scope/security self-review before declaring implementation complete.
 - [x] 6.7 Close the preserved `ai-todo` Windows GBK `/exit` regression with a real subprocess test, document the executable AgentRetro first-use and read-only doctor workflow, and repeat the full compatibility gate without real user-state writes.

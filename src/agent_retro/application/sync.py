@@ -821,6 +821,13 @@ class SyncService:
         return self._finish(event_id, status, reason)
 
     @contextmanager
+    def project_lock(self, project_id: str):
+        """Expose the shared project lock to other bounded vault writers."""
+
+        with self._project_lock(project_id):
+            yield
+
+    @contextmanager
     def _project_lock(self, project_id: str):
         """Combine a thread lock with an OS-released file-region lock."""
 

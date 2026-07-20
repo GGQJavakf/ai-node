@@ -1,5 +1,8 @@
 """Read-only adapter for the existing product's model client configuration."""
 
+import json
+from collections.abc import Mapping
+
 from ai_todo_assistant.infrastructure.config import load_settings
 from ai_todo_assistant.infrastructure.llm import build_llm_client
 
@@ -43,3 +46,53 @@ def build_retro_llm_client_from_config(config: dict[str, object]):
 
     filtered = {key: config.get(key) for key in MODEL_CONFIG_KEYS}
     return build_llm_client(filtered)
+
+
+def probe_legacy_model_config(config: Mapping[str, object], *, timeout: int) -> bool:
+    """Run one minimal structured request without starting the app-server."""
+
+    filtered = {key: config.get(key) for key in MODEL_CONFIG_KEYS}
+    filtered["codex_use_app_server"] = False
+    client = build_llm_client(filtered)
+    if not client.is_configured():
+        return False
+    close = getattr(client, "close", None)
+    try:
+        response = client.request(
+            {
+                "model": config.get("model"),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return only the exact JSON object requested by the "
+                            "response schema."
+                        ),
+                    },
+                    {"role": "user", "content": "AgentRetro readiness probe."},
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "agentretro_model_probe",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"status": {"const": "ok"}},
+                            "required": ["status"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "temperature": 0,
+            },
+            stream=False,
+            timeout=timeout,
+        )
+        content = response["choices"][0]["message"]["content"]
+        return isinstance(content, str) and json.loads(content) == {"status": "ok"}
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+    finally:
+        if callable(close):
+            close()

@@ -77,6 +77,7 @@ def test_doctor_returns_exact_order_redacted_model_state_and_one_recovery_per_ch
             "model": "test-model",
             "api_key": "doctor-secret-must-not-leak",
         },
+        model_probe=lambda config: True,
         console_encoding=lambda: "utf-8",
     ).run()
 
@@ -88,11 +89,71 @@ def test_doctor_returns_exact_order_redacted_model_state_and_one_recovery_per_ch
     assert all(check.recovery for check in report.checks)
     model = report.by_name("model")
     assert model.status == "healthy"
-    assert model.summary == "configured"
+    assert model.summary == "reachable"
     serialized = json.dumps(report.as_dict(), ensure_ascii=False)
     assert "doctor-secret-must-not-leak" not in serialized
     assert str(tmp_path) not in serialized
     assert "test-model" not in serialized
+
+
+def test_doctor_reports_configured_but_unreachable_model_without_leaking_detail(
+    tmp_path,
+):
+    codex_home = tmp_path / "codex"
+    (codex_home / "sessions").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = _settings(tmp_path, vault)
+    calls = []
+
+    def fail_probe(config):
+        calls.append(dict(config))
+        raise RuntimeError("api_key=doctor-secret-must-not-leak")
+
+    report = DoctorService(
+        settings,
+        _Repository(),
+        codex_home=codex_home,
+        model_config_loader=lambda: {
+            "model": "test-model",
+            "api_key": "doctor-secret-must-not-leak",
+        },
+        model_probe=fail_probe,
+        console_encoding=lambda: "utf-8",
+    ).run()
+
+    model = report.by_name("model")
+    assert model.status == "warning"
+    assert model.summary == "unreachable"
+    assert (
+        model.recovery
+        == "verify existing ai-todo model connectivity and authentication"
+    )
+    assert len(calls) == 1
+    serialized = json.dumps(report.as_dict(), ensure_ascii=False)
+    assert "doctor-secret-must-not-leak" not in serialized
+    assert "test-model" not in serialized
+
+
+def test_doctor_never_probes_when_model_is_missing(tmp_path):
+    codex_home = tmp_path / "codex"
+    (codex_home / "sessions").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = _settings(tmp_path, vault)
+
+    report = DoctorService(
+        settings,
+        _Repository(),
+        codex_home=codex_home,
+        model_config_loader=lambda: {"model": ""},
+        model_probe=lambda config: (_ for _ in ()).throw(
+            AssertionError("missing model must not be probed")
+        ),
+        console_encoding=lambda: "utf-8",
+    ).run()
+
+    assert report.by_name("model").summary == "missing"
 
 
 def test_doctor_surfaces_rollback_purge_override_and_missing_model_without_paths(

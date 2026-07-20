@@ -5,12 +5,14 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from agent_retro.application.doctor import DoctorService
+from agent_retro.application.obsidian_init import ManagedBoundaryInitializer
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.purge import PurgeService
 from agent_retro.application.sync import ProjectionCoordinator, SyncService
 from agent_retro.infrastructure.codex_guidance import discover_managed_instruction
+from agent_retro.infrastructure.legacy_model import probe_legacy_model_config
 from agent_retro.infrastructure.obsidian import ObsidianProjection
-from agent_retro.infrastructure.settings import RetroSettings
+from agent_retro.infrastructure.settings import RetroSettings, effective_model_timeout
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
 
 
@@ -32,6 +34,18 @@ def build_projection_coordinator(
         repository,
         ObsidianProjection(vault, settings.backup_dir),
         SyncService(repository, vault, settings.backup_dir),
+    )
+
+
+def build_managed_boundary_initializer(
+    settings: RetroSettings, repository: RetroRepository
+) -> ManagedBoundaryInitializer:
+    """Compose the previewed optional-page marker initializer."""
+
+    return ManagedBoundaryInitializer(
+        repository,
+        settings.obsidian_root,
+        settings.backup_dir,
     )
 
 
@@ -90,5 +104,8 @@ def build_doctor_service(
         repository,
         codex_home=codex_home,
         model_config_loader=model_config_loader,
+        model_probe=lambda config: probe_legacy_model_config(
+            config, timeout=effective_model_timeout(settings, config)
+        ),
         integration_discoverer=discover_managed_instruction,
     )

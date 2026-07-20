@@ -222,6 +222,24 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "OS-24": (
         "tests/test_agentretro_obsidian.py::test_public_apply_rejects_noncanonical_plan_before_any_filesystem_write[extra_prose]",
     ),
+    "OS-25": (
+        "tests/test_agentretro_obsidian_init.py::test_os_25_preview_is_deterministic_complete_and_zero_write",
+    ),
+    "OS-26": (
+        "tests/test_agentretro_obsidian_init.py::test_os_26_matching_apply_preserves_prose_and_missing_page_stays_missing",
+    ),
+    "OS-27": (
+        "tests/test_agentretro_obsidian_init.py::test_os_27_changed_target_rejects_stale_plan_before_backup_or_write",
+    ),
+    "OS-28": (
+        "tests/test_agentretro_obsidian_init.py::test_os_28_directory_or_symlink_target_is_rejected_without_write",
+        "tests/test_agentretro_obsidian_init.py::test_os_28_unsafe_marker_or_encoding_rejects_complete_plan[invalid-utf8-\\xff]",
+    ),
+    "OS-29": (
+        "tests/test_agentretro_obsidian_init.py::test_os_29_multi_target_failure_restores_or_records_rollback_required[False]",
+        "tests/test_agentretro_obsidian_init.py::test_os_29_multi_target_failure_restores_or_records_rollback_required[True]",
+        "tests/test_agentretro_obsidian_init.py::test_os_29_retry_after_verified_rollback_reuses_retained_backup",
+    ),
     # Retrospective briefing and Codex integration
     "BR-01": (
         "tests/test_agentretro_subprocess.py::test_retro_subprocess_smoke_has_defined_exits_and_strict_console_output[utf-8]",

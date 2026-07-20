@@ -7,7 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Literal, Sequence
 
 from agent_retro.domain.models import Knowledge, KnowledgeType
 
@@ -54,10 +54,67 @@ _FILENAMES = {
 }
 _START = re.compile(rb"<!-- agentretro:(summary|index):start project=([^>\r\n]+) -->")
 _END = re.compile(rb"<!-- agentretro:(summary|index):end -->")
+ManagedBoundaryKind = Literal["summary", "index"]
 
 
 def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def inspect_managed_boundary(
+    content: bytes, project_id: str, kind: ManagedBoundaryKind
+) -> bool:
+    """Return whether one exact boundary exists, failing closed on marker drift."""
+
+    try:
+        content.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise BoundaryError("managed boundary target must be valid UTF-8") from exc
+    starts = list(_START.finditer(content))
+    ends = list(_END.finditer(content))
+    marker_count = content.count(b"<!-- agentretro:")
+    if not starts and not ends and marker_count == 0:
+        return False
+    if len(starts) != 1 or len(ends) != 1 or marker_count != 2:
+        raise BoundaryError("managed boundary must contain exactly one start/end pair")
+    start, end = starts[0], ends[0]
+    expected_kind = kind.encode("ascii")
+    if start.group(1) != expected_kind or end.group(1) != expected_kind:
+        raise BoundaryError("managed boundary kind does not match target")
+    try:
+        marker_project = start.group(2).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise BoundaryError("managed boundary project is not valid UTF-8") from exc
+    if marker_project != project_id:
+        raise BoundaryError("managed boundary project does not match mapping")
+    if end.start() <= start.end():
+        raise BoundaryError("managed boundary is nested or reversed")
+    return True
+
+
+def initialize_managed_boundary(
+    content: bytes, project_id: str, kind: ManagedBoundaryKind
+) -> bytes:
+    """Append one empty boundary while preserving every existing input byte."""
+
+    if inspect_managed_boundary(content, project_id, kind):
+        return content
+    newline = b"\r\n" if b"\r\n" in content else b"\n"
+    if not content:
+        separator = b""
+    elif content.endswith(newline + newline):
+        separator = b""
+    elif content.endswith(newline):
+        separator = newline
+    else:
+        separator = newline + newline
+    block = (
+        f"<!-- agentretro:{kind}:start project={project_id} -->".encode("utf-8")
+        + newline
+        + f"<!-- agentretro:{kind}:end -->".encode("utf-8")
+        + newline
+    )
+    return content + separator + block
 
 
 def replace_managed_block(content: bytes, project_id: str, inner: str) -> bytes:

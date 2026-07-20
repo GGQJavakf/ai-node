@@ -70,6 +70,7 @@ class DoctorService:
         *,
         codex_home: Path,
         model_config_loader: Callable[[], Mapping[str, object]],
+        model_probe: Callable[[Mapping[str, object]], bool] | None = None,
         integration_discoverer: Callable[[Path], bool] = lambda _: False,
         console_encoding: Callable[[], str | None] = lambda: (
             locale.getpreferredencoding(False)
@@ -79,6 +80,7 @@ class DoctorService:
         self.repository = repository
         self.codex_home = Path(codex_home)
         self.model_config_loader = model_config_loader
+        self.model_probe = model_probe
         self.integration_discoverer = integration_discoverer
         self.console_encoding = console_encoding
 
@@ -166,15 +168,37 @@ class DoctorService:
 
     def _model(self) -> DoctorCheck:
         try:
-            model = self.model_config_loader().get("model")
+            config = self.model_config_loader()
+            model = config.get("model")
         except Exception:
+            config = {}
             model = None
         configured = isinstance(model, str) and bool(model.strip())
+        if not configured:
+            return self._check(
+                "model",
+                "warning",
+                "missing",
+                "configure the existing ai-todo model",
+            )
+        if self.model_probe is None:
+            return self._check(
+                "model",
+                "warning",
+                "unverified",
+                "run a live model readiness probe",
+            )
+        try:
+            reachable = bool(self.model_probe(config))
+        except Exception:
+            reachable = False
+        if reachable:
+            return self._check("model", "healthy", "reachable")
         return self._check(
             "model",
-            "healthy" if configured else "warning",
-            "configured" if configured else "missing",
-            "none" if configured else "configure the existing ai-todo model",
+            "warning",
+            "unreachable",
+            "verify existing ai-todo model connectivity and authentication",
         )
 
     def _obsidian_root(self) -> DoctorCheck:
