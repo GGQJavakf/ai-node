@@ -1,0 +1,4 @@
+{"version":1,"type":"session_meta","timestamp":"2026-07-18T08:05:00Z","payload":{"id":"session-aborted","cwd":"C:/synthetic/project"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:05:01Z","payload":{"type":"task_started","id":"start-aborted"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:05:02Z","payload":{"type":"task_complete","id":"complete-before-abort"}}
+{"version":1,"type":"event_msg","timestamp":"2026-07-18T08:05:03Z","payload":{"type":"turn_aborted","id":"abort-1"}}

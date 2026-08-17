@@ -28,6 +28,117 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
+## AgentRetro 会话复盘
+
+AgentRetro 是与 `ai-todo` 独立的本地 CLI。安装 editable 包后使用 `retro`
+命令；它只在用户显式执行 `capture`、审核、同步或集成命令时工作，不安装
+hook、watcher 或常驻服务。
+
+默认状态位于 `<user-home>/.agentretro/`，SQLite 数据库和备份默认位于该
+目录内。可通过以下环境变量显式注入路径：
+
+| 配置 | 说明 |
+| --- | --- |
+| `AGENTRETRO_HOME` | AgentRetro 独立状态根目录 |
+| `AGENTRETRO_DB_PATH` | 状态根内的 SQLite 数据库 |
+| `AGENTRETRO_BACKUP_DIR` | 状态根内的同步和迁移备份 |
+| `AGENTRETRO_OBSIDIAN_ROOT` | 明确选定的 Obsidian vault 根目录 |
+| `CODEX_HOME` | 明确选定的本地 Codex 会话源 |
+
+### 首次使用快速流程
+
+以下命令均为显式单次操作，不会安装 hook、watcher 或常驻服务。先在当前
+PowerShell 会话选择 Codex home 和 Obsidian vault；如果使用默认 Codex home，
+可以省略第一行：
+
+```powershell
+$env:CODEX_HOME = "$env:USERPROFILE\.codex"
+$env:AGENTRETRO_OBSIDIAN_ROOT = '<obsidian-vault>'
+```
+
+先创建 Git 项目到 Obsidian 项目的审计映射，再运行单命令就绪度检查。首次
+`project map` 会初始化独立的 AgentRetro 状态和数据库，但不会写入知识文件：
+
+```powershell
+retro project map --root '<git-root>' --vault-project '<project-name>'
+retro project list
+retro doctor
+```
+
+`retro doctor` 本身只读；它会分别检查 Codex 会话源、安全上限、数据库和迁移、
+模型配置、项目映射、vault、备份、同步/清除恢复状态、全局集成和控制台编码，
+并为 warning 或 error 给出恢复命令。若尚未执行任何状态命令，可先运行 doctor
+查看配置，但新数据库和项目映射会显示为尚未就绪。
+
+显式捕获一个已完成会话后，从 JSON 结果读取 `<session-id>`，再执行模型审核：
+
+```powershell
+retro --json capture --last
+retro --json review run --session '<session-id>'
+retro --json review list --status pending_review
+retro --json review show '<candidate-id>'
+```
+
+`review run` 会调用已配置的模型；达到阈值且通过确定性门禁的候选可能自动接受，
+并在同一命令内尝试投影到 vault。未自动接受的候选必须人工选择接受、编辑或拒绝：
+
+```powershell
+retro --json review accept '<candidate-id>'
+# 或：retro --json review edit '<candidate-id>' --text '<revised-text>'
+# 或：retro --json review reject '<candidate-id>'
+```
+
+接受或编辑会更新 AgentRetro SQLite，并对已映射项目尝试写入三个托管知识文件；
+写入前会执行路径、marker、哈希和恢复状态预检。随后可以只读生成任务简报，并
+预览全局 Codex 指引集成：
+
+```powershell
+retro brief '<current-task>' --project '<project-name>' --markdown
+retro integrate codex
+```
+
+最后一条命令只输出 `<codex-home>/AGENTS.md` 的完整预览；只有显式执行
+`retro integrate codex --apply` 才会备份并写入托管块。AgentRetro 的任何命令
+都不会写入 Codex 原生 memory。
+
+知识抽取和独立审核以只读方式复用现有 AI 配置中经过过滤的 model 与
+timeout；凭据、token 和完整原始配置不会写入 AgentRetro。`retro brief` 是确定性
+本地查询，不调用模型、向量库或 Codex 原生 memory。
+
+主要命令：
+
+| 命令 | 行为 |
+| --- | --- |
+| `retro capture --last` / `--session <id>` | 显式捕获一个已完成的 Codex 会话 |
+| `retro review run --session <id>` | 执行确定性门禁和独立模型审核 |
+| `retro review list/show/accept/edit/reject` | 查看证据并人工决定知识生命周期 |
+| `retro sync conflicts/reconcile/retry` | 检查、处理或恢复 Obsidian 投影 |
+| `retro merge plan/apply` | 预览受控深度整理，并仅应用当前且已精确确认的计划 |
+| `retro kb purge <id> --plan` | 零写入列出敏感清除的全部已知副本与操作 ID |
+| `retro kb purge <id> --apply-plan ...` | 仅在逐项确认当前计划的全部操作 ID 后清除并验证残留 |
+| `retro brief <task> --project <id>` | 按任务与项目生成有证据引用的本地摘要 |
+| `retro doctor` | 只读检查数据库、路径、恢复和编码状态 |
+| `retro integrate codex` | 零写入预览 canonical `<codex-home>/AGENTS.md` 变更 |
+| `retro integrate codex --apply` / `--remove` | 显式应用或移除唯一托管块，并校验备份和回读 |
+
+接受的项目知识由同一条命令事务后投影到三个 AgentRetro 托管文件：
+`规则.md`、`经验.md` 和 `任务状态.md`。SQLite 仍是权威源；预检或写入失败会
+标记可恢复状态，不会把 vault 内容静默反向覆盖数据库。
+
+发布边界是本地、显式且可回滚的：会话只在用户执行单次 `capture` 后进入复盘；
+接受、编辑、冲突解决、归档或完成清除会在同一命令内尝试一次三文件托管投影。
+写入用户自有正文的深度整理必须先预览，再显式应用当前计划；删除、重命名、
+移动和冲突必须逐个确认其精确操作 ID。敏感清除同样先生成零写入不可变计划，
+只有确认该计划的每个操作 ID 后才执行，并在残留验证通过前绝不报告成功。
+`kb` 是知识命令的 canonical 名称；`knowledge` 作为兼容别名保留，两者使用同一解析器和执行路径。
+全局 Codex 指引始终默认预览，只有显式 `--apply` 或 `--remove` 才修改 canonical
+`<codex-home>/AGENTS.md` 的唯一托管块。
+
+自动化测试只使用 pytest 临时目录和确定性 model doubles，不读取、哈希或
+写入真实 Codex home、Obsidian vault、全局 `AGENTS.md`、Codex 原生 memory 或外部系统。
+产品运行时也不读取或写入 Codex 原生 memory；需要历史上下文时仅按任务调用
+本地、确定性的 `retro brief`。
+
 依赖列表：
 
 - `rich>=13.0.0`

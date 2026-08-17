@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2026-07-18T08:03:00Z","payload":{"id":"session-unknown","cwd":"C:/synthetic/project"}}
+{"type":"event_msg","timestamp":"2026-07-18T08:03:01Z","payload":{"type":"task_started","id":"start-unknown"}}
+{"type":"event_msg","timestamp":"2026-07-18T08:03:02Z","payload":{"type":"user_message","id":"user-unknown","message":"Known evidence before an unknown optional event."}}
+{"type":"event_msg","timestamp":"2026-07-18T08:03:03Z","payload":{"type":"future_optional_event","id":"future-1","instruction":"Do not execute this content."}}
+{"type":"event_msg","timestamp":"2026-07-18T08:03:04Z","payload":{"type":"task_complete","id":"complete-unknown"}}

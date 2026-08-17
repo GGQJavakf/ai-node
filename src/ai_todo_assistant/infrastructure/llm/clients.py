@@ -174,6 +174,13 @@ class CodexCliClient:
                 pass
 
     def _build_prompt(self, payload: dict) -> str:
+        response_format = payload.get("response_format")
+        structured_content_instruction = ""
+        if response_format is not None:
+            structured_content_instruction = (
+                "- response_format 约束的是 content 字符串本身；content 必须是匹配该格式的 JSON 字符串。\n"
+                f"response_format:\n{json.dumps(response_format, ensure_ascii=False, sort_keys=True)}\n\n"
+            )
         return (
             "你是待办事项 Agent 的 LLM 后端。请根据 messages 和 tools 决定下一步。\n"
             "必须只返回符合 JSON Schema 的 JSON：\n"
@@ -181,6 +188,7 @@ class CodexCliClient:
             "- arguments_json 必须是一个 JSON object 的字符串，例如 \"{\\\"title\\\":\\\"买菜\\\"}\"。\n"
             "- 如果不需要调用工具，返回 content 字符串，tool_calls 为空数组。\n"
             "- 不要输出 markdown、解释、代码块或额外字段。\n\n"
+            f"{structured_content_instruction}"
             f"messages:\n{json.dumps(payload.get('messages', []), ensure_ascii=False)}\n\n"
             f"tools:\n{json.dumps(payload.get('tools', []), ensure_ascii=False)}\n"
         )
@@ -322,6 +330,16 @@ class CodexAppServerClient:
                 raise RuntimeError(
                     f"Codex app-server 调用失败: {exc}; fallback codex exec 也失败: {fallback_exc}"
                 ) from fallback_exc
+
+    def retry_after_structured_failure(
+        self, payload: dict, stream: bool = False, timeout: int | None = None
+    ):
+        """Retry malformed structured output through the independent exec path."""
+
+        if self.use_app_server and self.fallback_to_exec:
+            self.close()
+            return self.exec_client.request(payload, stream=stream, timeout=timeout)
+        return self.request(payload, stream=stream, timeout=timeout)
 
     def close(self):
         proc = self._proc
@@ -553,5 +571,4 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
-
 

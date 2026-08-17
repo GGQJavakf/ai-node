@@ -21,13 +21,14 @@ TODO CLI 交互层
 import sys
 import os
 import shlex
+import sqlite3
 from datetime import datetime
 
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-    from prompt_toolkit.completion import WordCompleter, Completer, Completion
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.styles import Style
     PROMPT_TOOLKIT_AVAILABLE = True
 except ImportError:
@@ -36,7 +37,6 @@ except ImportError:
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import Spinner
 from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt
@@ -451,8 +451,17 @@ class TodoCLI:
             if source_filter:
                 work_items = [item for item in work_items if item.source == source_filter]
             work_items = _dedupe_work_items(work_items)
+        evidence_by_item = {}
+        evidence_read_failures = []
+        if work_items:
+            repo = self._workflow_repo()
+            for item in work_items:
+                try:
+                    evidence_by_item[item.id] = repo.list_evidence(item.id)
+                except (OSError, ValueError, sqlite3.Error) as exc:
+                    evidence_read_failures.append((item.id, type(exc).__name__))
 
-        rows = _daily_triage_work_item_rows(work_items)
+        rows = _daily_triage_work_item_rows(work_items, evidence_by_item)
         for todo in self._rank_tasks(todos):
             rows.append(
                 {
@@ -468,7 +477,10 @@ class TodoCLI:
             )
 
         if not rows:
-            return "📋 每日工作分诊\n\n  暂无任务"
+            result = "📋 每日工作分诊\n\n  暂无任务"
+            if evidence_read_failures:
+                result += f"\n\n{_evidence_read_failure_message(evidence_read_failures)}"
+            return result
 
         table = Table(title="📋 每日工作分诊", expand=True)
         table.add_column("分组", width=10, no_wrap=True)
@@ -485,6 +497,8 @@ class TodoCLI:
                 _daily_triage_reason_label(row["reason"]),
                 row["next"],
             )
+        if evidence_read_failures:
+            table.caption = _evidence_read_failure_message(evidence_read_failures)
         return table
 
     def _work_items_for_list(self, subcmd="", source_filter=""):
@@ -1340,7 +1354,7 @@ TodoAgent CLI
     def _handle_natural_language(self, text):
         """处理自然语言命令 - 支持流式输出"""
         # 显示 Thinking 状态
-        with self.console.status("[cyan]Thinking...[/cyan]") as status:
+        with self.console.status("[cyan]Thinking...[/cyan]"):
             try:
                 # 准备流式输出
                 full_response = []
@@ -1381,12 +1395,22 @@ TodoAgent CLI
                 return True
 
             # 尝试作为 Markdown 渲染
+            markdown = Markdown(response)
+            output = self.console.file
+            encoding = getattr(output, "encoding", None) or "utf-8"
             try:
-                markdown = Markdown(response)
+                rendered = "".join(
+                    segment.text for segment in self.console.render(markdown)
+                )
+                rendered.encode(encoding, errors="strict")
+            except UnicodeEncodeError:
+                safe_response = response.encode(
+                    encoding, errors="replace"
+                ).decode(encoding, errors="replace")
+                output.write(safe_response + "\n")
+                output.flush()
+            else:
                 self.console.print(markdown)
-            except:
-                # 如果不是 Markdown，直接打印
-                self.console.print(response)
 
         return True
 
@@ -1443,7 +1467,7 @@ TodoAgent CLI
                 self.console.print("\n[yellow]EOF 退出[/yellow]")
                 break
 
-        self.console.print("\n👋 Goodbye!")
+        self._display_response("\n👋 Goodbye!")
 
 
 def main():
@@ -1464,10 +1488,11 @@ def _dedupe_work_items(items):
     return deduped
 
 
-def _daily_triage_work_item_rows(items):
+def _daily_triage_work_item_rows(items, evidence_by_item=None):
+    evidence_by_item = evidence_by_item or {}
     grouped = {name: [] for name in _DAILY_TRIAGE_GROUPS}
     for item in items:
-        group = _daily_triage_group(item)
+        group = _daily_triage_group(item, evidence_by_item.get(item.id, []))
         if not group or group not in grouped:
             continue
         grouped[group].append(item)
@@ -1479,7 +1504,7 @@ def _daily_triage_work_item_rows(items):
         if limit:
             candidates = candidates[:limit]
         for item in candidates:
-            reason = _work_item_triage_reason(item)
+            reason = _work_item_triage_reason(item, evidence_by_item.get(item.id, []))
             stale = _is_work_item_stale_today(item)
             reason_text = f"{reason} [stale]" if stale and item.status != WorkItemStatus.DONE.value else reason
             status_style = "yellow" if item.status == "blocked" else "grey50" if item.status == "done" else "cyan"
@@ -1517,6 +1542,9 @@ def _daily_triage_reason_label(reason):
         "blocked by Redmine": "Redmine 阻塞",
         "blocked by MR": "MR 阻塞",
         "blocked by OpenSpec": "OpenSpec 阻塞",
+        "MR merged but Redmine not closed": "MR 合并后待关 Redmine",
+        "Redmine resolved; validation missing": "Redmine 已解决待验证",
+        "OpenSpec completed but not archived": "OpenSpec 已完成待归档",
         "MR merged but closeout missing": "MR 已合并待闭环",
         "Redmine closeout missing": "Redmine 待闭环",
         "OpenSpec closeout missing": "OpenSpec 待归档",
@@ -1627,16 +1655,24 @@ _DAILY_TRIAGE_GROUPS = [
 ]
 
 
-def _daily_triage_group(item):
+def _evidence_read_failure_message(failures):
+    details = ", ".join(f"{item_id[:8]} ({error_type})" for item_id, error_type in failures)
+    return f"⚠ 证据读取失败: {details}"
+
+
+def _daily_triage_group(item, evidence=None):
     if item.status == WorkItemStatus.ARCHIVED.value:
         return ""
     if item.status == WorkItemStatus.DONE.value:
         return "recently completed"
-    reason = _work_item_triage_reason(item)
+    reason = _work_item_triage_reason(item, evidence)
     stale = _is_work_item_stale_today(item)
     if item.status == WorkItemStatus.BLOCKED.value:
         return "blocked"
     if reason in {
+        "MR merged but Redmine not closed",
+        "Redmine resolved; validation missing",
+        "OpenSpec completed but not archived",
         "MR merged but closeout missing",
         "Redmine closeout missing",
         "OpenSpec closeout missing",
@@ -1654,10 +1690,10 @@ def _daily_triage_group(item):
     return "active needs action" if item.status == WorkItemStatus.ACTIVE.value else ""
 
 
-def _work_item_triage_reason(item):
+def _work_item_triage_reason(item, evidence=None):
     if item.status == WorkItemStatus.DONE.value:
         return "recently completed"
-    text = _work_item_context_text(item)
+    text = _work_item_context_text(item, evidence)
     if item.merge_conflicts:
         return "merge conflict needs manual resolution"
     if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "redmine"):
@@ -1666,6 +1702,32 @@ def _work_item_triage_reason(item):
         return "blocked by MR"
     if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "openspec"):
         return "blocked by OpenSpec"
+    if _mentions(text, "mr merged but redmine not closed", "mr merged redmine not closed"):
+        return "MR merged but Redmine not closed"
+    if (
+        _mentions(text, "mr", "gitlab", "merge_request", "!")
+        and _mentions(text, "merged")
+        and _mentions(text, "redmine")
+        and _mentions(text, "not closed", "still open", "open", "unresolved", "未关闭")
+    ):
+        return "MR merged but Redmine not closed"
+    if _mentions(text, "redmine resolved but validation evidence missing"):
+        return "Redmine resolved; validation missing"
+    if (
+        _mentions(text, "redmine")
+        and _mentions(text, "resolved", "closed", "已解决", "已关闭")
+        and _mentions(text, "validation", "validate", "test", "review", "evidence", "验证")
+        and _mentions(text, "missing", "required", "缺少", "需要", "未")
+    ):
+        return "Redmine resolved; validation missing"
+    if _mentions(text, "openspec completed but not archived"):
+        return "OpenSpec completed but not archived"
+    if (
+        _mentions(text, "openspec")
+        and _mentions(text, "completed", "complete", "done", "tasks complete", "artifacts complete", "已完成")
+        and _mentions(text, "not archived", "archive missing", "unarchived", "未归档")
+    ):
+        return "OpenSpec completed but not archived"
     if _mentions(text, "mr", "gitlab", "!") and _mentions(text, "merged") and _mentions(text, "closeout", "missing"):
         return "MR merged but closeout missing"
     if _mentions(text, "redmine") and _mentions(text, "closeout", "closed_loop", "resolution", "missing"):
@@ -1682,12 +1744,16 @@ def _work_item_triage_reason(item):
     return "blocked" if item.status == WorkItemStatus.BLOCKED.value else "needs action"
 
 
-def _work_item_context_text(item):
+def _work_item_context_text(item, evidence=None):
     refs = [
         f"{ref.get('source', '')}:{ref.get('source_ref', '')}"
         for ref in item.source_refs
         if isinstance(ref, dict)
     ]
+    evidence_parts = []
+    for entry in evidence or []:
+        evidence_parts.append(getattr(entry, "summary", ""))
+        evidence_parts.append(getattr(entry, "output_excerpt", ""))
     parts = [
         item.source,
         item.source_ref,
@@ -1697,6 +1763,7 @@ def _work_item_context_text(item):
         *item.source_identities,
         *refs,
         *item.merge_conflicts,
+        *evidence_parts,
     ]
     return " ".join(str(part) for part in parts if part).lower()
 

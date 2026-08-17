@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import _path  # noqa: F401
 from ai_todo_assistant.application.workflow import WorkItemService, WorkflowSyncService
 from ai_todo_assistant.application.workflow.codex_reports import CodexTaskReport
-from ai_todo_assistant.domain.workflow import Evidence, EvidenceType, WorkItem
+from ai_todo_assistant.domain.workflow import Evidence, EvidenceType, WorkItem, WorkItemStatus
 from ai_todo_assistant.domain.workflow import SourceSnapshot
 from ai_todo_assistant.infrastructure.persistence import SQLiteWorkflowRepository
 
@@ -27,6 +27,25 @@ class FakeOpenSpec:
         return SourceSnapshot(source="openspec", project_path=project_path, summary="apply ready")
 
 
+class CloseoutGapOpenSpec(FakeOpenSpec):
+    def list_changes(self, project_path):
+        return SourceSnapshot(
+            source="openspec",
+            project_path=project_path,
+            summary="1 active changes",
+            command="openspec list --json",
+            facts={
+                "changes": [
+                    {
+                        "name": "add-closeout",
+                        "tasks": {"complete": 3, "total": 3},
+                        "archived": False,
+                    }
+                ]
+            },
+        )
+
+
 class FakePlaybook:
     def redmine_issue(self, project_path, issue_id):
         return SourceSnapshot(
@@ -41,6 +60,56 @@ class FakePlaybook:
 
     def closeout_gaps(self, project_path):
         return SourceSnapshot(source="playbook", project_path=project_path, summary="0 closeout gaps")
+
+
+class CloseoutGapPlaybook(FakePlaybook):
+    def closeout_gaps(self, project_path):
+        return SourceSnapshot(
+            source="playbook",
+            project_path=project_path,
+            summary="3 closeout gaps",
+            command="playbook workspace task closeout --dry-run --output json",
+            facts={
+                "gaps": [
+                    {
+                        "name": "redmine",
+                        "mr": {"iid": 42, "state": "merged"},
+                        "redmine": {"id": 232211, "status": "open"},
+                    },
+                    {
+                        "name": "validation",
+                        "redmine": {"id": 232212, "status": "resolved"},
+                        "validation": {"missing": True},
+                    },
+                    {
+                        "name": "openspec",
+                        "openspec": {"change": "add-closeout", "tasks_complete": True, "archived": False},
+                    },
+                ]
+            },
+        )
+
+
+class UnavailableSnapshotPlaybook(FakePlaybook):
+    def workspace_status(self, project_path):
+        return SourceSnapshot(
+            source="playbook",
+            project_path=project_path,
+            summary="playbook unavailable",
+            command="playbook workspace task status --output json --full",
+            success=False,
+            error="playbook missing",
+        )
+
+    def closeout_gaps(self, project_path):
+        return SourceSnapshot(
+            source="playbook",
+            project_path=project_path,
+            summary="playbook unavailable",
+            command="playbook workspace task closeout --dry-run --output json",
+            success=False,
+            error="closeout dry-run unavailable",
+        )
 
 
 class UnavailablePlaybook(FakePlaybook):
@@ -359,6 +428,88 @@ class TestWorkflowSyncServices(unittest.TestCase):
         self.assertIsNotNone(items[0].last_synced_at)
         self.assertEqual(len(self.repository.list_evidence(items[0].id)), 6)
 
+    def test_sync_project_records_closeout_gap_evidence_on_matching_work_items(self):
+        redmine = WorkItem(title="Redmine 232211 closeout", source="redmine", source_ref="232211")
+        redmine.source_identities = ["redmine:232211", "gitlab-mr:repo:42"]
+        redmine.project_path = "repo"
+        self.repository.save_work_item(redmine)
+        validation = WorkItem(title="Redmine 232212 validation", source="redmine", source_ref="232212")
+        validation.source_identities = ["redmine:232212"]
+        validation.project_path = "repo"
+        self.repository.save_work_item(validation)
+        openspec = WorkItem(title="OpenSpec add-closeout", source="openspec", source_ref="add-closeout")
+        openspec.source_identities = ["openspec:add-closeout"]
+        openspec.project_path = "repo"
+        self.repository.save_work_item(openspec)
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=CloseoutGapPlaybook(),
+        )
+
+        service.sync_project("repo")
+
+        redmine_evidence = [item.summary for item in self.repository.list_evidence(redmine.id)]
+        validation_evidence = [item.summary for item in self.repository.list_evidence(validation.id)]
+        openspec_evidence = [item.summary for item in self.repository.list_evidence(openspec.id)]
+        self.assertTrue(any("MR merged but Redmine not closed" in summary for summary in redmine_evidence))
+        self.assertTrue(any("Redmine resolved but validation evidence missing" in summary for summary in validation_evidence))
+        self.assertTrue(any("OpenSpec completed but not archived" in summary for summary in openspec_evidence))
+
+    def test_sync_project_records_openspec_completion_archive_gap_from_openspec_snapshot(self):
+        openspec = WorkItem(title="OpenSpec add-closeout", source="openspec", source_ref="add-closeout")
+        openspec.source_identities = ["openspec:add-closeout"]
+        openspec.project_path = "repo"
+        openspec = self.repository.save_work_item(openspec)
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=CloseoutGapOpenSpec(),
+            playbook=FakePlaybook(),
+        )
+
+        service.sync_project("repo")
+
+        summaries = [item.summary for item in self.repository.list_evidence(openspec.id)]
+        self.assertTrue(any("OpenSpec completed but not archived" in summary for summary in summaries))
+
+    def test_closeout_gap_evidence_is_idempotent_and_falls_back_to_project_context(self):
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=CloseoutGapPlaybook(),
+        )
+
+        service.sync_project("repo")
+        service.sync_project("repo")
+
+        context = self.repository.find_work_item_by_source("playbook", "sync:repo")
+        evidence = [
+            item.summary
+            for item in self.repository.list_evidence(context.id)
+            if item.summary.startswith("closeout gap:")
+        ]
+        self.assertEqual(len(evidence), 3)
+        self.assertEqual(len(set(evidence)), 3)
+
+    def test_sync_project_records_unavailable_connector_evidence_without_aborting(self):
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=UnavailableSnapshotPlaybook(),
+        )
+
+        snapshots = service.sync_project("repo")
+
+        self.assertEqual(len(snapshots), 4)
+        context = self.repository.find_work_item_by_source("playbook", "sync:repo")
+        summaries = [item.summary for item in self.repository.list_evidence(context.id)]
+        self.assertTrue(any("playbook unavailable" in summary for summary in summaries))
+        self.assertTrue(any("closeout dry-run unavailable" in item.output_excerpt for item in self.repository.list_evidence(context.id)))
+
     def test_status_summary_marks_stale_sync_data(self):
         item = WorkItemService(self.repository).create_manual("旧同步工作项")
         item.last_synced_at = (datetime.now() - timedelta(hours=25)).strftime("%Y-%m-%d %H:%M:%S")
@@ -368,6 +519,175 @@ class TestWorkflowSyncServices(unittest.TestCase):
 
         self.assertIn("同步已过期", summary)
         self.assertIn("/sync", summary)
+
+    def test_completion_signals_in_unfinished_and_blocked_close_codex_items(self):
+        for thread_id, title in [
+            ("thread-mr", "MR merged task"),
+            ("thread-redmine", "Redmine resolved task"),
+            ("thread-openspec", "OpenSpec archived task"),
+            ("thread-playbook", "Playbook closeout task"),
+            ("thread-validation", "Validation passed task"),
+        ]:
+            self.repository.save_work_item(WorkItem(title=title, source="codex", source_ref=thread_id))
+        blocked = self.repository.find_work_item_by_source("codex", "thread-redmine")
+        blocked.status = WorkItemStatus.BLOCKED.value
+        self.repository.save_work_item(blocked)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=5,
+            unfinished=[
+                {
+                    "thread_id": "thread-mr",
+                    "title": "MR merged task",
+                    "completion_signals": ["MR !42 merged"],
+                },
+                {
+                    "thread_id": "thread-openspec",
+                    "title": "OpenSpec archived task",
+                    "summary": "OpenSpec change archived and tasks complete",
+                },
+                {
+                    "thread_id": "thread-playbook",
+                    "title": "Playbook closeout task",
+                    "evidence": "Playbook closeout verified",
+                },
+                {
+                    "thread_id": "thread-validation",
+                    "title": "Validation passed task",
+                    "completion_signals": ["final validation passed with no follow-up"],
+                },
+            ],
+            blocked=[
+                {
+                    "thread_id": "thread-redmine",
+                    "title": "Redmine resolved task",
+                    "summary": "Redmine 232211 resolved",
+                }
+            ],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).import_codex_report(report)
+
+        self.assertEqual(result.completed, 5)
+        for thread_id in ["thread-mr", "thread-redmine", "thread-openspec", "thread-playbook", "thread-validation"]:
+            item = self.repository.find_work_item_by_source("codex", thread_id)
+            self.assertEqual(item.status, WorkItemStatus.DONE.value)
+            self.assertTrue(self.repository.list_evidence(item.id))
+
+    def test_closeout_gaps_and_ambiguous_titles_do_not_close_codex_items(self):
+        entries = [
+            {
+                "thread_id": "thread-mr-gap",
+                "title": "MR closeout",
+                "summary": "MR merged but Redmine not closed",
+            },
+            {
+                "thread_id": "thread-validation-gap",
+                "title": "Redmine validation",
+                "summary": "Redmine resolved but validation evidence missing",
+            },
+            {
+                "thread_id": "thread-openspec-gap",
+                "title": "OpenSpec closeout",
+                "summary": "OpenSpec completed but not archived",
+            },
+            {
+                "thread_id": "thread-ambiguous-title",
+                "title": "Investigate why MR !42 merged detection is wrong",
+            },
+        ]
+        for entry in entries:
+            self.repository.save_work_item(
+                WorkItem(
+                    title=entry["title"],
+                    source="codex",
+                    source_ref=entry["thread_id"],
+                )
+            )
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=len(entries),
+            unfinished=entries,
+            blocked=[],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).import_codex_report(report)
+
+        self.assertEqual(result.completed, 0)
+        for entry in entries:
+            item = self.repository.find_work_item_by_source("codex", entry["thread_id"])
+            self.assertEqual(item.status, WorkItemStatus.ACTIVE.value)
+
+    def test_done_items_become_reopen_candidates_without_status_regression(self):
+        done = WorkItem(title="已闭环但又出现", source="codex", source_ref="thread-done")
+        done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(done)
+        strong_done = WorkItem(title="已闭环且有完成证据", source="codex", source_ref="thread-strong")
+        strong_done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(strong_done)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=2,
+            unfinished=[
+                {"thread_id": "thread-done", "title": "已闭环但又出现", "next_action": "继续处理"},
+                {
+                    "thread_id": "thread-strong",
+                    "title": "已闭环且有完成证据",
+                    "completion_signals": ["writeback complete"],
+                },
+            ],
+            blocked=[],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).import_codex_report(report)
+
+        self.assertEqual(result.reopen_candidates, 1)
+        self.assertEqual(result.unchanged, 2)
+        self.assertIn("reopen candidate", " ".join(result.details))
+        self.assertEqual(self.repository.find_work_item_by_source("codex", "thread-done").status, WorkItemStatus.DONE.value)
+        self.assertEqual(self.repository.find_work_item_by_source("codex", "thread-strong").status, WorkItemStatus.DONE.value)
+        self.assertTrue(self.repository.list_evidence(strong_done.id))
+
+    def test_preview_completion_signal_detection_does_not_write(self):
+        self.repository.save_work_item(WorkItem(title="待预览闭环", source="codex", source_ref="thread-preview"))
+        done = WorkItem(title="预览 reopen 候选", source="codex", source_ref="thread-reopen")
+        done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(done)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=2,
+            unfinished=[
+                {
+                    "thread_id": "thread-preview",
+                    "title": "待预览闭环",
+                    "completion_signals": ["MR !42 merged"],
+                },
+                {"thread_id": "thread-reopen", "title": "预览 reopen 候选"},
+            ],
+            blocked=[],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).preview_codex_report(report)
+
+        self.assertEqual(result.completed, 1)
+        self.assertEqual(result.reopen_candidates, 1)
+        self.assertEqual(
+            self.repository.find_work_item_by_source("codex", "thread-preview").status,
+            WorkItemStatus.ACTIVE.value,
+        )
+        self.assertEqual(self.repository.list_evidence(self.repository.find_work_item_by_source("codex", "thread-preview").id), [])
 
 
 if __name__ == "__main__":

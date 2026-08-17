@@ -551,6 +551,123 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertIn("recently completed closeout", all_rendered)
         self.assertIn("完成", all_rendered)
 
+    def test_list_default_uses_local_evidence_for_closeout_gap_reasons(self):
+        today = datetime.now().strftime("%Y-%m-%d 09:00:00")
+        mr_redmine = WorkItem(
+            title="MR !42 closeout",
+            source="codex",
+            source_ref="thread-mr",
+            last_synced_at=today,
+        )
+        mr_redmine = self.repository.save_work_item(mr_redmine)
+        redmine_validation = WorkItem(
+            title="Redmine 232212 validation",
+            source="redmine",
+            source_ref="232212",
+            last_synced_at=today,
+        )
+        redmine_validation = self.repository.save_work_item(redmine_validation)
+        openspec = WorkItem(
+            title="OpenSpec add-closeout",
+            source="openspec",
+            source_ref="add-closeout",
+            last_synced_at=today,
+        )
+        openspec = self.repository.save_work_item(openspec)
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-1",
+                work_item_id=mr_redmine.id,
+                evidence_type="snapshot",
+                summary="closeout gap: MR merged but Redmine not closed",
+                command="playbook workspace task closeout --dry-run --output json",
+                output_excerpt="",
+                success=True,
+                source="playbook",
+                created_at=today,
+            )
+        )
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-2",
+                work_item_id=redmine_validation.id,
+                evidence_type="snapshot",
+                summary="closeout gap: Redmine resolved but validation evidence missing",
+                command="playbook workspace task closeout --dry-run --output json",
+                output_excerpt="",
+                success=True,
+                source="playbook",
+                created_at=today,
+            )
+        )
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-3",
+                work_item_id=openspec.id,
+                evidence_type="snapshot",
+                summary="closeout gap: OpenSpec completed but not archived",
+                command="openspec list --json",
+                output_excerpt="",
+                success=True,
+                source="openspec",
+                created_at=today,
+            )
+        )
+
+        rendered = _render_table(self.cli._handle_slash_command("/list"))
+
+        self.assertEqual(rendered.count("待闭环"), 3)
+        self.assertIn("MR 合并后待关 Redmine", rendered)
+        self.assertIn("Redmine 已解决待验证", rendered)
+        self.assertIn("OpenSpec 已完成待归档", rendered)
+
+    def test_list_preserves_loaded_evidence_and_reports_later_read_failure(self):
+        today = datetime.now().strftime("%Y-%m-%d 09:00:00")
+        first = self.repository.save_work_item(
+            WorkItem(
+                title="MR !42 closeout",
+                source="codex",
+                source_ref="thread-first",
+                last_synced_at=today,
+            )
+        )
+        second = self.repository.save_work_item(
+            WorkItem(
+                title="Second item",
+                source="codex",
+                source_ref="thread-second",
+                last_synced_at=today,
+            )
+        )
+        self.repository.add_evidence(
+            SimpleNamespace(
+                id="gap-first",
+                work_item_id=first.id,
+                evidence_type="snapshot",
+                summary="closeout gap: MR merged but Redmine not closed",
+                command="playbook workspace task closeout --dry-run --output json",
+                output_excerpt="",
+                success=True,
+                source="playbook",
+                created_at=today,
+            )
+        )
+        original_list_evidence = self.repository.list_evidence
+        self.repository.list_work_items = lambda include_closed=False: [first, second]
+
+        def list_evidence(work_item_id):
+            if work_item_id == second.id:
+                raise OSError("simulated evidence read failure")
+            return original_list_evidence(work_item_id)
+
+        self.repository.list_evidence = list_evidence
+
+        rendered = _render_table(self.cli._handle_slash_command("/list"))
+
+        self.assertIn("MR 合并后待关 Redmine", rendered)
+        self.assertIn("证据读取失败", rendered)
+        self.assertIn(second.id[:8], rendered)
+
     def test_list_default_source_todo_filter_suppresses_work_items(self):
         self.cli.manager.add("只看 Todo")
         WorkItemService(self.repository).create_manual("不应出现", next_action="继续")
@@ -869,6 +986,55 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
 
         self.assertIn("跳过: 标题冲突任务", response)
         self.assertIn("保留 done: 已闭环任务", response)
+
+    def test_cli_sync_reports_detected_completion_and_reopen_candidates(self):
+        self.repository.save_work_item(WorkItem(title="MR 已合并任务", source="codex", source_ref="thread-mr"))
+        done = WorkItem(title="疑似重开任务", source="codex", source_ref="thread-reopen")
+        done.status = WorkItemStatus.DONE.value
+        self.repository.save_work_item(done)
+        with open(os.path.join(self.report_dir, "2026-06-21.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-21T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-mr",
+                            "title": "MR 已合并任务",
+                            "completion_signals": ["MR !42 merged"],
+                        },
+                        {
+                            "thread_id": "thread-reopen",
+                            "title": "疑似重开任务",
+                            "next_action": "继续验证",
+                        },
+                    ],
+                    "blocked": [],
+                    "completed": [],
+                },
+                handle,
+            )
+
+        class FakeSyncService:
+            def __init__(self, repository):
+                self.repository = repository
+
+            def sync_project(self, project_path):
+                return [SourceSnapshot(source="git", project_path=project_path, summary="branch=main")]
+
+        with patch("ai_todo_assistant.presentation.cli.WorkflowSyncService", FakeSyncService):
+            response = self.cli._handle_slash_command("/sync D:/repo")
+
+        self.assertIn("completed=1", response)
+        self.assertIn("reopen_candidates=1", response)
+        self.assertIn("reopen candidate", response)
+        self.assertEqual(
+            self.repository.find_work_item_by_source("codex", "thread-mr").status,
+            WorkItemStatus.DONE.value,
+        )
+        self.assertEqual(
+            self.repository.find_work_item_by_source("codex", "thread-reopen").status,
+            WorkItemStatus.DONE.value,
+        )
 
     def test_cli_sync_reports_codex_merge_summary(self):
         with open(os.path.join(self.report_dir, "2026-06-20.json"), "w", encoding="utf-8") as handle:

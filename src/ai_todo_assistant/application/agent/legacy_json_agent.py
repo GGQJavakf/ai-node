@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import logging
 import traceback
 import urllib.request
@@ -137,9 +138,12 @@ class AITodoAgent:
             logger.debug(f"AI 原始响应: {resp_data}")
             ai_text = resp_data['choices'][0]['message']['content'].strip()
             # 兼容即使AI强行带了Markdown包裹块
-            if ai_text.startswith('```json'): ai_text = ai_text[7:]
-            if ai_text.startswith('```'): ai_text = ai_text[3:]
-            if ai_text.endswith('```'): ai_text = ai_text[:-3]
+            if ai_text.startswith('```json'):
+                ai_text = ai_text[7:]
+            if ai_text.startswith('```'):
+                ai_text = ai_text[3:]
+            if ai_text.endswith('```'):
+                ai_text = ai_text[:-3]
 
             result = json.loads(ai_text.strip())
             return self.execute_action(result)
