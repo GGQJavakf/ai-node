@@ -156,7 +156,7 @@ class DoctorService:
 
     def _migration(self) -> DoctorCheck:
         version = self._schema_version()
-        if version == 2:
+        if version == 3:
             return self._check("migration", "healthy", "current")
         if version is None:
             return self._check(

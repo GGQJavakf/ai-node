@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol, Sequence
@@ -33,6 +34,7 @@ from agent_retro.domain.models import (
     ReviewResult,
     ReviewVerdict,
 )
+from agent_retro.infrastructure.llm_review import StructuredModelResponseError
 
 
 _THRESHOLDS = {
@@ -277,33 +279,48 @@ class ReviewService:
         if candidate.status is not CandidateStatus.PENDING_REVIEW:
             return self.repository.get_review_result(candidate_id)
 
-        attempt = self.repository.begin_review_attempt(
-            ReviewAttempt(
-                id=f"review-{uuid4()}",
-                candidate_id=candidate_id,
-                input_hash=input_hash,
-                status="running",
-                result_json="",
-                error="",
+        for attempt_index in range(2):
+            attempt = self.repository.begin_review_attempt(
+                ReviewAttempt(
+                    id=f"review-{uuid4()}",
+                    candidate_id=candidate_id,
+                    input_hash=input_hash,
+                    status="running",
+                    result_json="",
+                    error="",
+                )
             )
-        )
-        try:
-            result = self.reviewer.review(
-                input_json, timeout=self.model_timeout_seconds
-            )
-            result = redacted_result(result, self.redact)
-        except Exception as exc:
+            started = time.monotonic()
+            try:
+                result = self.reviewer.review(
+                    input_json, timeout=self.model_timeout_seconds
+                )
+                result = redacted_result(result, self.redact)
+            except Exception as exc:
+                error_category = safe_error(exc)
+                duration_ms = max(0, round((time.monotonic() - started) * 1000))
+                self.repository.finish_review_attempt(
+                    attempt.id,
+                    "failed",
+                    error=error_category,
+                    duration_ms=duration_ms,
+                    error_category=error_category,
+                )
+                if attempt_index == 0 and isinstance(
+                    exc, StructuredModelResponseError
+                ):
+                    continue
+                return None
+            duration_ms = max(0, round((time.monotonic() - started) * 1000))
             self.repository.finish_review_attempt(
-                attempt.id, "failed", error=safe_error(exc)
+                attempt.id,
+                "completed",
+                result_json=review_result_to_json(result),
+                duration_ms=duration_ms,
             )
-            return None
-        self.repository.finish_review_attempt(
-            attempt.id,
-            "completed",
-            result_json=review_result_to_json(result),
-        )
-        self._apply_review_result(candidate, evidence, result)
-        return result
+            self._apply_review_result(candidate, evidence, result)
+            return result
+        return None
 
     def retry_session(self, session_id: str) -> list[ReviewResult | None]:
         return self._review_candidates(

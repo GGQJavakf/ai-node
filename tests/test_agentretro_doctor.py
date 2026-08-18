@@ -14,7 +14,7 @@ class _Repository:
     def __init__(
         self,
         *,
-        schema_version: int = 2,
+        schema_version: int = 3,
         mappings: tuple[ProjectMapping, ...] = (),
         rollback_jobs: tuple[SyncJob, ...] = (),
         purge_incomplete: bool = False,
@@ -154,6 +154,26 @@ def test_doctor_never_probes_when_model_is_missing(tmp_path):
     ).run()
 
     assert report.by_name("model").summary == "missing"
+
+
+def test_doctor_reports_schema_v2_as_pending_after_v3_release(tmp_path):
+    codex_home = tmp_path / "codex"
+    (codex_home / "sessions").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = _settings(tmp_path, vault)
+
+    report = DoctorService(
+        settings,
+        _Repository(schema_version=2),
+        codex_home=codex_home,
+        model_config_loader=lambda: {"model": ""},
+        console_encoding=lambda: "utf-8",
+    ).run()
+
+    migration = report.by_name("migration")
+    assert migration.status == "warning"
+    assert migration.summary == "pending"
 
 
 def test_doctor_surfaces_rollback_purge_override_and_missing_model_without_paths(

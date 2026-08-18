@@ -115,40 +115,53 @@ class CaptureService:
             root, remote = resolve_git_identity(path)
         except GitProjectError:
             root, remote = path, ""
-        return self.project_resolver.resolve(root, remote)
+        return self.project_resolver.resolve(root, remote, source_path=path)
 
     def _redacted_session(self, session: NormalizedSession) -> NormalizedSession:
+        events: list[NormalizedEvent] = []
+        for event in session.events:
+            content = self.redactor.redact(event.content)
+            locator = replace(
+                event.locator,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            )
+            events.append(replace(event, content=content, locator=locator))
         return replace(
             session,
-            events=tuple(
-                replace(event, content=self.redactor.redact(event.content))
-                for event in session.events
-            ),
+            events=tuple(events),
         )
 
     def _minimal_evidence(self, session: NormalizedSession) -> tuple[Evidence, ...]:
-        items: list[Evidence] = []
+        items: dict[tuple[str, str], Evidence] = {}
         for event in session.events:
+            key = (event.kind, event.locator.content_hash)
+            existing = items.get(key)
+            if existing is not None:
+                if event.locator not in existing.all_locators:
+                    items[key] = replace(
+                        existing,
+                        locators=existing.all_locators + (event.locator,),
+                    )
+                continue
             excerpt = _excerpt(event.content, self.evidence_excerpt_chars)
             evidence_id = (
                 "evidence-"
                 + hashlib.sha256(
                     (
-                        f"{session.source_session_id}:{event.id}:"
+                        f"{session.source_session_id}:{event.kind}:"
                         f"{event.locator.content_hash}"
                     ).encode("utf-8")
                 ).hexdigest()[:24]
             )
-            items.append(
-                Evidence(
-                    id=evidence_id,
-                    session_id=session.id,
-                    kind=event.kind,
-                    locator=event.locator,
-                    excerpt=excerpt,
-                )
+            items[key] = Evidence(
+                id=evidence_id,
+                session_id=session.id,
+                kind=event.kind,
+                locator=event.locator,
+                excerpt=excerpt,
+                locators=(event.locator,),
             )
-        return tuple(items)
+        return tuple(items.values())
 
     def _persistent_session(
         self,
@@ -156,7 +169,11 @@ class CaptureService:
         resolution: ProjectResolution,
         evidence: Sequence[Evidence],
     ) -> NormalizedSession:
-        excerpts = {item.locator.event_id: item.excerpt for item in evidence}
+        excerpts = {
+            locator.event_id: item.excerpt
+            for item in evidence
+            for locator in item.all_locators
+        }
         project_id = (
             resolution.project_id
             if resolution.status == "resolved"

@@ -122,7 +122,7 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
     expected_fields = {
         SourceLocator: ("session_id", "event_id", "source_path", "content_hash"),
         NormalizedEvent: ("id", "kind", "content", "locator"),
-        Evidence: ("id", "session_id", "kind", "locator", "excerpt"),
+        Evidence: ("id", "session_id", "kind", "locator", "excerpt", "locators"),
         NormalizedSession: (
             "id",
             "source_session_id",
@@ -189,6 +189,7 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
             "remote_identity",
             "obsidian_project",
             "active",
+            "mapping_kind",
         ),
         ReviewAttempt: (
             "id",
@@ -197,6 +198,9 @@ def test_domain_contracts_are_not_polluted_by_sqlite_columns():
             "status",
             "result_json",
             "error",
+            "attempt_no",
+            "duration_ms",
+            "error_category",
         ),
         PurgeOperation: ("id", "location_kind", "location", "expected_hash"),
         PurgePlan: ("id", "knowledge_id", "operations", "status"),
@@ -244,16 +248,17 @@ def test_projection_status_contract():
     ]
 
 
-def test_repository_creates_schema_version_two(tmp_path):
+def test_repository_creates_schema_version_three(tmp_path):
     repo = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
 
     repo.migrate()
 
-    assert repo.schema_version() == 2
+    assert repo.schema_version() == 3
     assert set(repo.table_names()) >= {
         "sessions",
         "session_events",
         "evidence",
+        "evidence_locators",
         "candidates",
         "review_attempts",
         "knowledge",
@@ -575,7 +580,7 @@ def test_bootstrap_uses_agentretro_settings_and_migrates_the_isolated_database(
     repo = build_retro_repository(settings)
 
     assert repo.db_path == tmp_path / ".agentretro" / "retro.db"
-    assert repo.schema_version() == 2
+    assert repo.schema_version() == 3
     assert not (tmp_path / "data" / "todos.db").exists()
 
 

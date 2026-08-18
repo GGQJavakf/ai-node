@@ -16,6 +16,7 @@ from agent_retro.domain.models import (
     KnowledgeType,
     NormalizedSession,
     ProjectMapping,
+    ReviewAttempt,
     ReviewResult,
     ReviewVerdict,
     SourceLocator,
@@ -201,7 +202,24 @@ def test_list_show_and_manual_accept_use_only_stored_state_without_model(
     tmp_path, capsys, monkeypatch
 ):
     state_home = tmp_path / "state"
-    _seed_repository(state_home)
+    repository = _seed_repository(state_home)
+    attempt = repository.begin_review_attempt(
+        ReviewAttempt(
+            "attempt-1",
+            "candidate-1",
+            "input-hash",
+            "running",
+            "",
+            "",
+        )
+    )
+    repository.finish_review_attempt(
+        attempt.id,
+        "failed",
+        error="MODEL_REVIEW_RESPONSE_INVALID",
+        duration_ms=57,
+        error_category="MODEL_REVIEW_RESPONSE_INVALID",
+    )
 
     def fail_model_builder(*args, **kwargs):
         pytest.fail("manual and read-only commands must not load model composition")
@@ -234,6 +252,19 @@ def test_list_show_and_manual_accept_use_only_stored_state_without_model(
     assert shown["data"]["candidate"]["status"] == "pending_review"
     assert shown["data"]["review"]["verdict"] == "EDIT"
     assert shown["data"]["evidence"][0]["excerpt"] == "用户要求保留脱敏后的证据。"
+    assert shown["data"]["evidence"][0]["locators"] == [
+        shown["data"]["evidence"][0]["locator"]
+    ]
+    assert shown["data"]["attempts"] == [
+        {
+            "attempt_no": 1,
+            "duration_ms": 57,
+            "error_category": "MODEL_REVIEW_RESPONSE_INVALID",
+            "id": "attempt-1",
+            "input_hash": "input-hash",
+            "status": "failed",
+        }
+    ]
 
     assert (
         retro_cli.main(

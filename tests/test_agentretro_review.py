@@ -761,10 +761,14 @@ def test_review_failure_is_sanitized_immutable_and_keeps_candidate_pending(
 
     candidate = repository.list_candidates(CandidateStatus.PENDING_REVIEW)[0]
     attempts = repository.review_attempts_for_candidate(candidate.id)
-    assert len(attempts) == 1
-    assert attempts[0].status == "failed"
-    assert attempts[0].input_hash
-    assert "SECRET_VALUE" not in attempts[0].error
+    expected_attempts = 2 if isinstance(failure, StructuredModelResponseError) else 1
+    assert len(attempts) == expected_attempts
+    assert all(item.status == "failed" for item in attempts)
+    assert all(item.input_hash for item in attempts)
+    assert all("SECRET_VALUE" not in item.error for item in attempts)
+    assert [item.attempt_no for item in attempts] == list(
+        range(1, expected_attempts + 1)
+    )
     with pytest.raises(ValueError, match="already finished"):
         repository.finish_review_attempt(attempts[0].id, "completed")
 
@@ -1250,9 +1254,9 @@ def test_reclassify_wraps_finish_failure_with_new_second_phase_candidate_ids(
     original_finish = repository.finish_review_attempt
     injected = False
 
-    def finish_then_fail(attempt_id, status, result_json="", error=""):
+    def finish_then_fail(attempt_id, status, result_json="", error="", **kwargs):
         nonlocal injected
-        original_finish(attempt_id, status, result_json, error)
+        original_finish(attempt_id, status, result_json, error, **kwargs)
         if status == "completed" and not injected:
             injected = True
             raise RuntimeError("api_key=must-not-leak")
@@ -1304,8 +1308,8 @@ def test_pending_review_wraps_finish_failure_with_exact_candidate_ids(
     service = _service(repository, _Extractor(()), _Reviewer(_review()))
     original_finish = repository.finish_review_attempt
 
-    def finish_then_fail(attempt_id, status, result_json="", error=""):
-        original_finish(attempt_id, status, result_json, error)
+    def finish_then_fail(attempt_id, status, result_json="", error="", **kwargs):
+        original_finish(attempt_id, status, result_json, error, **kwargs)
         raise RuntimeError("Authorization: Bearer must-not-leak")
 
     monkeypatch.setattr(repository, "finish_review_attempt", finish_then_fail)

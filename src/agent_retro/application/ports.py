@@ -41,7 +41,7 @@ from agent_retro.domain.models import (
 class RetroRepository(Protocol):
     """Typed boundary consumed by AgentRetro application services."""
 
-    def migrate(self, target_version: int = 2) -> None: ...
+    def migrate(self, target_version: int = 3) -> None: ...
 
     def transaction(self) -> AbstractContextManager[Any]: ...
 
@@ -117,6 +117,8 @@ class RetroRepository(Protocol):
         status: str,
         result_json: str = "",
         error: str = "",
+        duration_ms: int = 0,
+        error_category: str = "",
     ) -> None: ...
 
     def find_completed_review_attempt(

@@ -60,6 +60,10 @@ def run_review_command(
                 for item in repository.evidence_for_candidate(candidate.id)
             ],
             "review": _review_data(repository.get_review_result(candidate.id)),
+            "attempts": [
+                _review_attempt_data(item)
+                for item in repository.review_attempts_for_candidate(candidate.id)
+            ],
         }
         _write_result(
             args.json_output,
@@ -271,6 +275,15 @@ def _candidate_data(candidate) -> dict[str, object]:
 
 
 def _evidence_data(evidence) -> dict[str, object]:
+    locators = [
+        {
+            "session_id": item.session_id,
+            "event_id": item.event_id,
+            "source_path": item.source_path,
+            "content_hash": item.content_hash,
+        }
+        for item in evidence.all_locators
+    ]
     return {
         "id": evidence.id,
         "session_id": evidence.session_id,
@@ -282,6 +295,18 @@ def _evidence_data(evidence) -> dict[str, object]:
             "source_path": evidence.locator.source_path,
             "content_hash": evidence.locator.content_hash,
         },
+        "locators": locators,
+    }
+
+
+def _review_attempt_data(attempt) -> dict[str, object]:
+    return {
+        "id": attempt.id,
+        "attempt_no": attempt.attempt_no,
+        "input_hash": attempt.input_hash,
+        "status": attempt.status,
+        "duration_ms": attempt.duration_ms,
+        "error_category": attempt.error_category,
     }
 
 

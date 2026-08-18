@@ -91,6 +91,19 @@ class Evidence:
     kind: str
     locator: SourceLocator
     excerpt: str
+    locators: tuple[SourceLocator, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.locators:
+            object.__setattr__(self, "locators", (self.locator,))
+        elif self.locators[0] != self.locator:
+            raise ValueError("the canonical evidence locator must be first")
+
+    @property
+    def all_locators(self) -> tuple[SourceLocator, ...]:
+        """Return every source occurrence while preserving the canonical locator."""
+
+        return self.locators or (self.locator,)
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,9 @@ class ReviewAttempt:
     status: str
     result_json: str
     error: str
+    attempt_no: int = 0
+    duration_ms: int = 0
+    error_category: str = ""
 
 
 @dataclass(frozen=True)
@@ -243,6 +259,7 @@ class ProjectMapping:
     remote_identity: str
     obsidian_project: str
     active: bool = True
+    mapping_kind: str = "git"
 
 
 @dataclass(frozen=True)

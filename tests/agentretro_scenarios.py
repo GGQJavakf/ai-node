@@ -346,6 +346,82 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
 }
 
 
+HARDENING_SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
+    "WR-01": (
+        "tests/test_agentretro_recent_session_hardening.py::test_non_git_workspace_mapping_routes_contained_session",
+    ),
+    "WR-02": (
+        "tests/test_agentretro_recent_session_hardening.py::test_workspace_mapping_rejects_missing_file_and_symlink_roots",
+    ),
+    "WR-03": (
+        "tests/test_agentretro_recent_session_hardening.py::test_non_git_workspace_mapping_routes_contained_session",
+    ),
+    "WR-04": (
+        "tests/test_agentretro_recent_session_hardening.py::test_workspace_routing_prefers_longest_root_and_stops_on_git_disagreement",
+    ),
+    "WR-05": (
+        "tests/test_agentretro_recent_session_hardening.py::test_workspace_routing_prefers_longest_root_and_stops_on_git_disagreement",
+    ),
+    "WR-06": (
+        "tests/test_agentretro_recent_session_hardening.py::test_non_git_workspace_mapping_routes_contained_session",
+    ),
+    "SF-01": (
+        "tests/test_agentretro_recent_session_hardening.py::test_valid_nested_session_metadata_chain_uses_leaf_identity",
+    ),
+    "SF-02": (
+        "tests/test_agentretro_capture.py::test_completed_session_is_normalized",
+    ),
+    "SF-03": (
+        "tests/test_agentretro_recent_session_hardening.py::test_invalid_repeated_session_metadata_remains_fail_closed[unrelated]",
+    ),
+    "SF-04": (
+        "tests/test_agentretro_recent_session_hardening.py::test_invalid_repeated_session_metadata_remains_fail_closed[post_event]",
+    ),
+    "SF-05": (
+        "tests/test_agentretro_recent_session_hardening.py::test_invalid_repeated_session_metadata_remains_fail_closed[family_conflict]",
+    ),
+    "SF-06": (
+        "tests/test_agentretro_recent_session_hardening.py::test_valid_nested_session_metadata_chain_uses_leaf_identity",
+    ),
+    "IQ-01": (
+        "tests/test_agentretro_recent_session_hardening.py::test_optional_event_warnings_are_aggregated_by_type",
+    ),
+    "IQ-02": (
+        "tests/test_agentretro_recent_session_hardening.py::test_valid_nested_session_metadata_chain_uses_leaf_identity",
+    ),
+    "IQ-03": (
+        "tests/test_agentretro_recent_session_hardening.py::test_duplicate_evidence_is_canonical_with_all_source_locators",
+    ),
+    "IQ-04": (
+        "tests/test_agentretro_recent_session_hardening.py::test_equal_content_with_different_kinds_remains_distinct_evidence",
+    ),
+    "IQ-05": (
+        "tests/test_agentretro_recent_session_hardening.py::test_duplicate_evidence_is_canonical_with_all_source_locators",
+    ),
+    "IQ-06": (
+        "tests/test_agentretro_recent_session_hardening.py::test_duplicate_evidence_is_canonical_with_all_source_locators",
+    ),
+    "RR-01": (
+        "tests/test_agentretro_recent_session_hardening.py::test_structured_review_failure_gets_one_fresh_observable_retry",
+    ),
+    "RR-02": (
+        "tests/test_agentretro_review.py::test_review_failure_is_sanitized_immutable_and_keeps_candidate_pending[strict-parse]",
+    ),
+    "RR-03": (
+        "tests/test_agentretro_recent_session_hardening.py::test_non_retryable_review_failure_is_not_automatically_repeated",
+    ),
+    "RR-04": (
+        "tests/test_agentretro_recent_session_hardening.py::test_structured_review_failure_gets_one_fresh_observable_retry",
+    ),
+    "RR-05": (
+        "tests/test_agentretro_recent_session_hardening.py::test_schema_v3_migration_is_backup_first_and_backfills_existing_rows",
+    ),
+    "RR-06": (
+        "tests/test_agentretro_review.py::test_completed_review_retry_reuses_result_without_new_request_or_knowledge",
+    ),
+}
+
+
 def scenario_verification_rows() -> tuple[str, ...]:
     """Render the human-readable verification evidence from the canonical registry."""
     return tuple(

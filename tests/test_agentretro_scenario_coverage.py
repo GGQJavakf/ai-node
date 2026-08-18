@@ -7,10 +7,20 @@ import sys
 from pathlib import Path
 
 import _path  # noqa: F401
-from agentretro_scenarios import SCENARIO_TESTS, scenario_verification_rows
+from agentretro_scenarios import (
+    HARDENING_SCENARIO_TESTS,
+    SCENARIO_TESTS,
+    scenario_verification_rows,
+)
 
 
 CHANGE_ROOT = Path(__file__).parents[1] / "openspec" / "changes" / "add-agentretro-mvp"
+HARDENING_CHANGE_ROOT = (
+    Path(__file__).parents[1]
+    / "openspec"
+    / "changes"
+    / "harden-recent-session-capture"
+)
 SCENARIO_PATTERN = re.compile(
     r"^#### Scenario: \[(CR|KR|OS|BR)-(\d{2})\]", re.MULTILINE
 )
@@ -69,3 +79,29 @@ def test_all_openspec_scenarios_have_exact_collected_pytest_evidence():
         f"stale node IDs: {sorted(mapped_nodes - collected)}\n{verification_report}"
     )
     assert len(verification_rows) == 103
+
+
+def test_hardening_openspec_scenarios_have_exact_collected_pytest_evidence():
+    pattern = re.compile(
+        r"^#### Scenario: \[(WR|SF|IQ|RR)-(\d{2})\]", re.MULTILINE
+    )
+    discovered: list[str] = []
+    for spec in sorted((HARDENING_CHANGE_ROOT / "specs").glob("**/spec.md")):
+        discovered.extend(
+            f"{prefix}-{number}"
+            for prefix, number in pattern.findall(spec.read_text(encoding="utf-8"))
+        )
+    expected = {
+        *(f"WR-{number:02d}" for number in range(1, 7)),
+        *(f"SF-{number:02d}" for number in range(1, 7)),
+        *(f"IQ-{number:02d}" for number in range(1, 7)),
+        *(f"RR-{number:02d}" for number in range(1, 7)),
+    }
+    assert len(discovered) == len(set(discovered)) == 24
+    assert set(discovered) == expected == set(HARDENING_SCENARIO_TESTS)
+    mapped_nodes = {
+        node for nodes in HARDENING_SCENARIO_TESTS.values() for node in nodes
+    }
+    assert all("::" in node for node in mapped_nodes)
+    collected = _collected_node_ids()
+    assert mapped_nodes <= collected, f"stale node IDs: {sorted(mapped_nodes - collected)}"

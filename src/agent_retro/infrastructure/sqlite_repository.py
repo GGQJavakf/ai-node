@@ -8,7 +8,7 @@ import os
 import shutil
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -53,7 +53,7 @@ from agent_retro.domain.projection import ProjectionFenceError, projection_input
 from agent_retro.infrastructure.obsidian import render_aggregate
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _SCHEMA_V1 = (
     "CREATE TABLE schema_version (version INTEGER NOT NULL)",
@@ -254,6 +254,34 @@ _SCHEMA_V2 = (
     )""",
 )
 
+_SCHEMA_V3 = (
+    "ALTER TABLE project_mappings ADD COLUMN mapping_kind TEXT NOT NULL "
+    "DEFAULT 'git' CHECK(mapping_kind IN ('git', 'workspace'))",
+    "DROP INDEX uq_active_mapping_remote",
+    """CREATE UNIQUE INDEX uq_active_mapping_remote
+        ON project_mappings(remote_identity)
+        WHERE active = 1 AND mapping_kind = 'git' AND remote_identity <> ''""",
+    """CREATE TABLE evidence_locators (
+        evidence_id TEXT NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+        locator_session_id TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        locator_source_path TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        PRIMARY KEY(evidence_id, locator_session_id, event_id, locator_source_path,
+                    content_hash),
+        UNIQUE(evidence_id, ordinal)
+    )""",
+    """INSERT INTO evidence_locators(
+        evidence_id, locator_session_id, event_id, locator_source_path,
+        content_hash, ordinal
+    ) SELECT id, locator_session_id, event_id, locator_source_path,
+             content_hash, 0 FROM evidence""",
+    "ALTER TABLE review_attempts ADD COLUMN duration_ms INTEGER NOT NULL "
+    "DEFAULT 0 CHECK(duration_ms >= 0)",
+    "ALTER TABLE review_attempts ADD COLUMN error_category TEXT NOT NULL DEFAULT ''",
+)
+
 _PURGE_SQLITE_FIELDS = (
     ("sqlite_knowledge", "knowledge", "id || ':' || version", "text"),
     ("sqlite_candidate", "candidates", "id", "proposed_text"),
@@ -410,6 +438,11 @@ class SQLiteRetroRepository(RetroRepository):
             for statement in _SCHEMA_V2:
                 connection.execute(statement)
             connection.execute("UPDATE schema_version SET version = 2")
+            return
+        if version == 3:
+            for statement in _SCHEMA_V3:
+                connection.execute(statement)
+            connection.execute("UPDATE schema_version SET version = 3")
             return
         raise ValueError(f"unsupported schema migration: {version}")
 
@@ -575,6 +608,21 @@ class SQLiteRetroRepository(RetroRepository):
                         item.excerpt,
                     ),
                 )
+                for ordinal, locator in enumerate(item.all_locators):
+                    connection.execute(
+                        """INSERT INTO evidence_locators(
+                            evidence_id, locator_session_id, event_id,
+                            locator_source_path, content_hash, ordinal
+                        ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            item.id,
+                            locator.session_id,
+                            locator.event_id,
+                            locator.source_path,
+                            locator.content_hash,
+                            ordinal,
+                        ),
+                    )
             self._append_audit_record(
                 connection,
                 self._audit_entry(
@@ -590,12 +638,36 @@ class SQLiteRetroRepository(RetroRepository):
         connection = self._connect()
         try:
             rows = connection.execute(
-                "SELECT * FROM evidence WHERE session_id = ? ORDER BY rowid",
-                (session_id,),
+                """SELECT * FROM evidence
+                WHERE session_id = ? OR session_id = (
+                    SELECT id FROM sessions WHERE source_session_id = ?
+                    ORDER BY captured_at LIMIT 1
+                ) ORDER BY rowid""",
+                (session_id, session_id),
             ).fetchall()
-            return [_evidence_from_row(row) for row in rows]
+            return [self._evidence_with_locators(connection, row) for row in rows]
         finally:
             connection.close()
+
+    @staticmethod
+    def _evidence_with_locators(
+        connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> Evidence:
+        locator_rows = connection.execute(
+            """SELECT locator_session_id, event_id, locator_source_path, content_hash
+            FROM evidence_locators WHERE evidence_id = ? ORDER BY ordinal""",
+            (row["id"],),
+        ).fetchall()
+        locators = tuple(
+            SourceLocator(
+                session_id=str(item["locator_session_id"]),
+                event_id=str(item["event_id"]),
+                source_path=str(item["locator_source_path"]),
+                content_hash=str(item["content_hash"]),
+            )
+            for item in locator_rows
+        )
+        return _evidence_from_row(row, locators)
 
     def save_candidates(self, candidates: Sequence[Candidate]) -> None:
         with self.transaction() as connection:
@@ -729,6 +801,20 @@ class SQLiteRetroRepository(RetroRepository):
                     relative_path.as_posix(),
                     content_hash,
                     candidate.proposed_text,
+                ),
+            )
+            connection.execute(
+                """INSERT OR IGNORE INTO evidence_locators(
+                    evidence_id, locator_session_id, event_id,
+                    locator_source_path, content_hash, ordinal
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    evidence_id,
+                    session_id,
+                    candidate.id,
+                    relative_path.as_posix(),
+                    content_hash,
+                    0,
                 ),
             )
             connection.execute(
@@ -876,7 +962,7 @@ class SQLiteRetroRepository(RetroRepository):
                 WHERE ce.candidate_id = ? ORDER BY e.id""",
                 (candidate_id,),
             ).fetchall()
-            return [_evidence_from_row(row) for row in rows]
+            return [self._evidence_with_locators(connection, row) for row in rows]
         finally:
             connection.close()
 
@@ -942,6 +1028,7 @@ class SQLiteRetroRepository(RetroRepository):
 
     def begin_review_attempt(self, attempt: ReviewAttempt) -> ReviewAttempt:
         with self.transaction() as connection:
+            attempt_no = self._next_review_attempt_no(connection, attempt.candidate_id)
             connection.execute(
                 """INSERT INTO review_attempts(
                     id, candidate_id, input_hash, attempt_no, status,
@@ -951,7 +1038,7 @@ class SQLiteRetroRepository(RetroRepository):
                     attempt.id,
                     attempt.candidate_id,
                     attempt.input_hash,
-                    self._next_review_attempt_no(connection, attempt.candidate_id),
+                    attempt_no,
                     attempt.status,
                     attempt.result_json,
                     attempt.error,
@@ -968,7 +1055,7 @@ class SQLiteRetroRepository(RetroRepository):
                     detail={"candidate_id": attempt.candidate_id},
                 ),
             )
-        return attempt
+        return replace(attempt, attempt_no=attempt_no)
 
     def _next_review_attempt_no(
         self, connection: sqlite3.Connection, candidate_id: str
@@ -986,12 +1073,24 @@ class SQLiteRetroRepository(RetroRepository):
         status: str,
         result_json: str = "",
         error: str = "",
+        duration_ms: int = 0,
+        error_category: str = "",
     ) -> None:
+        if duration_ms < 0:
+            raise ValueError("duration_ms must not be negative")
         with self.transaction() as connection:
             cursor = connection.execute(
                 "UPDATE review_attempts SET status = ?, result_json = ?, "
-                "error = ? WHERE id = ? AND status = 'running'",
-                (status, result_json, error, attempt_id),
+                "error = ?, duration_ms = ?, error_category = ? "
+                "WHERE id = ? AND status = 'running'",
+                (
+                    status,
+                    result_json,
+                    error,
+                    duration_ms,
+                    error_category,
+                    attempt_id,
+                ),
             )
             if cursor.rowcount == 0:
                 existing = connection.execute(
@@ -1008,9 +1107,20 @@ class SQLiteRetroRepository(RetroRepository):
                     entity_type="review_attempt",
                     entity_id=attempt_id,
                     after_hash=_hash_value(
-                        {"status": status, "result_json": result_json, "error": error}
+                        {
+                            "status": status,
+                            "result_json": result_json,
+                            "error": error,
+                            "duration_ms": duration_ms,
+                            "error_category": error_category,
+                        }
                     ),
-                    detail={"status": status, "has_error": bool(error)},
+                    detail={
+                        "status": status,
+                        "has_error": bool(error),
+                        "duration_ms": duration_ms,
+                        "error_category": error_category,
+                    },
                 ),
             )
 
@@ -2064,14 +2174,15 @@ class SQLiteRetroRepository(RetroRepository):
         with self.transaction() as connection:
             connection.execute(
                 """INSERT INTO project_mappings(
-                    id, git_root, remote_identity, obsidian_project, active,
+                    id, git_root, remote_identity, obsidian_project, active, mapping_kind,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     git_root = excluded.git_root,
                     remote_identity = excluded.remote_identity,
                     obsidian_project = excluded.obsidian_project,
                     active = excluded.active,
+                    mapping_kind = excluded.mapping_kind,
                     updated_at = excluded.updated_at""",
                 (
                     mapping.id,
@@ -2079,6 +2190,7 @@ class SQLiteRetroRepository(RetroRepository):
                     mapping.remote_identity,
                     mapping.obsidian_project,
                     int(mapping.active),
+                    mapping.mapping_kind,
                     _now_text(),
                     _now_text(),
                 ),
@@ -2112,6 +2224,7 @@ class SQLiteRetroRepository(RetroRepository):
                     remote_identity=str(row["remote_identity"]),
                     obsidian_project=str(row["obsidian_project"]),
                     active=bool(row["active"]),
+                    mapping_kind=str(row["mapping_kind"]),
                 )
                 for row in rows
             ]
@@ -3523,7 +3636,9 @@ def _event_from_row(row: sqlite3.Row) -> NormalizedEvent:
     )
 
 
-def _evidence_from_row(row: sqlite3.Row) -> Evidence:
+def _evidence_from_row(
+    row: sqlite3.Row, locators: tuple[SourceLocator, ...] = ()
+) -> Evidence:
     return Evidence(
         id=str(row["id"]),
         session_id=str(row["session_id"]),
@@ -3535,6 +3650,7 @@ def _evidence_from_row(row: sqlite3.Row) -> Evidence:
             content_hash=str(row["content_hash"]),
         ),
         excerpt=str(row["excerpt"]),
+        locators=locators,
     )
 
 
@@ -3586,6 +3702,9 @@ def _review_attempt_from_row(row: sqlite3.Row) -> ReviewAttempt:
         status=str(row["status"]),
         result_json=str(row["result_json"]),
         error=str(row["error"]),
+        attempt_no=int(row["attempt_no"]),
+        duration_ms=int(row["duration_ms"]),
+        error_category=str(row["error_category"]),
     )
 
 

@@ -152,7 +152,10 @@ def _insert_knowledge(repository: SQLiteRetroRepository) -> None:
             ),
         )
         connection.execute(
-            "INSERT INTO review_attempts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO review_attempts(
+                id, candidate_id, input_hash, attempt_no, status,
+                result_json, error, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 "review-a",
                 "candidate-a",

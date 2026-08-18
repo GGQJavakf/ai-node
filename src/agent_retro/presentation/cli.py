@@ -123,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     map_command = project_commands.add_parser("map", help="创建项目映射")
     map_command.add_argument("--root", required=True, type=Path)
     map_command.add_argument("--vault-project", required=True)
+    map_workspace = project_commands.add_parser(
+        "map-workspace", help="创建非 Git 工作区显式映射"
+    )
+    map_workspace.add_argument("--root", required=True, type=Path)
+    map_workspace.add_argument("--vault-project", required=True)
     project_commands.add_parser("list", help="列出活动项目映射")
     remove = project_commands.add_parser("remove", help="停用项目映射")
     remove.add_argument("mapping_id")
@@ -754,6 +759,9 @@ def _run_command(
     if args.project_command == "map":
         mapping = service.map(args.root, args.vault_project)
         data = _mapping_data(mapping)
+    elif args.project_command == "map-workspace":
+        mapping = service.map_workspace(args.root, args.vault_project)
+        data = _mapping_data(mapping)
     elif args.project_command == "list":
         data = [_mapping_data(mapping) for mapping in service.list()]
     elif args.project_command == "remove":
@@ -951,6 +959,8 @@ def _datetime_argument(value: str) -> datetime:
 def _mapping_data(mapping) -> dict[str, object]:
     return {
         "id": mapping.id,
+        "mapping_kind": mapping.mapping_kind,
+        "root": str(mapping.git_root),
         "git_root": str(mapping.git_root),
         "remote_identity": mapping.remote_identity,
         "obsidian_project": mapping.obsidian_project,

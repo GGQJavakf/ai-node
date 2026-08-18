@@ -106,12 +106,48 @@ class ProjectResolver:
     def __init__(self, mappings: Sequence[ProjectMapping]) -> None:
         self.mappings = tuple(mapping for mapping in mappings if mapping.active)
 
-    def resolve(self, git_root: Path, remote_identity: str = "") -> ProjectResolution:
+    def resolve(
+        self,
+        git_root: Path,
+        remote_identity: str = "",
+        *,
+        source_path: Path | None = None,
+    ) -> ProjectResolution:
+        git_resolution = self._resolve_git(git_root, remote_identity)
+        workspace_resolution = self._resolve_workspace(source_path)
+        if "ambiguous" in (git_resolution.status, workspace_resolution.status):
+            diagnostics = tuple(
+                item.diagnostic
+                for item in (git_resolution, workspace_resolution)
+                if item.diagnostic
+            )
+            return ProjectResolution(
+                status="ambiguous", diagnostic="；".join(diagnostics)
+            )
+        if git_resolution.status == workspace_resolution.status == "resolved":
+            if git_resolution.project_id != workspace_resolution.project_id:
+                return ProjectResolution(
+                    status="ambiguous",
+                    diagnostic="Git 映射与工作区映射指向不同项目",
+                )
+            return git_resolution
+        if git_resolution.status == "resolved":
+            return git_resolution
+        if workspace_resolution.status == "resolved":
+            return workspace_resolution
+        return ProjectResolution(status="unknown", diagnostic="没有匹配的项目映射")
+
+    def _resolve_git(
+        self, git_root: Path, remote_identity: str = ""
+    ) -> ProjectResolution:
+        mappings = tuple(
+            item for item in self.mappings if item.mapping_kind == "git"
+        )
         root_key = _path_key(git_root)
         remote_key = normalize_git_remote(remote_identity) if remote_identity else ""
         exact = [
             item
-            for item in self.mappings
+            for item in mappings
             if _path_key(item.git_root) == root_key
             and item.remote_identity == remote_key
         ]
@@ -119,13 +155,13 @@ class ProjectResolver:
         if resolution is not None:
             return resolution
         by_root = [
-            item for item in self.mappings if _path_key(item.git_root) == root_key
+            item for item in mappings if _path_key(item.git_root) == root_key
         ]
         resolution = self._from_candidates(by_root, "Git root")
         if resolution is not None:
             return resolution
         by_remote = (
-            [item for item in self.mappings if item.remote_identity == remote_key]
+            [item for item in mappings if item.remote_identity == remote_key]
             if remote_key
             else []
         )
@@ -133,6 +169,26 @@ class ProjectResolver:
         if resolution is not None:
             return resolution
         return ProjectResolution(status="unknown", diagnostic="没有匹配的项目映射")
+
+    def _resolve_workspace(self, source_path: Path | None) -> ProjectResolution:
+        if source_path is None:
+            return ProjectResolution(status="unknown")
+        source_key = _path_key(source_path)
+        candidates = [
+            item
+            for item in self.mappings
+            if item.mapping_kind == "workspace"
+            and _path_contains(_path_key(item.git_root), source_key)
+        ]
+        if not candidates:
+            return ProjectResolution(status="unknown")
+        longest = max(len(_path_key(item.git_root)) for item in candidates)
+        nearest = [
+            item for item in candidates if len(_path_key(item.git_root)) == longest
+        ]
+        resolution = self._from_candidates(nearest, "工作区根目录")
+        assert resolution is not None
+        return resolution
 
     @staticmethod
     def _from_candidates(
@@ -178,17 +234,45 @@ class ProjectMappingService:
         self, git_root: Path, obsidian_project: str, actor: str = "user"
     ) -> ProjectMapping:
         root, remote = resolve_git_identity(git_root)
+        return self._save_mapping(root, remote, obsidian_project, "git", actor)
+
+    def map_workspace(
+        self, workspace_root: Path, obsidian_project: str, actor: str = "user"
+    ) -> ProjectMapping:
+        supplied = Path(workspace_root).expanduser()
+        if not supplied.exists() or not supplied.is_dir():
+            raise ProjectMappingError(f"工作区根目录不存在或不是目录: {supplied}")
+        if supplied.is_symlink():
+            raise ProjectMappingError(f"工作区根目录不能是符号链接: {supplied}")
+        return self._save_mapping(
+            supplied.resolve(), "", obsidian_project, "workspace", actor
+        )
+
+    def _save_mapping(
+        self,
+        root: Path,
+        remote: str,
+        obsidian_project: str,
+        mapping_kind: str,
+        actor: str,
+    ) -> ProjectMapping:
         project = self._validated_project(obsidian_project)
         for existing in self.repository.list_project_mappings():
             same_root = _path_key(existing.git_root) == _path_key(root)
-            same_remote = bool(remote) and existing.remote_identity == remote
+            same_remote = (
+                mapping_kind == existing.mapping_kind == "git"
+                and bool(remote)
+                and existing.remote_identity == remote
+            )
             if not (same_root or same_remote):
                 continue
             if existing.obsidian_project == project:
                 return existing
-            raise ProjectMappingConflictError("Git root 或 remote 已映射到不兼容的项目")
+            raise ProjectMappingConflictError("项目根目录或 Git remote 已映射到不兼容的项目")
         identity = json.dumps(
-            [str(root), remote, project], ensure_ascii=False, separators=(",", ":")
+            [mapping_kind, str(root), remote, project],
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
         mapping = ProjectMapping(
             id="mapping-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24],
@@ -196,6 +280,7 @@ class ProjectMappingService:
             remote_identity=remote,
             obsidian_project=project,
             active=True,
+            mapping_kind=mapping_kind,
         )
         self.repository.save_project_mapping(mapping, actor)
         return mapping
@@ -262,3 +347,10 @@ class ProjectMappingService:
 
 def _path_key(path: Path) -> str:
     return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def _path_contains(root_key: str, child_key: str) -> bool:
+    try:
+        return os.path.commonpath((root_key, child_key)) == root_key
+    except ValueError:
+        return False

@@ -1170,6 +1170,19 @@ def test_cli_requires_exactly_one_capture_selector_and_has_project_commands():
         ).project_command
         == "map"
     )
+    assert (
+        parser.parse_args(
+            [
+                "project",
+                "map-workspace",
+                "--root",
+                ".",
+                "--vault-project",
+                "Projects/Test",
+            ]
+        ).project_command
+        == "map-workspace"
+    )
     assert parser.parse_args(["project", "list"]).project_command == "list"
     assert (
         parser.parse_args(["project", "remove", "mapping-1"]).project_command

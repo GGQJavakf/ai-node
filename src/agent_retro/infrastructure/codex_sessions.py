@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,6 +103,7 @@ class CodexSessionSource:
         self.monotonic = monotonic
         self.last_discovery = DiscoveryDiagnostics()
         self._warnings: list[str] = []
+        self._optional_warning_counts: Counter[str] = Counter()
         self._diagnostics: list[str] = []
         self._inspected_count = 0
 
@@ -309,11 +311,18 @@ class CodexSessionSource:
 
     def _begin_discovery(self) -> None:
         self._warnings = []
+        self._optional_warning_counts = Counter()
         self._diagnostics = []
         self._inspected_count = 0
         self.last_discovery = DiscoveryDiagnostics()
 
     def _finish_discovery(self) -> None:
+        if self._optional_warning_counts:
+            counts = ", ".join(
+                f"{kind}={count}"
+                for kind, count in sorted(self._optional_warning_counts.items())
+            )
+            self._warnings.append(f"忽略未知可选 Codex 事件: {counts}")
         self.last_discovery = DiscoveryDiagnostics(
             inspected_count=self._inspected_count,
             warnings=tuple(self._warnings),
@@ -371,6 +380,10 @@ class CodexSessionSource:
         completed_at: datetime | None = None
         events: list[NormalizedEvent] = []
         saw_meta = False
+        saw_non_meta = False
+        family_id = ""
+        meta_ids: set[str] = set()
+        previous_meta: dict[str, object] | None = None
         try:
             with path.open("rb") as stream:
                 self._check_deadline(deadline)
@@ -406,15 +419,43 @@ class CodexSessionSource:
                             f"缺少事件 payload，行 {line_number}: {path}"
                         )
                     if record_type == "session_meta":
-                        if saw_meta:
-                            raise SessionFormatError(f"重复 session_meta: {path}")
-                        saw_meta = True
-                        session_id = _required_text(payload.get("id"), "session ID")
-                        project_id = _required_text(
-                            payload.get("cwd"), "session source locator"
-                        )
-                        completed_at = _parse_timestamp(record.get("timestamp"))
+                        if saw_non_meta:
+                            raise SessionFormatError(
+                                f"session_meta 出现在普通事件之后: {path}"
+                            )
+                        current_id = _required_text(payload.get("id"), "session ID")
+                        current_family = str(payload.get("session_id") or "").strip()
+                        if current_id in meta_ids:
+                            raise SessionFormatError(
+                                f"session_meta 链包含重复或循环 ID: {path}"
+                            )
+                        if family_id and current_family and current_family != family_id:
+                            raise SessionFormatError(
+                                f"session_meta 链的 session_id 不一致: {path}"
+                            )
+                        if not family_id and current_family:
+                            family_id = current_family
+                        if previous_meta is not None:
+                            declared_parents = {
+                                str(previous_meta.get(field) or "").strip()
+                                for field in ("forked_from_id", "parent_thread_id")
+                            }
+                            declared_parents.discard("")
+                            if current_id not in declared_parents:
+                                raise SessionFormatError(
+                                    f"session_meta 不是连续的子到父链: {path}"
+                                )
+                        if not saw_meta:
+                            saw_meta = True
+                            session_id = current_id
+                            project_id = _required_text(
+                                payload.get("cwd"), "session source locator"
+                            )
+                            completed_at = _parse_timestamp(record.get("timestamp"))
+                        meta_ids.add(current_id)
+                        previous_meta = payload
                         continue
+                    saw_non_meta = True
                     if not saw_meta or session_id is None:
                         raise SessionFormatError(
                             f"事件出现在 session_meta 之前，行 {line_number}: {path}"
@@ -512,9 +553,7 @@ class CodexSessionSource:
 
         if kind is None or content is None:
             optional_kind = str(payload_type or record_type or "unknown")
-            self._warnings.append(
-                f"忽略未知可选 Codex 事件 {optional_kind}，行 {line_number}: {path}"
-            )
+            self._optional_warning_counts[optional_kind] += 1
             return None
         source_identity = str(payload.get("id") or payload.get("call_id") or kind)
         event_id = (

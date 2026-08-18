@@ -65,6 +65,17 @@ retro project list
 retro doctor
 ```
 
+对于 `D:\IdeaProjects\kcsp` 这类根目录本身不是 Git 仓库、但内部包含多个成员仓的
+工作区，使用显式映射。它按最长匹配根目录归类，不会扫描或猜测成员仓：
+
+```powershell
+retro project map-workspace --root 'D:\IdeaProjects\kcsp' --vault-project 'KCSP'
+retro project list
+```
+
+列表会显示 `mapping_kind=workspace`。如果 Git 映射与工作区映射指向不同项目，
+捕获会停在 `awaiting:ambiguous`，不会把会话归入错误项目。
+
 `retro doctor` 本身只读；它会分别检查 Codex 会话源、安全上限、数据库和迁移、
 模型配置、项目映射、vault、备份、同步/清除恢复状态、全局集成和控制台编码，
 并为 warning 或 error 给出恢复命令。若尚未执行任何状态命令，可先运行 doctor
