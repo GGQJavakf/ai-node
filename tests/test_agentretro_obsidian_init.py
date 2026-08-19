@@ -27,25 +27,30 @@ def _snapshot(root: Path) -> dict[str, bytes]:
     }
 
 
-def _repository(tmp_path: Path) -> SQLiteRetroRepository:
+def _repository(
+    tmp_path: Path, obsidian_project: str = "NPKI"
+) -> SQLiteRetroRepository:
     state = tmp_path / "state"
     repository = SQLiteRetroRepository(state / "retro.db", state / "backups")
     repository.migrate()
     repository.save_project_mapping(
         ProjectMapping(
-            id="mapping-npki",
+            id=f"mapping-{obsidian_project.replace('/', '-')}",
             git_root=tmp_path / "repo",
             remote_identity="example.invalid/npki",
-            obsidian_project="NPKI",
+            obsidian_project=obsidian_project,
         ),
         actor="user",
     )
     return repository
 
 
-def _targets(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _targets(
+    tmp_path: Path, project_id: str = "NPKI"
+) -> tuple[Path, Path, Path]:
     vault = tmp_path / "vault"
-    summary = vault / "项目" / "NPKI" / "项目_NPKI.md"
+    project_path = Path(project_id)
+    summary = vault / "项目" / project_path / f"项目_{project_path.name}.md"
     index = vault / "项目" / "项目索引.md"
     summary.parent.mkdir(parents=True)
     index.parent.mkdir(parents=True, exist_ok=True)
@@ -125,6 +130,35 @@ def test_os_26_matching_apply_preserves_prose_and_missing_page_stays_missing(
     assert not summary.exists()
 
 
+def test_nested_project_preview_and_apply_use_leaf_summary_name(tmp_path: Path) -> None:
+    project_id = "Team/Example"
+    vault, summary, index = _targets(tmp_path, project_id)
+    original_summary = "# Example\n\n人工摘要\n".encode()
+    original_index = "# 项目索引\n\n- [[项目/OTHER]]\n".encode()
+    summary.write_bytes(original_summary)
+    index.write_bytes(original_index)
+    repository = _repository(tmp_path, project_id)
+    initializer = _initializer(tmp_path, repository=repository)
+
+    plan = initializer.preview(project_id)
+
+    assert [target.relative_path.as_posix() for target in plan.targets] == [
+        "项目/Team/Example/项目_Example.md",
+        "项目/项目索引.md",
+    ]
+    assert _snapshot(vault)["项目/Team/Example/项目_Example.md"] == original_summary
+
+    result = initializer.apply(project_id, plan.id)
+
+    assert result.status is ProjectionStatus.SYNCED
+    assert result.changed is True
+    assert b"agentretro:summary:start project=Team/Example" in summary.read_bytes()
+    assert b"agentretro:index:start project=Team/Example" in index.read_bytes()
+    assert (
+        plan.backup_dir / "项目" / "Team" / "Example" / "项目_Example.md"
+    ).read_bytes() == original_summary
+
+
 def test_os_27_changed_target_rejects_stale_plan_before_backup_or_write(
     tmp_path: Path,
 ) -> None:
@@ -200,14 +234,33 @@ def test_os_28_directory_or_symlink_target_is_rejected_without_write(
     assert index.read_bytes() == b"index\n"
 
 
-@pytest.mark.parametrize("project_id", ["../NPKI", "NPKI\nOTHER", "NPKI -->"])
+@pytest.mark.parametrize(
+    "project_id",
+    [
+        "../NPKI",
+        "Team/../../NPKI",
+        "/absolute/NPKI",
+        "C:/absolute/NPKI",
+        "//server/share/NPKI",
+        "Team/./NPKI",
+        "Team//NPKI",
+        "Team\\NPKI",
+        "Team/NPKI?",
+        "NPKI\nOTHER",
+        "NPKI -->",
+    ],
+)
 def test_os_28_project_identity_cannot_escape_path_or_marker(
     tmp_path: Path, project_id: str
 ) -> None:
-    _targets(tmp_path)
+    vault, _, _ = _targets(tmp_path)
+    before = _snapshot(vault)
 
     with pytest.raises(BoundaryInitError, match="invalid_project_id"):
         _initializer(tmp_path).preview(project_id)
+
+    assert _snapshot(vault) == before
+    assert not (tmp_path / "state" / "backups").exists()
 
 
 @pytest.mark.parametrize("rollback_fails", [False, True])

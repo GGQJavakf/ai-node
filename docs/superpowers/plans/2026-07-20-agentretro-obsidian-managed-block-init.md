@@ -71,12 +71,12 @@
 
 **Files/state:**
 - Read/write only through the new CLI: configured Obsidian optional managed targets and AgentRetro backup/journal state
-- Read/write: `C:/Users/Administrator/.agentretro/runtime-v1`
-- Read/write: `C:/Users/Administrator/.agentretro/runtime-install.json`
+- Read/write: `<user-home>/.agentretro/runtime-v1`
+- Read/write: `<user-home>/.agentretro/runtime-install.json`
 
 - [ ] Snapshot the real project page hash, relevant projection event, and pending candidate IDs/statuses.
 - [ ] Run real `retro sync init --project NPKI --json` and inspect the exact plan without writing.
-- [ ] Apply only that confirmed plan ID, read back the managed markers and retained backup, then run `retro sync retry projection-c685f0e7593b93630b2dc2b6`.
+- [ ] Apply only that confirmed plan ID, read back the managed markers and retained backup, then run `retro sync retry <projection-event-id>` for the previously identified event.
 - [ ] Verify the project page managed summary matches accepted SQLite knowledge, the projection event is `synced`, and both pending candidates remain pending.
 - [ ] Mark task `4.14` complete, run the final full verification, and commit scoped implementation/evidence files.
 - [ ] Build a wheel from the clean commit, replace the local runtime, and read back the runtime manifest with the new commit, wheel hash, and `source_dirty=false`.

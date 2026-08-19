@@ -176,7 +176,17 @@ config/settings.local.json
 Copy-Item config/settings.example.json config/settings.local.json
 ```
 
-`config/settings.local.json` 已加入 `.gitignore`，用于本机运行和测试，不提交。也可以使用环境变量覆盖本地配置。旧的 `config/settings.json` 仍作为兼容入口，但不建议继续把真实 API Key 写在可提交文件中。
+`config/settings.local.json` 已加入 `.gitignore`，用于本机运行和测试，不提交。旧的 `config/settings.json` 仍作为源码检出的兼容入口，但不建议继续把真实 API Key 写在可提交文件中。
+
+对 wheel 或其他非 editable 安装，请使用绝对路径显式选择配置文件：
+
+```powershell
+$configHome = Join-Path $env:LOCALAPPDATA "ai-todo-assistant"
+New-Item -ItemType Directory -Force $configHome | Out-Null
+$env:AI_SETTINGS_FILE = Join-Path $configHome "settings.local.json"
+```
+
+安装包在 `share/ai-todo-assistant/settings.example.json` 中携带不含真实凭据的模板，也可参照下文 JSON 直接创建上述文件。`AI_SETTINGS_FILE` 必须是绝对路径；一旦设置，加载器不会再回退到当前目录或仓库内的其他配置。路径为空、相对路径、文件缺失/不可读，或 JSON 格式错误/顶层不是对象时，程序会在创建模型客户端前停止，不会使用默认端点或 `AI_API_KEY` 绕过失败。`retro --json doctor` 会以单个 JSON 结果将此报告为 `model: configuration_error`。只有成功读取配置文件后，单项环境变量（如 `AI_MODEL`、`AI_API_KEY`）才保持最高优先级。
 
 ### 方式一：OpenAI 兼容 API（默认）
 
@@ -200,6 +210,7 @@ Copy-Item config/settings.example.json config/settings.local.json
 PowerShell 环境变量示例：
 
 ```powershell
+$env:AI_SETTINGS_FILE="C:\Users\<you>\AppData\Local\ai-todo-assistant\settings.local.json"
 $env:AI_AUTH_MODE="openai_api"
 $env:AI_API_KEY="REPLACE_WITH_YOUR_API_KEY"
 $env:AI_API_BASE="https://api.openai.com/v1/chat/completions"

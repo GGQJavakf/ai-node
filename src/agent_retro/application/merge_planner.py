@@ -11,6 +11,7 @@ from agent_retro.application.merge import (
     MergePlan,
     MergeService,
     SensitiveMergeContentError,
+    canonical_merge_project_path,
     canonical_merge_path_identity,
 )
 from agent_retro.infrastructure.redaction import Redactor
@@ -72,24 +73,24 @@ class MergePlanner:
         self.redactor = Redactor()
 
     def plan(self, project_id: str, instruction: str) -> MergePlan:
-        project_part = Path(project_id)
-        if (
-            not project_id.strip()
-            or project_part.is_absolute()
-            or len(project_part.parts) != 1
-            or project_part.name != project_id
-        ):
-            raise ValueError("merge_planner_project_invalid")
+        try:
+            project_part = canonical_merge_project_path(project_id)
+        except ValueError as exc:
+            raise ValueError("merge_planner_project_invalid") from exc
         if self.redactor.contains_sensitive_value(project_id):
             raise SensitiveMergeContentError("sensitive_merge_content")
-        project_root = self.vault_root / "项目" / project_id
+        project_relative = Path("项目") / project_part
+        project_root = self.vault_root / project_relative
         vault = self.vault_root.resolve(strict=True)
         try:
             project_root.resolve(strict=False).relative_to(vault)
         except ValueError as exc:
             raise ValueError("merge_planner_project_invalid") from exc
-        if project_root.is_symlink():
-            raise ValueError("merge_planner_unsafe_markdown")
+        current = self.vault_root
+        for part in project_relative.parts:
+            current = current / part
+            if current.exists() and current.is_symlink():
+                raise ValueError("merge_planner_unsafe_markdown")
         deadline = self.monotonic() + self.discovery_timeout_seconds
         paths = []
         for path in project_root.rglob("*.md"):
@@ -163,15 +164,17 @@ class MergePlanner:
         for source, target in proposal.renames:
             paths.extend((source, target))
         try:
-            expected = canonical_merge_path_identity(Path("项目") / project_id).split(
-                "/"
-            )
+            project_path = canonical_merge_project_path(project_id)
+            project_prefix = ("项目", *project_path.parts)
+            expected = canonical_merge_path_identity(
+                Path("项目") / project_path
+            ).split("/")
             vault = self.vault_root.resolve(strict=True)
             for raw_path in paths:
                 path = Path(raw_path)
                 if path.is_absolute() or not path.parts or ".." in path.parts:
                     raise ValueError
-                if tuple(path.parts[:2]) != ("项目", project_id):
+                if tuple(path.parts[: len(project_prefix)]) != project_prefix:
                     raise ValueError
                 identity = canonical_merge_path_identity(path).split("/")
                 if (

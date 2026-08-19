@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 
 from ai_todo_assistant.application.ports.codex_resume_client import CodexThreadResumeOutcome
+
+
+_SAFE_THREAD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z", re.ASCII)
 
 
 class CodexCliResumeClient:
@@ -20,6 +24,8 @@ class CodexCliResumeClient:
     def resume_thread(self, thread_id: str, prompt: str) -> CodexThreadResumeOutcome:
         if not self.enabled:
             return CodexThreadResumeOutcome(success=False, message="codex resume disabled")
+        if not _SAFE_THREAD_ID.fullmatch(thread_id):
+            return CodexThreadResumeOutcome(success=False, message="invalid codex thread id")
         base_command = _base_command(self.command)
         if not base_command:
             return CodexThreadResumeOutcome(success=False, message=f"codex command not found: {self.command}")
@@ -34,6 +40,7 @@ class CodexCliResumeClient:
                 timeout=self.timeout,
                 encoding="utf-8",
                 errors="replace",
+                shell=False,
             )
         except subprocess.TimeoutExpired:
             return CodexThreadResumeOutcome(success=False, message=f"codex resume timeout after {self.timeout}s")
@@ -47,17 +54,30 @@ class CodexCliResumeClient:
 
 
 def _base_command(command: str) -> list[str]:
-    resolved = shutil.which(command) or command
-    if not shutil.which(command) and not os.path.exists(resolved):
+    discovered = shutil.which(command)
+    resolved = discovered or command
+    if discovered is None and not os.path.isfile(resolved):
         return []
-    if os.name == "nt" and resolved.lower().endswith(".cmd"):
-        base_dir = os.path.dirname(resolved)
-        codex_js = os.path.join(base_dir, "node_modules", "@openai", "codex", "bin", "codex.js")
-        if os.path.exists(codex_js):
-            bundled_node = os.path.join(base_dir, "node.exe")
-            node = bundled_node if os.path.exists(bundled_node) else shutil.which("node") or "node"
-            return [node, codex_js]
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        return _native_windows_codex_command(resolved)
     return [resolved]
+
+
+def _native_windows_codex_command(batch_command: str) -> list[str]:
+    """Resolve a Windows batch shim without passing report-derived arguments to it."""
+    base_dir = os.path.dirname(batch_command)
+    native_codex = os.path.join(base_dir, "codex.exe")
+    if os.path.isfile(native_codex):
+        return [native_codex]
+
+    codex_js = os.path.join(base_dir, "node_modules", "@openai", "codex", "bin", "codex.js")
+    if not os.path.isfile(codex_js):
+        return []
+    bundled_node = os.path.join(base_dir, "node.exe")
+    node = bundled_node if os.path.isfile(bundled_node) else shutil.which("node")
+    if not node or not node.lower().endswith(".exe") or not os.path.isfile(node):
+        return []
+    return [node, codex_js]
 
 
 def _compact_output(stdout: str, stderr: str, limit: int = 1000) -> str:

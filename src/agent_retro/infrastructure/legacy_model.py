@@ -29,14 +29,14 @@ MODEL_CONFIG_KEYS = (
 
 
 def load_legacy_model_config(project_root: str | None = None) -> dict[str, object]:
-    """Return a fresh allowlisted model configuration dictionary."""
+    """Return allowlisted settings or propagate the typed configuration failure."""
 
     source = load_settings(project_root)
     return {key: source.get(key) for key in MODEL_CONFIG_KEYS}
 
 
 def build_retro_llm_client(project_root: str | None = None):
-    """Build the shared LLM client without exposing unrelated legacy settings."""
+    """Load validated settings before constructing any model client or endpoint."""
 
     return build_llm_client(load_legacy_model_config(project_root))
 

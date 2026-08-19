@@ -171,8 +171,12 @@ class DoctorService:
             config = self.model_config_loader()
             model = config.get("model")
         except Exception:
-            config = {}
-            model = None
+            return self._check(
+                "model",
+                "error",
+                "configuration_error",
+                "repair the selected ai-todo settings file",
+            )
         configured = isinstance(model, str) and bool(model.strip())
         if not configured:
             return self._check(

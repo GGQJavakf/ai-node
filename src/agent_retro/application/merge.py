@@ -9,7 +9,7 @@ import json
 import sqlite3
 import unicodedata
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Mapping, Sequence
 
 from agent_retro.application.ports import RetroRepository
@@ -320,10 +320,9 @@ class MergeService:
             raise KeyError("merge_plan_not_found")
         if job.status == "synced":
             return MergeApplyResult(plan.id, "already_applied")
-        required = {
-            item.operation_id
-            for item in (*plan.deletes, *plan.renames, *plan.conflicts)
-        }
+        required = {item.operation_id for item in plan.deletes}
+        required.update(item.operation_id for item in plan.renames)
+        required.update(item.operation_id for item in plan.conflicts)
         supplied = set(confirmed_operations)
         missing = required - supplied
         if missing:
@@ -740,6 +739,10 @@ class MergeService:
             raise ProjectionPersistenceError("merge_state_unavailable") from exc
 
     def _require_mapping(self, project_id: str) -> None:
+        try:
+            canonical_merge_project_path(project_id)
+        except ValueError as exc:
+            raise ValueError("project_mapping_invalid") from exc
         mappings = [
             item
             for item in self.repository.list_project_mappings()
@@ -749,6 +752,10 @@ class MergeService:
             raise ValueError("project_mapping_invalid")
 
     def _safe_relative(self, project_id: str, path: Path) -> Path:
+        try:
+            project_path = canonical_merge_project_path(project_id)
+        except ValueError as exc:
+            raise ValueError("project_mapping_invalid") from exc
         path = Path(path)
         if path.is_absolute():
             try:
@@ -758,8 +765,13 @@ class MergeService:
         if not path.parts or ".." in path.parts:
             raise ValueError("merge_target_outside_vault")
         _windows_path_identity(path)
-        if len(path.parts) >= 2 and path.parts[0] == "项目":
-            if path.parts[1] not in (project_id, "项目索引.md"):
+        if path.parts and path.parts[0] == "项目":
+            project_prefix = ("项目", *project_path.parts)
+            is_global_index = path.parts == ("项目", "项目索引.md")
+            if not is_global_index and (
+                len(path.parts) < len(project_prefix)
+                or tuple(path.parts[: len(project_prefix)]) != project_prefix
+            ):
                 raise ValueError("merge_target_cross_project")
         root = self.vault_root.resolve(strict=True)
         current = self.vault_root
@@ -891,6 +903,36 @@ def canonical_merge_path_identity(path: Path) -> str:
     """Return the Windows-compatible identity used by persisted merge plans."""
 
     return _windows_path_identity(Path(path))
+
+
+def canonical_merge_project_path(project_id: str) -> Path:
+    """Return one safe canonical relative project path, including nested projects."""
+
+    candidate = Path(project_id)
+    windows_candidate = PureWindowsPath(project_id)
+    marker_unsafe = (
+        "--" in project_id
+        or "<" in project_id
+        or ">" in project_id
+        or any(ord(character) < 32 for character in project_id)
+    )
+    path_unsafe = (
+        "\\" in project_id
+        or candidate.as_posix() != project_id
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    )
+    if (
+        not project_id
+        or marker_unsafe
+        or path_unsafe
+        or candidate.is_absolute()
+        or windows_candidate.is_absolute()
+        or bool(windows_candidate.drive)
+        or bool(windows_candidate.root)
+    ):
+        raise ValueError("merge_project_invalid")
+    _windows_path_identity(candidate)
+    return candidate
 
 
 def _reconciliation_id(
@@ -1047,9 +1089,10 @@ def _plan_from_data(data: object) -> MergePlan:
 
 
 def required_merge_operation_ids(plan: MergePlan) -> frozenset[str]:
-    return frozenset(
-        item.operation_id for item in (*plan.deletes, *plan.renames, *plan.conflicts)
-    )
+    required = {item.operation_id for item in plan.deletes}
+    required.update(item.operation_id for item in plan.renames)
+    required.update(item.operation_id for item in plan.conflicts)
+    return frozenset(required)
 
 
 def load_persisted_merge_plan(job: SyncJob, plan_id: str) -> MergePlan:
@@ -1077,43 +1120,45 @@ def load_persisted_merge_plan(job: SyncJob, plan_id: str) -> MergePlan:
     for target in plan.targets:
         if target.path_identity != _windows_path_identity(target.path):
             raise MergeIntegrityError("merge_plan_path_identity_mismatch")
-    for item in plan.deletes:
+    for delete_item in plan.deletes:
         identity = [
             "delete",
-            item.path_identity,
-            item.input_exists,
-            item.input_kind,
-            item.input_hash,
+            delete_item.path_identity,
+            delete_item.input_exists,
+            delete_item.input_kind,
+            delete_item.input_hash,
         ]
-        if item.path_identity != _windows_path_identity(
-            item.path
-        ) or item.operation_id != _operation_id(identity):
+        if delete_item.path_identity != _windows_path_identity(
+            delete_item.path
+        ) or delete_item.operation_id != _operation_id(identity):
             raise MergeIntegrityError("merge_operation_identity_mismatch")
-    for item in plan.renames:
+    for rename_item in plan.renames:
         identity = [
             "rename",
-            item.source_identity,
-            item.target_identity,
-            item.source_exists,
-            item.source_kind,
-            item.target_exists,
-            item.target_kind,
-            item.source_hash,
-            item.target_hash,
+            rename_item.source_identity,
+            rename_item.target_identity,
+            rename_item.source_exists,
+            rename_item.source_kind,
+            rename_item.target_exists,
+            rename_item.target_kind,
+            rename_item.source_hash,
+            rename_item.target_hash,
         ]
         if (
-            item.source_identity != _windows_path_identity(item.source)
-            or item.target_identity != _windows_path_identity(item.target)
-            or item.operation_id != _operation_id(identity)
+            rename_item.source_identity != _windows_path_identity(rename_item.source)
+            or rename_item.target_identity != _windows_path_identity(rename_item.target)
+            or rename_item.operation_id != _operation_id(identity)
         ):
             raise MergeIntegrityError("merge_operation_identity_mismatch")
-    for item in plan.conflicts:
-        if item.operation_id != _operation_id(["conflict", item.description]):
+    for conflict_item in plan.conflicts:
+        if conflict_item.operation_id != _operation_id(
+            ["conflict", conflict_item.description]
+        ):
             raise MergeIntegrityError("merge_operation_identity_mismatch")
     identities = [target.path_identity for target in plan.targets]
-    identities.extend(item.path_identity for item in plan.deletes)
-    for item in plan.renames:
-        identities.extend((item.source_identity, item.target_identity))
+    identities.extend(delete_item.path_identity for delete_item in plan.deletes)
+    for rename_item in plan.renames:
+        identities.extend((rename_item.source_identity, rename_item.target_identity))
     if len(identities) != len(set(identities)):
         raise MergeIntegrityError("merge_plan_paths_overlap")
     return plan

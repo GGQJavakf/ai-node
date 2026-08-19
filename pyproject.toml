@@ -20,3 +20,6 @@ retro = "agent_retro.presentation.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.data-files]
+"share/ai-todo-assistant" = ["config/settings.example.json"]

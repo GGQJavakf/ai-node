@@ -10,6 +10,9 @@ from agent_retro.presentation import cli as retro_cli
 
 
 class _EmptyBriefRepository:
+    def expire_task_states(self, at):
+        return []
+
     def list_brief_knowledge(self, project_id, at):
         return []
 

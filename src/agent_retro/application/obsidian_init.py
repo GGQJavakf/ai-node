@@ -10,7 +10,7 @@ import shutil
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable
 
 from agent_retro.application.ports import RetroRepository
@@ -93,9 +93,15 @@ class ManagedBoundaryInitializer:
 
     def preview(self, project_id: str) -> BoundaryInitPlan:
         vault = self._validate_context(project_id)
+        project_path = Path(project_id)
         planned: list[tuple[Path, ManagedBoundaryKind, bytes, bytes, str]] = []
         candidates: tuple[tuple[Path, ManagedBoundaryKind], ...] = (
-            (Path("项目") / project_id / f"项目_{project_id}.md", "summary"),
+            (
+                Path("项目")
+                / project_path
+                / f"项目_{project_path.name}.md",
+                "summary",
+            ),
             (Path("项目") / "项目索引.md", "index"),
         )
         for relative, kind in candidates:
@@ -241,19 +247,27 @@ class ManagedBoundaryInitializer:
     @staticmethod
     def _validate_project_id(project_id: str) -> None:
         candidate = Path(project_id)
+        windows_candidate = PureWindowsPath(project_id)
         marker_unsafe = (
             "--" in project_id
             or "<" in project_id
             or ">" in project_id
             or any(ord(character) < 32 for character in project_id)
         )
+        path_unsafe = (
+            "\\" in project_id
+            or any(character in ':"|?*' for character in project_id)
+            or candidate.as_posix() != project_id
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        )
         if (
             not project_id
             or marker_unsafe
+            or path_unsafe
             or candidate.is_absolute()
-            or len(candidate.parts) != 1
-            or candidate.name != project_id
-            or project_id in {".", ".."}
+            or windows_candidate.is_absolute()
+            or bool(windows_candidate.drive)
+            or bool(windows_candidate.root)
         ):
             raise BoundaryInitError("invalid_project_id")
 

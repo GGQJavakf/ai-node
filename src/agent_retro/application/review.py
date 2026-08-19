@@ -347,7 +347,9 @@ class ReviewService:
         except ReviewUnavailableError as exc:
             if exc.candidate_ids == candidate_ids:
                 raise
-            cause = exc.__cause__ or exc
+            cause = exc.__cause__
+            if not isinstance(cause, Exception):
+                cause = exc
             raise ReviewUnavailableError(
                 f"model review failed; retry is available ({safe_error(cause)})",
                 candidate_ids=candidate_ids,

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, replace
@@ -340,18 +338,20 @@ class SQLiteRetroRepository(RetroRepository):
             return 0
         connection = self._connect()
         try:
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'schema_version'"
-            ).fetchone()
-            if exists is None:
-                return 0
-            row = connection.execute(
-                "SELECT version FROM schema_version LIMIT 1"
-            ).fetchone()
-            return 0 if row is None else int(row[0])
+            return self._schema_version(connection)
         finally:
             connection.close()
+
+    @staticmethod
+    def _schema_version(connection: sqlite3.Connection) -> int:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'schema_version'"
+        ).fetchone()
+        if exists is None:
+            return 0
+        row = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        return 0 if row is None else int(row[0])
 
     def table_names(self) -> list[str]:
         if not self.db_path.exists():
@@ -368,34 +368,43 @@ class SQLiteRetroRepository(RetroRepository):
             connection.close()
 
     def migrate(self, target_version: int = _SCHEMA_VERSION) -> None:
-        """Migrate after a byte-for-byte backup, restoring it on failure."""
+        """Migrate under one writer fence after a verified SQLite snapshot."""
 
         if target_version < 1:
             raise ValueError("target_version must be at least 1")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        database_existed = self.db_path.exists()
+        created_database = False
+        if not self.db_path.exists():
+            try:
+                self.db_path.touch(exist_ok=False)
+                created_database = True
+            except FileExistsError:
+                pass
         connection: sqlite3.Connection | None = None
         backup_path: Path | None = None
-        backup_hash: str | None = None
+        current_version = 0
         try:
-            current_version = self.schema_version()
+            connection = self._connect()
+            connection.execute("BEGIN IMMEDIATE")
+            current_version = self._schema_version(connection)
+            if current_version > 0:
+                created_database = False
             if current_version == target_version:
+                connection.rollback()
+                connection.close()
+                connection = None
                 return
             if current_version > target_version:
                 raise ValueError("database downgrades are not supported")
 
-            if database_existed:
-                self._prepare_database_for_backup()
+            if not created_database:
                 self.backup_dir.mkdir(parents=True, exist_ok=True)
                 stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
                 backup_path = self.backup_dir / (
                     f"migration-{current_version}-to-{target_version}-{stamp}.db"
                 )
-                shutil.copy2(self.db_path, backup_path)
-                backup_hash = _sha256_file(backup_path)
+                self._create_migration_backup(backup_path)
 
-            connection = self._connect()
-            connection.execute("BEGIN IMMEDIATE")
             for version in range(current_version + 1, target_version + 1):
                 self._apply_migration(connection, version)
                 self._append_audit_record(
@@ -420,12 +429,19 @@ class SQLiteRetroRepository(RetroRepository):
                     connection.close()
                 except BaseException:
                     pass
-            if backup_path is not None and backup_hash is not None:
-                self._restore_backup(backup_path, backup_hash)
-            elif not database_existed:
+                connection = None
+            if created_database:
                 self._remove_failed_database()
+            elif backup_path is not None and backup_path.exists():
+                try:
+                    self._verify_database_readback(current_version)
+                except BaseException as recovery_error:
+                    raise RuntimeError(
+                        "migration rollback verification failed; verified backup retained"
+                    ) from recovery_error
             raise
         else:
+            assert connection is not None
             connection.close()
 
     def _apply_migration(self, connection: sqlite3.Connection, version: int) -> None:
@@ -446,44 +462,49 @@ class SQLiteRetroRepository(RetroRepository):
             return
         raise ValueError(f"unsupported schema migration: {version}")
 
-    def _restore_backup(self, backup_path: Path, expected_hash: str) -> None:
-        restore_path = self.db_path.with_name(f".{self.db_path.name}.restore")
-        self._remove_database_sidecars()
-        try:
-            shutil.copy2(backup_path, restore_path)
-            if _sha256_file(restore_path) != expected_hash:
-                raise RuntimeError("migration backup copy hash mismatch")
-            os.replace(restore_path, self.db_path)
-            if _sha256_file(self.db_path) != expected_hash:
-                raise RuntimeError("migration backup restoration hash mismatch")
-            self._verify_database_readback()
-        finally:
-            restore_path.unlink(missing_ok=True)
-            self._remove_database_sidecars()
+    def _create_migration_backup(self, backup_path: Path) -> None:
+        """Create a logical snapshot while the migration connection fences writers."""
 
-    def _prepare_database_for_backup(self) -> None:
-        """Recover journals and checkpoint WAL before copying the main file."""
-
-        connection = self._connect()
+        if backup_path.exists():
+            raise FileExistsError(f"migration backup already exists: {backup_path}")
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        backup_complete = False
+        backup_created = False
         try:
-            checkpoint = connection.execute(
-                "PRAGMA wal_checkpoint(TRUNCATE)"
-            ).fetchone()
-            if checkpoint is not None and int(checkpoint[0]) != 0:
-                raise RuntimeError("database WAL checkpoint is busy")
-            result = connection.execute("PRAGMA quick_check").fetchone()
+            source = sqlite3.connect(self.db_path)
+            destination = sqlite3.connect(backup_path)
+            backup_created = True
+            source.backup(destination)
+            result = destination.execute("PRAGMA quick_check").fetchone()
             if result is None or str(result[0]).lower() != "ok":
-                raise RuntimeError("database failed pre-migration readback")
+                raise RuntimeError("migration backup failed readback")
+            destination.commit()
+            backup_complete = True
         finally:
-            connection.close()
-        self._remove_database_sidecars()
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+            if backup_created and not backup_complete:
+                for path in (
+                    backup_path,
+                    Path(f"{backup_path}-journal"),
+                    Path(f"{backup_path}-wal"),
+                    Path(f"{backup_path}-shm"),
+                ):
+                    path.unlink(missing_ok=True)
+        if not backup_path.exists():
+            raise RuntimeError("migration backup was not created")
 
-    def _verify_database_readback(self) -> None:
+    def _verify_database_readback(self, expected_version: int) -> None:
         connection = sqlite3.connect(self.db_path)
         try:
             result = connection.execute("PRAGMA quick_check").fetchone()
             if result is None or str(result[0]).lower() != "ok":
-                raise RuntimeError("restored database failed readback")
+                raise RuntimeError("migration rollback failed readback")
+            if self._schema_version(connection) != expected_version:
+                raise RuntimeError("migration rollback did not restore the schema version")
         finally:
             connection.close()
 

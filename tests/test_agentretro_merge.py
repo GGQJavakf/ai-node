@@ -20,7 +20,11 @@ from agent_retro.application.merge import (
     StalePlanError,
     SensitiveMergeContentError,
 )
-from agent_retro.application.merge_planner import MergePlanner, MergeProposal
+from agent_retro.application.merge_planner import (
+    MergePlanner,
+    MergeProposal,
+    MergeProposalScopeError,
+)
 from agent_retro.application.knowledge import KnowledgeService
 from agent_retro.application.sync import ProjectionCoordinator, SyncService
 from agent_retro.application.sync import ProjectionPersistenceError
@@ -69,15 +73,15 @@ def _knowledge(identifier: str = "rule-1", text: str = "数据库规则") -> Kno
     )
 
 
-def _repo(tmp_path: Path) -> SQLiteRetroRepository:
+def _repo(tmp_path: Path, project_id: str = "NPKI") -> SQLiteRetroRepository:
     repository = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
     repository.migrate()
     repository.save_project_mapping(
         ProjectMapping(
-            id="mapping-npki",
+            id=f"mapping-{project_id.replace('/', '-')}",
             git_root=tmp_path / "repo",
             remote_identity="https://example.invalid/npki.git",
-            obsidian_project="NPKI",
+            obsidian_project=project_id,
         ),
         "user",
     )
@@ -85,11 +89,11 @@ def _repo(tmp_path: Path) -> SQLiteRetroRepository:
 
 
 def _service(
-    tmp_path: Path, *, replace=os.replace
+    tmp_path: Path, *, replace=os.replace, project_id: str = "NPKI"
 ) -> tuple[SQLiteRetroRepository, MergeService, Path]:
     vault = tmp_path / "vault"
     vault.mkdir()
-    repository = _repo(tmp_path)
+    repository = _repo(tmp_path, project_id)
     sync = SyncService(
         repository,
         vault,
@@ -1228,6 +1232,137 @@ def test_semantic_merge_planner_redacts_bounded_project_markdown_and_only_plans(
     assert source.read_text(encoding="utf-8").endswith("project notes\n")
 
 
+def test_nested_semantic_merge_plan_preview_apply_and_backup(tmp_path: Path) -> None:
+    project_id = "Team/Example"
+    repository, service, vault = _service(tmp_path, project_id=project_id)
+    project_root = vault / "项目" / "Team" / "Example"
+    project_root.mkdir(parents=True)
+    source = project_root / "source.md"
+    original = b"# Original\n\nproject notes\n"
+    replacement = "# Organized\n\nproject notes\n"
+    source.write_bytes(original)
+    gateway = _ProposalGateway(
+        MergeProposal(
+            replacements={Path("项目/Team/Example/source.md"): replacement},
+            deletes=(),
+            renames=(),
+            conflicts=(),
+        )
+    )
+    planner = MergePlanner(service, vault, gateway)
+
+    plan = planner.plan(project_id, "organize")
+
+    assert set(gateway.calls[0][2]) == {"项目/Team/Example/source.md"}
+    assert plan.project_id == project_id
+    assert plan.targets[0].path == Path("项目/Team/Example/source.md")
+    assert service.preview(plan.id) == plan
+    assert source.read_bytes() == original
+    assert repository.get_sync_job(plan.id).status == "planned"
+
+    applied = service.apply(plan.id, confirmed=True)
+
+    assert applied.status == "synced"
+    assert source.read_text(encoding="utf-8") == replacement
+    assert (
+        tmp_path
+        / "backups"
+        / plan.id
+        / "项目"
+        / "Team"
+        / "Example"
+        / "source.md"
+    ).read_bytes() == original
+
+
+def test_nested_semantic_merge_rejects_noncontained_proposal_paths(
+    tmp_path: Path,
+) -> None:
+    project_id = "Team/Example"
+    repository, service, vault = _service(tmp_path, project_id=project_id)
+    project_root = vault / "项目" / "Team" / "Example"
+    project_root.mkdir(parents=True)
+    source = project_root / "source.md"
+    source.write_text("source\n", encoding="utf-8")
+    before = source.read_bytes()
+    invalid_paths = (
+        Path("项目/Team/Other/out.md"),
+        Path("项目/Team/ExampleSibling/out.md"),
+        Path("项目/Team/Example/../../Other/out.md"),
+        Path("项目/Team/Example/.obsidian/out.md"),
+        (vault / "项目" / "Team" / "Example" / "absolute.md").resolve(),
+    )
+
+    for invalid_path in invalid_paths:
+        gateway = _ProposalGateway(
+            MergeProposal({invalid_path: "output\n"}, (), (), ())
+        )
+        planner = MergePlanner(service, vault, gateway)
+
+        with pytest.raises(MergeProposalScopeError, match="merge_proposal_scope_invalid"):
+            planner.plan(project_id, "organize")
+
+    assert source.read_bytes() == before
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    "project_id",
+    (
+        "Team/../Example",
+        "/absolute/Example",
+        "C:/absolute/Example",
+        "//server/share/Example",
+        "Team/Example -->",
+    ),
+)
+def test_semantic_merge_rejects_unsafe_project_identity_before_gateway(
+    tmp_path: Path, project_id: str
+) -> None:
+    _, service, vault = _service(tmp_path)
+    gateway = _ProposalGateway(
+        MergeProposal({Path("项目/NPKI/out.md"): "output\n"}, (), (), ())
+    )
+    planner = MergePlanner(service, vault, gateway)
+
+    with pytest.raises(ValueError, match="merge_planner_project_invalid"):
+        planner.plan(project_id, "organize")
+
+    assert gateway.calls == []
+
+
+def test_nested_semantic_merge_rejects_symlinked_project_component(
+    tmp_path: Path,
+) -> None:
+    project_id = "Team/Example"
+    _, service, vault = _service(tmp_path, project_id=project_id)
+    actual = vault / "actual"
+    (actual / "Example").mkdir(parents=True)
+    (actual / "Example" / "source.md").write_text("source\n", encoding="utf-8")
+    projects = vault / "项目"
+    projects.mkdir()
+    try:
+        (projects / "Team").symlink_to(actual, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    gateway = _ProposalGateway(
+        MergeProposal({Path("项目/Team/Example/out.md"): "output\n"}, (), (), ())
+    )
+    planner = MergePlanner(service, vault, gateway)
+
+    with pytest.raises(ValueError, match="merge_planner_unsafe_markdown"):
+        planner.plan(project_id, "organize")
+
+    assert gateway.calls == []
+    assert not (actual / "Example" / "out.md").exists()
+
+
 def test_semantic_merge_planner_enforces_file_limit_before_gateway(
     tmp_path: Path,
 ) -> None:
@@ -1966,6 +2101,32 @@ def test_cross_boundary_or_cross_project_target_is_rejected(
 
     assert not (tmp_path / "escape.md").exists()
     assert not (vault / "项目" / "OTHER" / "prose.md").exists()
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        Path("项目/Team/Other/out.md"),
+        Path("项目/Team/ExampleSibling/out.md"),
+        Path("项目/Team/out.md"),
+    ),
+)
+def test_nested_merge_service_validates_the_complete_project_prefix(
+    tmp_path: Path, target: Path
+) -> None:
+    repository, service, vault = _service(tmp_path, project_id="Team/Example")
+
+    with pytest.raises(ValueError, match="merge_target_cross_project"):
+        service.create_plan("Team/Example", replacements={target: b"bad"})
+
+    assert not (vault / target).exists()
+    with sqlite3.connect(repository.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sync_jobs WHERE id LIKE 'merge-%'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_symlink_introduced_after_preview_is_typed_stale_and_zero_write(

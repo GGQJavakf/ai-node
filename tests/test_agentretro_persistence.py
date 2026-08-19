@@ -1,6 +1,4 @@
 import sqlite3
-import subprocess
-import sys
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -310,12 +308,18 @@ def test_capture_round_trips_complete_evidence_locators_without_derivation(tmp_p
     assert repo.list_evidence(session.id) == [evidence]
 
 
-def test_failed_migration_restores_database(tmp_path, monkeypatch):
+def test_failed_migration_rolls_back_and_keeps_a_consistent_backup(
+    tmp_path, monkeypatch
+):
     db_path = tmp_path / "retro.db"
     backup_dir = tmp_path / "backups"
     repo = SQLiteRetroRepository(db_path, backup_dir)
     repo.migrate(target_version=1)
-    before = db_path.read_bytes()
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE pre_migration_probe(value TEXT NOT NULL)")
+        connection.execute("INSERT INTO pre_migration_probe VALUES ('preserved')")
+        connection.commit()
+    connection.close()
 
     monkeypatch.setattr(
         repo,
@@ -328,8 +332,11 @@ def test_failed_migration_restores_database(tmp_path, monkeypatch):
 
     backups = list(backup_dir.glob("migration-1-to-2-*.db"))
     assert len(backups) == 1
-    assert backups[0].read_bytes() == before
-    assert db_path.read_bytes() == before
+    assert _rows(backups[0], "PRAGMA quick_check")[0][0] == "ok"
+    assert _rows(backups[0], "SELECT value FROM pre_migration_probe")[0][0] == (
+        "preserved"
+    )
+    assert _rows(db_path, "SELECT value FROM pre_migration_probe")[0][0] == "preserved"
     assert repo.schema_version() == 1
 
 
@@ -402,9 +409,7 @@ def test_rollback_failure_does_not_skip_restore_or_replace_original_error(
     db_path = tmp_path / "retro.db"
     repo = SQLiteRetroRepository(db_path, tmp_path / "backups")
     repo.migrate(target_version=1)
-    before = db_path.read_bytes()
     original_connect = repo._connect
-    connect_count = 0
 
     class RollbackFailureConnection:
         def __init__(self, connection):
@@ -424,12 +429,7 @@ def test_rollback_failure_does_not_skip_restore_or_replace_original_error(
             return self.connection.close()
 
     def connect_with_rollback_failure():
-        nonlocal connect_count
-        connect_count += 1
-        connection = original_connect()
-        if connect_count == 3:
-            return RollbackFailureConnection(connection)
-        return connection
+        return RollbackFailureConnection(original_connect())
 
     monkeypatch.setattr(repo, "_connect", connect_with_rollback_failure)
     monkeypatch.setattr(
@@ -441,29 +441,21 @@ def test_rollback_failure_does_not_skip_restore_or_replace_original_error(
     with pytest.raises(RuntimeError, match="injected"):
         repo.migrate(target_version=2)
 
-    assert db_path.read_bytes() == before
+    assert repo.schema_version() == 1
+    assert _rows(db_path, "PRAGMA quick_check")[0][0] == "ok"
 
 
-def test_failed_migration_removes_sidecars_before_restoring_backup(
+def test_failed_existing_database_migration_never_unlinks_live_sidecars(
     tmp_path, monkeypatch
 ):
     db_path = tmp_path / "retro.db"
     repo = SQLiteRetroRepository(db_path, tmp_path / "backups")
     repo.migrate(target_version=1)
-    before = db_path.read_bytes()
-    sidecars = [
-        Path(f"{db_path}-journal"),
-        Path(f"{db_path}-wal"),
-        Path(f"{db_path}-shm"),
-    ]
-    original_restore = repo._restore_backup
-
-    def restore_with_stale_sidecars(backup_path, expected_hash):
-        for path in sidecars:
-            path.write_bytes(b"stale")
-        original_restore(backup_path, expected_hash)
-
-    monkeypatch.setattr(repo, "_restore_backup", restore_with_stale_sidecars)
+    monkeypatch.setattr(
+        repo,
+        "_remove_database_sidecars",
+        lambda: pytest.fail("existing database sidecars must not be unlinked"),
+    )
     monkeypatch.setattr(
         repo,
         "_apply_migration",
@@ -473,54 +465,49 @@ def test_failed_migration_removes_sidecars_before_restoring_backup(
     with pytest.raises(RuntimeError, match="injected"):
         repo.migrate(target_version=2)
 
-    assert db_path.read_bytes() == before
-    assert all(not path.exists() for path in sidecars)
+    assert repo.schema_version() == 1
+    assert _rows(db_path, "PRAGMA quick_check")[0][0] == "ok"
 
 
-def test_migration_backup_checkpoints_wal_before_copy(tmp_path, monkeypatch):
+def test_migration_backup_includes_wal_and_fences_concurrent_writers(
+    tmp_path, monkeypatch
+):
     db_path = tmp_path / "retro.db"
     repo = SQLiteRetroRepository(db_path, tmp_path / "backups")
-    repo.migrate()
-    sidecars = [
-        Path(f"{db_path}-journal"),
-        Path(f"{db_path}-wal"),
-        Path(f"{db_path}-shm"),
-    ]
+    repo.migrate(target_version=1)
+    wal_connection = sqlite3.connect(db_path)
+    wal_connection.execute("PRAGMA journal_mode=WAL")
+    wal_connection.execute("PRAGMA wal_autocheckpoint=0")
+    wal_connection.execute("CREATE TABLE wal_probe(value TEXT NOT NULL)")
+    wal_connection.execute("INSERT INTO wal_probe VALUES ('preserved')")
+    wal_connection.commit()
+    assert Path(f"{db_path}-wal").exists()
+    original_backup = repo._create_migration_backup
+    writer_was_fenced = False
 
-    def schema_version_after_uncheckpointed_write():
-        script = (
-            "import os, sqlite3, sys\n"
-            "connection = sqlite3.connect(sys.argv[1])\n"
-            "connection.execute('PRAGMA journal_mode=WAL')\n"
-            "connection.execute('PRAGMA wal_autocheckpoint=0')\n"
-            "connection.execute('CREATE TABLE wal_probe(value TEXT NOT NULL)')\n"
-            "connection.execute(\"INSERT INTO wal_probe VALUES ('preserved')\")\n"
-            "connection.commit()\n"
-            "os._exit(0)\n"
-        )
-        result = subprocess.run(
-            [sys.executable, "-c", script, str(db_path)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert result.returncode == 0, result.stderr
-        assert Path(f"{db_path}-wal").exists()
-        return 1
+    def backup_with_concurrent_writer_probe(backup_path):
+        nonlocal writer_was_fenced
+        writer = sqlite3.connect(db_path, timeout=0)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                writer.execute("INSERT INTO wal_probe VALUES ('raced')")
+                writer.commit()
+            writer_was_fenced = True
+        finally:
+            writer.close()
+        original_backup(backup_path)
 
-    monkeypatch.setattr(
-        repo, "schema_version", schema_version_after_uncheckpointed_write
-    )
-    monkeypatch.setattr(
-        repo,
-        "_apply_migration",
-        lambda connection, version: (_ for _ in ()).throw(RuntimeError("injected")),
-    )
-
-    with pytest.raises(RuntimeError, match="injected"):
+    monkeypatch.setattr(repo, "_create_migration_backup", backup_with_concurrent_writer_probe)
+    try:
         repo.migrate(target_version=2)
+    finally:
+        wal_connection.close()
 
-    assert all(not path.exists() for path in sidecars)
+    assert writer_was_fenced is True
+    backups = list((tmp_path / "backups").glob("migration-1-to-2-*.db"))
+    assert len(backups) == 1
+    assert _rows(backups[0], "PRAGMA quick_check")[0][0] == "ok"
+    assert _rows(backups[0], "SELECT value FROM wal_probe")[0][0] == "preserved"
     assert _rows(db_path, "SELECT value FROM wal_probe")[0][0] == "preserved"
 
 

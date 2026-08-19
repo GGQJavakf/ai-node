@@ -486,7 +486,7 @@ def _run_command(
         report = build_doctor_service(
             settings, codex_home, load_legacy_model_config
         ).run()
-        data = doctor_json_data(report)
+        doctor_data = doctor_json_data(report)
         if args.json_output:
             write_json(
                 {
@@ -497,7 +497,7 @@ def _run_command(
                         else "RETRO_DOCTOR_ISSUES"
                     ),
                     "message": "AgentRetro doctor checks completed.",
-                    "data": data,
+                    "data": doctor_data,
                 }
             )
         else:
@@ -516,25 +516,27 @@ def _run_command(
         preview = (
             guidance.preview_remove() if action == "remove" else guidance.preview()
         )
-        data = _guidance_preview_data(preview)
-        data["override_conflict"] = (codex_home / "AGENTS.override.md").exists() or (
+        guidance_data = _guidance_preview_data(preview)
+        guidance_data["override_conflict"] = (
+            codex_home / "AGENTS.override.md"
+        ).exists() or (
             codex_home / "AGENTS.override.md"
         ).is_symlink()
         if action != "preview":
-            result = (
+            guidance_result = (
                 guidance.remove(preview.id)
                 if action == "remove"
                 else guidance.apply(preview.id)
             )
-            data.update(
+            guidance_data.update(
                 {
-                    "changed": result.changed,
-                    "result_status": result.status,
-                    "target_hash": result.target_hash,
+                    "changed": guidance_result.changed,
+                    "result_status": guidance_result.status,
+                    "target_hash": guidance_result.target_hash,
                 }
             )
             if action == "apply":
-                data["discoverable"] = result.discoverable
+                guidance_data["discoverable"] = guidance_result.discoverable
         code = {
             "preview": "RETRO_CODEX_INTEGRATION_PREVIEW",
             "apply": "RETRO_CODEX_INTEGRATION_APPLIED",
@@ -546,16 +548,16 @@ def _run_command(
                     "status": "ok",
                     "code": code,
                     "message": "Codex guidance integration command completed.",
-                    "data": data,
+                    "data": guidance_data,
                 }
             )
         else:
-            sys.stdout.write(safe_text(json_text(data)) + "\n")
+            sys.stdout.write(safe_text(json_text(guidance_data)) + "\n")
         return 0
 
     repository = build_retro_repository(settings)
     if args.command == "brief":
-        result = BriefService(
+        brief_result = BriefService(
             repository,
             timeout_seconds=settings.brief_timeout_seconds,
             default_max_tokens=settings.brief_max_tokens,
@@ -572,13 +574,13 @@ def _run_command(
                     "status": "ok",
                     "code": "RETRO_BRIEF_READY",
                     "message": "Task-scoped brief generated.",
-                    "data": brief_json_data(result),
+                    "data": brief_json_data(brief_result),
                 }
             )
         elif args.markdown:
-            sys.stdout.write(safe_text(render_brief_markdown(result)))
+            sys.stdout.write(safe_text(render_brief_markdown(brief_result)))
         else:
-            sys.stdout.write(safe_text(render_brief_terminal(result)))
+            sys.stdout.write(safe_text(render_brief_terminal(brief_result)))
         return 0
 
     coordinator = build_projection_coordinator(settings, repository)
@@ -596,41 +598,56 @@ def _run_command(
         exit_code = 0
         if args.sync_command == "init":
             initializer = build_managed_boundary_initializer(settings, repository)
-            plan = initializer.preview(args.project_id)
-            data = _boundary_init_plan_data(plan)
+            init_plan = initializer.preview(args.project_id)
+            sync_data = _boundary_init_plan_data(init_plan)
             if args.init_plan_id:
-                result = initializer.apply(args.project_id, args.init_plan_id)
-                data = _boundary_init_plan_data(result.plan)
-                data.update(
+                init_result = initializer.apply(args.project_id, args.init_plan_id)
+                sync_data = _boundary_init_plan_data(init_result.plan)
+                sync_data.update(
                     {
-                        "status": result.status.value,
-                        "changed": result.changed,
-                        "reason": result.reason,
-                        "recovery_command": result.recovery_command,
+                        "status": init_result.status.value,
+                        "changed": init_result.changed,
+                        "reason": init_result.reason,
+                        "recovery_command": init_result.recovery_command,
                     }
                 )
                 code = (
                     "RETRO_SYNC_INIT_APPLIED"
-                    if result.status is ProjectionStatus.SYNCED
+                    if init_result.status is ProjectionStatus.SYNCED
                     else "RETRO_SYNC_INIT_FAILED"
                 )
-                if result.status is not ProjectionStatus.SYNCED:
+                if init_result.status is not ProjectionStatus.SYNCED:
                     exit_code = 2
                 message = "Obsidian managed-boundary initialization applied."
             else:
                 code = "RETRO_SYNC_INIT_PREVIEW"
                 message = "Obsidian managed-boundary initialization previewed."
         elif args.sync_command == "retry":
-            result = coordinator.retry(args.event_id)
-            data = {
-                "event_id": result.event_id,
-                "projection_status": result.status.value,
-                "warning": result.warning,
-                "recovery_command": result.recovery_command,
-                "reason": result.reason,
+            retry_result = coordinator.retry(args.event_id)
+            sync_data = {
+                "event_id": retry_result.event_id,
+                "projection_status": retry_result.status.value,
+                "warning": retry_result.warning,
+                "recovery_command": retry_result.recovery_command,
+                "reason": retry_result.reason,
             }
-            code = "RETRO_SYNC_RETRIED"
-            message = "Obsidian projection retry completed."
+            if retry_result.status is ProjectionStatus.SYNCED:
+                code = "RETRO_SYNC_RETRIED"
+                message = "Obsidian projection retry completed."
+            else:
+                exit_code = 2
+                code = retry_result.warning or (
+                    "RETRO_ROLLBACK_REQUIRED"
+                    if retry_result.status is ProjectionStatus.ROLLBACK_REQUIRED
+                    else "RETRO_SYNC_PENDING"
+                )
+                if not sync_data["recovery_command"]:
+                    sync_data["recovery_command"] = (
+                        "retro doctor --repair-sync"
+                        if retry_result.status is ProjectionStatus.ROLLBACK_REQUIRED
+                        else f"retro sync retry {retry_result.event_id}"
+                    )
+                message = "Obsidian projection retry remains incomplete."
         else:
             merge_service = MergeService(
                 repository,
@@ -639,7 +656,7 @@ def _run_command(
             )
             if args.sync_command == "conflicts":
                 conflicts = merge_service.find_external_edits(args.project_id)
-                data = {
+                sync_data = {
                     "conflicts": [
                         {
                             "id": item.id,
@@ -658,7 +675,7 @@ def _run_command(
                 reconciled = merge_service.reconcile(
                     args.conflict_id, args.action, actor="user"
                 )
-                data = {
+                sync_data = {
                     "conflict_id": reconciled.conflict_id,
                     "status": reconciled.status,
                     "candidate_id": reconciled.candidate_id,
@@ -672,55 +689,67 @@ def _run_command(
                     "status": "ok" if exit_code == 0 else "error",
                     "code": code,
                     "message": message,
-                    "data": data,
+                    "data": sync_data,
                 }
             )
         else:
-            sys.stdout.write(safe_text(json_text(data)) + "\n")
+            sys.stdout.write(safe_text(json_text(sync_data)) + "\n")
         return exit_code
     if args.command == "merge":
+        exit_code = 0
         merge_service = MergeService(
             repository,
             settings.obsidian_root,
             settings.backup_dir,
         )
         if args.merge_command == "plan":
-            plan = _build_merge_planner(settings, repository).plan(
+            merge_plan = _build_merge_planner(settings, repository).plan(
                 args.project_id, args.instruction
             )
-            data = _merge_plan_data(plan)
+            merge_data = _merge_plan_data(merge_plan)
             code = "RETRO_MERGE_PLANNED"
             message = "Preview-only semantic merge plan created."
         elif args.merge_command == "preview":
-            plan = merge_service.preview(args.plan_id)
-            data = _merge_plan_data(plan)
+            merge_plan = merge_service.preview(args.plan_id)
+            merge_data = _merge_plan_data(merge_plan)
             code = "RETRO_MERGE_PREVIEW"
             message = "Current complete merge plan preview."
         else:
-            result = merge_service.apply(
+            merge_result = merge_service.apply(
                 args.plan_id,
                 confirmed=args.merge_confirmed,
                 confirmed_operations=tuple(args.confirmed_operations),
             )
-            data = {
-                "plan_id": result.plan_id,
-                "status": result.status,
-                "reason": result.reason,
+            merge_data = {
+                "plan_id": merge_result.plan_id,
+                "status": merge_result.status,
+                "reason": merge_result.reason,
             }
-            code = "RETRO_MERGE_APPLIED"
-            message = "Confirmed merge apply completed."
+            if merge_result.status in {"synced", "already_applied"}:
+                code = "RETRO_MERGE_APPLIED"
+                message = "Confirmed merge apply completed."
+            else:
+                exit_code = 2
+                if merge_result.status == "rollback_required":
+                    code = "RETRO_ROLLBACK_REQUIRED"
+                    recovery_command = "retro doctor --repair-sync"
+                else:
+                    code = "RETRO_MERGE_SYNC_PENDING"
+                    recovery_command = f"retro merge preview {merge_result.plan_id}"
+                merge_data["recovery_command"] = recovery_command
+                message = "Confirmed merge apply remains incomplete."
         if args.json_output:
             write_json(
                 {
-                    "status": "ok",
+                    "status": "ok" if exit_code == 0 else "error",
                     "code": code,
                     "message": message,
-                    "data": data,
+                    "data": merge_data,
                 }
             )
         else:
-            sys.stdout.write(safe_text(json_text(data)) + "\n")
-        return 0
+            sys.stdout.write(safe_text(json_text(merge_data)) + "\n")
+        return exit_code
     if args.command == "capture":
         source = CodexSessionSource(
             effective_codex_home(home=home, env=values),
@@ -728,13 +757,13 @@ def _run_command(
             discovery_timeout_seconds=settings.discovery_timeout_seconds,
             max_session_bytes=settings.session_max_bytes,
         )
-        service = CaptureService(source, repository, Redactor(), resolver)
-        result = (
-            service.capture_last()
+        capture_service = CaptureService(source, repository, Redactor(), resolver)
+        capture_result = (
+            capture_service.capture_last()
             if args.capture_last
-            else service.capture_session(args.session_id)
+            else capture_service.capture_session(args.session_id)
         )
-        _write_capture_result(result, args.json_output)
+        _write_capture_result(capture_result, args.json_output)
         return 0
 
     if args.command == "review":
@@ -751,25 +780,27 @@ def _run_command(
         review_stored_evidence = _build_review_service(
             settings, repository
         ).review_stored_evidence
-    service = ProjectMappingService(
+    project_service = ProjectMappingService(
         repository,
         vault_root=settings.obsidian_root,
         review_stored_evidence=review_stored_evidence,
     )
     if args.project_command == "map":
-        mapping = service.map(args.root, args.vault_project)
-        data = _mapping_data(mapping)
+        mapping = project_service.map(args.root, args.vault_project)
+        project_data: dict[str, object] | list[dict[str, object]] = _mapping_data(
+            mapping
+        )
     elif args.project_command == "map-workspace":
-        mapping = service.map_workspace(args.root, args.vault_project)
-        data = _mapping_data(mapping)
+        mapping = project_service.map_workspace(args.root, args.vault_project)
+        project_data = _mapping_data(mapping)
     elif args.project_command == "list":
-        data = [_mapping_data(mapping) for mapping in service.list()]
+        project_data = [_mapping_data(mapping) for mapping in project_service.list()]
     elif args.project_command == "remove":
-        service.remove(args.mapping_id)
-        data = {"mapping_id": args.mapping_id, "active": False}
+        project_service.remove(args.mapping_id)
+        project_data = {"mapping_id": args.mapping_id, "active": False}
     elif args.project_command == "reclassify":
-        service.reclassify(args.session_id, args.mapping_id)
-        data = {
+        project_service.reclassify(args.session_id, args.mapping_id)
+        project_data = {
             "session_id": args.session_id,
             "mapping_id": args.mapping_id,
         }
@@ -785,11 +816,11 @@ def _run_command(
                     if args.project_command == "reclassify"
                     else "Project mapping command completed."
                 ),
-                "data": data,
+                "data": project_data,
             }
         )
     else:
-        sys.stdout.write(safe_text(json_text(data)) + "\n")
+        sys.stdout.write(safe_text(json_text(project_data)) + "\n")
     return 0
 
 

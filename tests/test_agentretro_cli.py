@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from agent_retro.domain.models import (
     KnowledgeType,
     NormalizedSession,
     ProjectMapping,
+    ProjectionStatus,
     ReviewAttempt,
     ReviewResult,
     ReviewVerdict,
@@ -618,6 +620,183 @@ def test_merge_planner_composition_fails_before_client_when_model_is_missing(
 
     with pytest.raises(RuntimeError, match="merge_proposal_unavailable"):
         retro_cli._build_merge_planner(settings, repository)
+
+
+def test_cli_brief_reports_effective_expiry_without_persisted_or_vault_writes(
+    tmp_path, capsys
+):
+    state_home = tmp_path / "state"
+    repository = _seed_repository(state_home, with_candidate=False)
+    candidate = Candidate(
+        id="candidate-effectively-expired",
+        knowledge_type=KnowledgeType.TASK_STATE,
+        project_id="project-1",
+        scope="project",
+        proposed_text="已超过有效期但尚未持久化为 stale。",
+        evidence_ids=("evidence-1",),
+        status=CandidateStatus.PENDING_REVIEW,
+        extraction_confidence=0.91,
+    )
+    repository.save_candidates([candidate])
+    knowledge = KnowledgeService(repository, clock=lambda: NOW).edit(
+        candidate.id,
+        text=candidate.proposed_text,
+        actor="user",
+        valid_until=NOW - timedelta(seconds=1),
+    )
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    sentinel = vault / "user-note.md"
+    sentinel.write_bytes(b"user-owned\r\ncontent\n")
+    before_versions = repository.knowledge_versions(knowledge.id)
+    before_audits = repository.list_audit_entries()
+    before_events = repository.list_projection_events("project-1")
+    before_vault = {
+        path.relative_to(vault): path.read_bytes()
+        for path in vault.rglob("*")
+        if path.is_file()
+    }
+
+    assert (
+        retro_cli.main(
+            ["--json", "brief", "inspect expiry", "--project", "project-1"],
+            home=tmp_path,
+            env={
+                **_env(state_home),
+                "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+            },
+        )
+        == 0
+    )
+
+    payload = _json_output(capsys)
+    latest = repository.list_brief_knowledge(
+        "project-1", datetime.now(timezone.utc)
+    )
+    after_vault = {
+        path.relative_to(vault): path.read_bytes()
+        for path in vault.rglob("*")
+        if path.is_file()
+    }
+    assert payload["data"]["stale_ids"] == [knowledge.id]
+    assert payload["data"]["warnings"] == []
+    assert [(item.id, item.status, item.version) for item in latest] == [
+        (knowledge.id, "active", knowledge.version)
+    ]
+    assert repository.knowledge_versions(knowledge.id) == before_versions
+    assert repository.list_audit_entries() == before_audits
+    assert repository.list_projection_events("project-1") == before_events
+    assert after_vault == before_vault
+
+
+@pytest.mark.parametrize(
+    ("projection_status", "expected_exit", "expected_code", "expected_recovery"),
+    [
+        (ProjectionStatus.SYNCED, 0, "RETRO_SYNC_RETRIED", ""),
+        (
+            ProjectionStatus.SYNC_PENDING,
+            2,
+            "RETRO_SYNC_PENDING",
+            "retro sync retry event-1",
+        ),
+        (
+            ProjectionStatus.ROLLBACK_REQUIRED,
+            2,
+            "RETRO_ROLLBACK_REQUIRED",
+            "retro doctor --repair-sync",
+        ),
+    ],
+)
+def test_cli_sync_retry_status_controls_exit_envelope_and_recovery(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    projection_status,
+    expected_exit,
+    expected_code,
+    expected_recovery,
+):
+    state_home = tmp_path / "state"
+    _seed_repository(state_home, with_candidate=False)
+    use_fallbacks = projection_status is ProjectionStatus.SYNC_PENDING
+    recovery = "" if use_fallbacks else expected_recovery
+    warning = "" if use_fallbacks or expected_exit == 0 else expected_code
+    coordinator = SimpleNamespace(
+        retry=lambda event_id: SimpleNamespace(
+            event_id=event_id,
+            status=projection_status,
+            warning=warning,
+            recovery_command=recovery,
+            reason="injected_status",
+        )
+    )
+    monkeypatch.setattr(
+        retro_cli, "build_projection_coordinator", lambda *args: coordinator
+    )
+
+    assert (
+        retro_cli.main(
+            ["--json", "sync", "retry", "event-1"],
+            home=tmp_path,
+            env=_env(state_home),
+        )
+        == expected_exit
+    )
+    payload = _json_output(capsys)
+    assert payload["status"] == ("ok" if expected_exit == 0 else "error")
+    assert payload["code"] == expected_code
+    assert payload["data"]["recovery_command"] == expected_recovery
+
+
+@pytest.mark.parametrize(
+    ("merge_status", "expected_exit", "expected_code", "expected_recovery"),
+    [
+        ("synced", 0, "RETRO_MERGE_APPLIED", ""),
+        ("already_applied", 0, "RETRO_MERGE_APPLIED", ""),
+        (
+            "sync_pending",
+            2,
+            "RETRO_MERGE_SYNC_PENDING",
+            "retro merge preview plan-1",
+        ),
+        (
+            "rollback_required",
+            2,
+            "RETRO_ROLLBACK_REQUIRED",
+            "retro doctor --repair-sync",
+        ),
+    ],
+)
+def test_cli_merge_apply_only_reports_completed_statuses_as_success(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    merge_status,
+    expected_exit,
+    expected_code,
+    expected_recovery,
+):
+    state_home = tmp_path / "state"
+    _seed_repository(state_home, with_candidate=False)
+    merge_service = SimpleNamespace(
+        apply=lambda *args, **kwargs: SimpleNamespace(
+            plan_id="plan-1", status=merge_status, reason="injected_status"
+        )
+    )
+    monkeypatch.setattr(retro_cli, "MergeService", lambda *args: merge_service)
+
+    assert (
+        retro_cli.main(
+            ["--json", "merge", "apply", "plan-1", "--apply"],
+            home=tmp_path,
+            env=_env(state_home),
+        )
+        == expected_exit
+    )
+    payload = _json_output(capsys)
+    assert payload["status"] == ("ok" if expected_exit == 0 else "error")
+    assert payload["code"] == expected_code
+    assert payload["data"].get("recovery_command", "") == expected_recovery
 
 
 def test_cli_merge_plan_model_unavailable_is_stable_and_writes_no_plan(

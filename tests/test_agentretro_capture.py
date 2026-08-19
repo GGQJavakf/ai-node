@@ -16,7 +16,9 @@ import pytest
 import _path  # noqa: F401
 from agent_retro.application.capture import CaptureService, SourceIntegrityError
 from agent_retro.application.ports import RetroRepository
+from agent_retro.application.review import ReviewService
 from agent_retro.domain.models import ProjectMapping
+from agent_retro.infrastructure import redaction as redaction_module
 from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     IncompleteSessionError,
@@ -759,6 +761,305 @@ def test_redactor_covers_headers_fields_pem_and_connection_strings():
     assert redactor.redact(redacted) == redacted
     assert redactor.contains_sensitive_value(raw) is True
     assert redactor.contains_sensitive_value(redacted) is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "Authorization: Basic BASIC_CREDENTIAL_FOR_REDACTION_TEST",
+            "Authorization: Basic [REDACTED]",
+        ),
+        (
+            "Authorization: Digest username=user, response=DIGEST_FOR_REDACTION_TEST",
+            "Authorization: Digest [REDACTED]",
+        ),
+        (
+            "Authorization: Custom-Scheme CUSTOM_CREDENTIAL_FOR_REDACTION_TEST",
+            "Authorization: Custom-Scheme [REDACTED]",
+        ),
+        (
+            "Authorization: OPAQUE_AUTH_VALUE_FOR_REDACTION_TEST",
+            "Authorization: [REDACTED]",
+        ),
+        (
+            "Proxy-Authorization: Basic PROXY_BASIC_VALUE_FOR_REDACTION_TEST",
+            "Proxy-Authorization: Basic [REDACTED]",
+        ),
+        (
+            "Proxy-Authorization: Bearer PROXY_BEARER_VALUE_FOR_REDACTION_TEST",
+            "Proxy-Authorization: Bearer [REDACTED]",
+        ),
+        (
+            "Proxy-Authorization: Custom-Scheme "
+            "PROXY_CUSTOM_VALUE_FOR_REDACTION_TEST",
+            "Proxy-Authorization: Custom-Scheme [REDACTED]",
+        ),
+        (
+            "Cookie: session=COOKIE_VALUE_FOR_REDACTION_TEST; theme=dark",
+            "Cookie: [REDACTED]",
+        ),
+        (
+            "Set-Cookie: sid=SET_COOKIE_VALUE_FOR_REDACTION_TEST; Path=/; HttpOnly",
+            "Set-Cookie: [REDACTED]",
+        ),
+        (
+            "Authorization: Digest username=user,\n"
+            " response=FOLDED_AUTH_VALUE_FOR_REDACTION_TEST",
+            "Authorization: Digest [REDACTED]",
+        ),
+        (
+            "Authorization: Basic\n FOLD_AFTER_SCHEME_AUTH_VALUE_FOR_REDACTION_TEST",
+            "Authorization: Basic [REDACTED]",
+        ),
+        (
+            "Authorization:\n Basic FOLD_BEFORE_SCHEME_AUTH_VALUE_FOR_REDACTION_TEST",
+            "Authorization: Basic [REDACTED]",
+        ),
+        (
+            "Authorization:\r\n\tDigest username=user, "
+            "response=FOLDED_DIGEST_AUTH_VALUE_FOR_REDACTION_TEST",
+            "Authorization: Digest [REDACTED]",
+        ),
+        (
+            "Cookie: session=FOLDED_COOKIE_VALUE_FOR_REDACTION_TEST;\r\n Path=/",
+            "Cookie: [REDACTED]",
+        ),
+        (
+            "Set-Cookie: sid=FOLDED_SET_COOKIE_VALUE_FOR_REDACTION_TEST;\n HttpOnly",
+            "Set-Cookie: [REDACTED]",
+        ),
+        (
+            'Authorization: Digest username="user", note="prefix '
+            'X-Trace: QUOTED_AUTH_VALUE_FOR_REDACTION_TEST"',
+            "Authorization: Digest [REDACTED]",
+        ),
+        (
+            'Authorization: Digest uri="https://example.invalid/a:b", '
+            'nonce="URL_TIME_AUTH_VALUE_FOR_REDACTION_TEST 10:18:14"',
+            "Authorization: Digest [REDACTED]",
+        ),
+        (
+            "Set-Cookie: sid=COOKIE_EXPIRES_VALUE_FOR_REDACTION_TEST; "
+            "Expires=Wed, 09 Jun 2021 10:18:14 GMT; HttpOnly",
+            "Set-Cookie: [REDACTED]",
+        ),
+    ],
+)
+def test_redactor_preserves_auth_header_identity_but_removes_all_credentials(
+    raw, expected
+):
+    redactor = Redactor()
+
+    redacted = redactor.redact(raw)
+
+    assert redacted == expected
+    assert redactor.redact(redacted) == redacted
+
+
+def test_redactor_preserves_non_sensitive_headers_between_flattened_auth_headers():
+    redactor = Redactor()
+    raw = (
+        "Authorization: Basic FLAT_AUTH_VALUE_FOR_REDACTION_TEST "
+        "X-Trace: keep-trace "
+        "Cookie: sid=FLAT_COOKIE_VALUE_FOR_REDACTION_TEST "
+        "X-Request-Id: keep-request"
+    )
+
+    redacted = redactor.redact(raw)
+
+    assert redacted == (
+        "Authorization: Basic [REDACTED] "
+        "X-Trace: keep-trace "
+        "Cookie: [REDACTED] "
+        "X-Request-Id: keep-request"
+    )
+    assert redactor.redact(redacted) == redacted
+
+
+def test_redactor_fails_closed_on_unterminated_quote_without_consuming_next_line():
+    redactor = Redactor()
+    raw = (
+        'Authorization: Digest note="UNTERMINATED_AUTH_VALUE_FOR_REDACTION_TEST\n'
+        "X-Trace: keep-trace"
+    )
+
+    redacted = redactor.redact(raw)
+
+    assert redacted == "Authorization: Digest [REDACTED]\nX-Trace: keep-trace"
+    assert redactor.redact(redacted) == redacted
+
+
+def test_redactor_does_not_treat_custom_header_suffixes_as_standard_auth_headers():
+    redactor = Redactor()
+    raw = (
+        "X-Authorization: Basic CUSTOM_HEADER_AUTH_VALUE "
+        "X-Cookie: sid=CUSTOM_HEADER_COOKIE_VALUE"
+    )
+
+    assert redactor.redact(raw) == raw
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("Authorization: Basic", "Authorization: Basic [REDACTED]"),
+        ("Cookie:", "Cookie: [REDACTED]"),
+    ],
+)
+def test_redactor_scans_long_unmatched_whitespace_once(
+    header, expected, monkeypatch
+):
+    matcher = redaction_module._FLATTENED_HEADER
+    match_calls = 0
+
+    class CountingMatcher:
+        def match(self, text, position):
+            nonlocal match_calls
+            match_calls += 1
+            return matcher.match(text, position)
+
+    monkeypatch.setattr(redaction_module, "_FLATTENED_HEADER", CountingMatcher())
+    redactor = Redactor()
+    raw = f"{header} SECRET_FOR_LINEAR_SCAN_TEST{' ' * 4096}tail"
+
+    redacted = redactor.redact(raw)
+
+    assert redacted == expected
+    assert match_calls <= 2
+
+
+@pytest.mark.parametrize("header_name", ["9Trace", "_Trace"])
+def test_redactor_preserves_flattened_rfc_token_header_names(header_name):
+    redactor = Redactor()
+    raw = (
+        "Authorization: Basic FLAT_RFC_TOKEN_AUTH_VALUE_FOR_REDACTION_TEST "
+        f"{header_name}: keep-trace"
+    )
+
+    assert redactor.redact(raw) == (
+        f"Authorization: Basic [REDACTED] {header_name}: keep-trace"
+    )
+
+
+def test_redactor_fails_closed_for_ambiguous_set_cookie_extension_value():
+    redactor = Redactor()
+    raw = (
+        "Set-Cookie: sid=AMBIGUOUS_COOKIE_VALUE_FOR_REDACTION_TEST; "
+        "Ext=prefix X-Trace: AMBIGUOUS_EXTENSION_VALUE_FOR_REDACTION_TEST"
+    )
+
+    assert redactor.redact(raw) == "Set-Cookie: [REDACTED]"
+    assert (
+        redactor.redact("Set-Cookie: [REDACTED] X-Trace: keep-trace")
+        == "Set-Cookie: [REDACTED] X-Trace: keep-trace"
+    )
+
+
+def test_capture_removes_authentication_material_before_model_and_sqlite_boundaries(
+    tmp_path, monkeypatch
+):
+    codex_home = tmp_path / "codex"
+    session_path = _standard_session_path(
+        codex_home,
+        "auth-material",
+        timestamp="2026-07-18T12-00-00",
+    )
+    session_path.parent.mkdir(parents=True)
+    authentication_values = (
+        "BASIC_CREDENTIAL_FOR_CAPTURE_TEST",
+        "DIGEST_RESPONSE_FOR_CAPTURE_TEST",
+        "CUSTOM_CREDENTIAL_FOR_CAPTURE_TEST",
+        "PROXY_CREDENTIAL_FOR_CAPTURE_TEST",
+        "COOKIE_VALUE_FOR_CAPTURE_TEST",
+        "SET_COOKIE_VALUE_FOR_CAPTURE_TEST",
+    )
+    message = "\n".join(
+        (
+            f"Authorization: Basic {authentication_values[0]}",
+            "Authorization: Digest "
+            f'username="user",\n note="prefix X-Trace: {authentication_values[1]}"',
+            f"Authorization: Custom-Scheme {authentication_values[2]}",
+            f"Proxy-Authorization: Basic {authentication_values[3]}",
+            f"Cookie: session={authentication_values[4]}; theme=dark",
+            "Set-Cookie: "
+            f"sid={authentication_values[5]};\n "
+            "Expires=Wed, 09 Jun 2021 10:18:14 GMT; HttpOnly; Secure",
+        )
+    )
+    records = (
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": "session-auth-material",
+                "cwd": str(tmp_path / "project"),
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": message},
+        },
+        {"type": "event_msg", "payload": {"type": "task_complete"}},
+    )
+    session_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+    repo = _repository(tmp_path)
+    sqlite_boundary: list[str] = []
+    save_capture = repo.save_capture
+
+    def inspect_then_save(session, evidence):
+        sqlite_boundary.extend(event.content for event in session.events)
+        sqlite_boundary.extend(item.excerpt for item in evidence)
+        save_capture(session, evidence)
+
+    monkeypatch.setattr(repo, "save_capture", inspect_then_save)
+    redactor = Redactor()
+
+    CaptureService(
+        CodexSessionSource(codex_home), repo, redactor, ProjectResolver([])
+    ).capture_session("session-auth-material")
+
+    persisted = repo.find_session_by_source_id("session-auth-material")
+    assert persisted is not None
+    evidence = repo.list_evidence(persisted.id)
+    model_inputs: list[str] = []
+
+    class RecordingExtractor:
+        def extract(self, input_json, *, timeout):
+            model_inputs.append(input_json)
+            return ()
+
+    class UnusedReviewer:
+        def review(self, input_json, *, timeout):
+            raise AssertionError("review is not called without extracted candidates")
+
+    ReviewService(
+        repo,
+        RecordingExtractor(),
+        UnusedReviewer(),
+        model_timeout_seconds=30,
+        redact=redactor.redact,
+    ).review_session("session-auth-material")
+    assert len(model_inputs) == 1
+    model_input = model_inputs[0]
+    sqlite_values = "\n".join(sqlite_boundary)
+    persisted_values = "\n".join(
+        [*(event.content for event in persisted.events), *(item.excerpt for item in evidence)]
+    )
+    removed_header_fragments = (*authentication_values, "10:18:14 GMT")
+    for header_fragment in removed_header_fragments:
+        assert header_fragment not in sqlite_values
+        assert header_fragment not in persisted_values
+        assert header_fragment not in model_input
+        assert header_fragment.encode() not in repo.db_path.read_bytes()
+    assert "Authorization: Basic [REDACTED]" in sqlite_values
+    assert "Authorization: Digest [REDACTED]" in sqlite_values
+    assert "Authorization: Custom-Scheme [REDACTED]" in sqlite_values
+    assert "Proxy-Authorization: Basic [REDACTED]" in sqlite_values
+    assert "Cookie: [REDACTED]" in sqlite_values
+    assert "Set-Cookie: [REDACTED]" in sqlite_values
 
 
 @pytest.mark.parametrize(

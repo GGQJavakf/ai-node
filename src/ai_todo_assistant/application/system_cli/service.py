@@ -44,10 +44,10 @@ class SystemCliService:
         if spec is None:
             return self._denied(command_key, [], resolved_cwd, f"unknown command: {command_key}")
         if spec.risk_level != READ_ONLY:
-            return self._denied(command_key, spec.argv, resolved_cwd, f"unsupported risk level: {spec.risk_level}")
+            return self._denied(command_key, list(spec.argv), resolved_cwd, f"unsupported risk level: {spec.risk_level}")
         allowed, reason = self._is_cwd_allowed(resolved_cwd)
         if not allowed:
-            return self._denied(command_key, spec.argv, resolved_cwd, reason)
+            return self._denied(command_key, list(spec.argv), resolved_cwd, reason)
 
         runner = self.runner or CommandRunner(timeout=spec.timeout_seconds)
         result = runner.run(list(spec.argv), cwd=resolved_cwd)

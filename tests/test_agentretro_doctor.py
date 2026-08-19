@@ -8,6 +8,7 @@ from agent_retro.application.doctor import CHECK_ORDER, DoctorService
 from agent_retro.domain.models import ProjectMapping, SyncJob
 from agent_retro.infrastructure.settings import load_retro_settings
 from agent_retro.infrastructure.sqlite_repository import SQLiteRetroRepository
+from ai_todo_assistant.infrastructure.config.settings import SettingsConfigurationError
 
 
 class _Repository:
@@ -154,6 +155,34 @@ def test_doctor_never_probes_when_model_is_missing(tmp_path):
     ).run()
 
     assert report.by_name("model").summary == "missing"
+
+
+def test_doctor_turns_settings_loader_failure_into_sanitized_model_error(tmp_path):
+    codex_home = tmp_path / "codex"
+    (codex_home / "sessions").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = _settings(tmp_path, vault)
+
+    def fail_settings():
+        raise SettingsConfigurationError("invalid_json")
+
+    report = DoctorService(
+        settings,
+        _Repository(),
+        codex_home=codex_home,
+        model_config_loader=fail_settings,
+        model_probe=lambda config: (_ for _ in ()).throw(
+            AssertionError("invalid settings must not be probed")
+        ),
+        console_encoding=lambda: "utf-8",
+    ).run()
+
+    model = report.by_name("model")
+    assert model.status == "error"
+    assert model.summary == "configuration_error"
+    assert model.recovery == "repair the selected ai-todo settings file"
+    assert report.exit_code == 2
 
 
 def test_doctor_reports_schema_v2_as_pending_after_v3_release(tmp_path):

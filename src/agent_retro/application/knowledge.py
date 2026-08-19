@@ -60,8 +60,11 @@ class KnowledgeService:
 
     def accept(self, candidate_id: str, *, actor: str) -> Knowledge:
         candidate = self._pending_user_candidate(candidate_id, actor)
-        if self._is_vault_adoption(candidate.id):
-            return self.adoption_service.accept_vault_adoption(
+        adoption_service = self.adoption_service
+        if adoption_service is not None and adoption_service.is_vault_adoption(
+            candidate.id
+        ):
+            return adoption_service.accept_vault_adoption(
                 candidate.id,
                 text=candidate.proposed_text,
                 actor=actor,
@@ -89,7 +92,10 @@ class KnowledgeService:
         candidate = self._pending_user_candidate(candidate_id, actor)
         if not text.strip():
             raise CandidateLifecycleError("edited knowledge text must be non-empty")
-        if self._is_vault_adoption(candidate.id):
+        adoption_service = self.adoption_service
+        if adoption_service is not None and adoption_service.is_vault_adoption(
+            candidate.id
+        ):
             if (
                 knowledge_type is not None
                 or scope is not None
@@ -98,7 +104,7 @@ class KnowledgeService:
                 raise CandidateLifecycleError(
                     "vault adoption edit cannot change identity metadata"
                 )
-            return self.adoption_service.accept_vault_adoption(
+            return adoption_service.accept_vault_adoption(
                 candidate.id,
                 text=text,
                 actor=actor,
@@ -135,12 +141,6 @@ class KnowledgeService:
     def reject(self, candidate_id: str, *, actor: str) -> Candidate:
         self._pending_user_candidate(candidate_id, actor)
         return self.repository.reject_candidate(candidate_id, actor)
-
-    def _is_vault_adoption(self, candidate_id: str) -> bool:
-        return (
-            self.adoption_service is not None
-            and self.adoption_service.is_vault_adoption(candidate_id)
-        )
 
     def detect_conflict(
         self,
