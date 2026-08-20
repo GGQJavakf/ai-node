@@ -2,6 +2,7 @@
 
 - [x] 1.1 Add exact, CI-only Python tool versions without changing runtime dependencies.
 - [x] 1.2 Remove the four unused `examples/demo.py` assignments and prove example behavior remains unchanged.
+- [x] 1.3 Correct the three hosted-matrix portability failures without skipping platforms or weakening their intended invariants.
 
 ## 2. Implement repository CI gates
 
@@ -19,5 +20,5 @@
 
 ## 4. Deliver reviewable remote evidence
 
-- [ ] 4.1 Commit and push the isolated branch, then create a Draft PR targeting `main` with verification and rollback details.
+- [x] 4.1 Commit and push the isolated branch, then create a Draft PR targeting `main` with verification and rollback details.
 - [ ] 4.2 Read back the remote PR head and every new CI job; keep the PR Draft until all jobs pass on the delivered commit.

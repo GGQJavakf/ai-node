@@ -127,6 +127,8 @@ class UnavailablePlaybook(FakePlaybook):
 class TestWorkflowSyncServices(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.project_path = os.path.join(self.temp_dir.name, "repo")
+        os.mkdir(self.project_path)
         self.repository = SQLiteWorkflowRepository(os.path.join(self.temp_dir.name, "workflow.db"))
 
     def tearDown(self):
@@ -411,7 +413,7 @@ class TestWorkflowSyncServices(unittest.TestCase):
             playbook=FakePlaybook(),
         )
 
-        snapshots = service.sync_project("repo", openspec_change="change-a")
+        snapshots = service.sync_project(self.project_path, openspec_change="change-a")
 
         self.assertEqual([snapshot.source for snapshot in snapshots], [
             "git",
@@ -424,22 +426,22 @@ class TestWorkflowSyncServices(unittest.TestCase):
         self.assertIn("apply", snapshots[-1].summary)
         items = self.repository.list_work_items()
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0].source_ref, "sync:repo")
+        self.assertEqual(items[0].source_ref, f"sync:{self.project_path}")
         self.assertIsNotNone(items[0].last_synced_at)
         self.assertEqual(len(self.repository.list_evidence(items[0].id)), 6)
 
     def test_sync_project_records_closeout_gap_evidence_on_matching_work_items(self):
         redmine = WorkItem(title="Redmine 232211 closeout", source="redmine", source_ref="232211")
-        redmine.source_identities = ["redmine:232211", "gitlab-mr:repo:42"]
-        redmine.project_path = "repo"
+        redmine.source_identities = ["redmine:232211", f"gitlab-mr:{self.project_path}:42"]
+        redmine.project_path = self.project_path
         self.repository.save_work_item(redmine)
         validation = WorkItem(title="Redmine 232212 validation", source="redmine", source_ref="232212")
         validation.source_identities = ["redmine:232212"]
-        validation.project_path = "repo"
+        validation.project_path = self.project_path
         self.repository.save_work_item(validation)
         openspec = WorkItem(title="OpenSpec add-closeout", source="openspec", source_ref="add-closeout")
         openspec.source_identities = ["openspec:add-closeout"]
-        openspec.project_path = "repo"
+        openspec.project_path = self.project_path
         self.repository.save_work_item(openspec)
         service = WorkflowSyncService(
             self.repository,
@@ -448,7 +450,7 @@ class TestWorkflowSyncServices(unittest.TestCase):
             playbook=CloseoutGapPlaybook(),
         )
 
-        service.sync_project("repo")
+        service.sync_project(self.project_path)
 
         redmine_evidence = [item.summary for item in self.repository.list_evidence(redmine.id)]
         validation_evidence = [item.summary for item in self.repository.list_evidence(validation.id)]
@@ -460,7 +462,7 @@ class TestWorkflowSyncServices(unittest.TestCase):
     def test_sync_project_records_openspec_completion_archive_gap_from_openspec_snapshot(self):
         openspec = WorkItem(title="OpenSpec add-closeout", source="openspec", source_ref="add-closeout")
         openspec.source_identities = ["openspec:add-closeout"]
-        openspec.project_path = "repo"
+        openspec.project_path = self.project_path
         openspec = self.repository.save_work_item(openspec)
         service = WorkflowSyncService(
             self.repository,
@@ -469,7 +471,7 @@ class TestWorkflowSyncServices(unittest.TestCase):
             playbook=FakePlaybook(),
         )
 
-        service.sync_project("repo")
+        service.sync_project(self.project_path)
 
         summaries = [item.summary for item in self.repository.list_evidence(openspec.id)]
         self.assertTrue(any("OpenSpec completed but not archived" in summary for summary in summaries))
@@ -482,10 +484,10 @@ class TestWorkflowSyncServices(unittest.TestCase):
             playbook=CloseoutGapPlaybook(),
         )
 
-        service.sync_project("repo")
-        service.sync_project("repo")
+        service.sync_project(self.project_path)
+        service.sync_project(self.project_path)
 
-        context = self.repository.find_work_item_by_source("playbook", "sync:repo")
+        context = self.repository.find_work_item_by_source("playbook", f"sync:{self.project_path}")
         evidence = [
             item.summary
             for item in self.repository.list_evidence(context.id)
@@ -502,13 +504,25 @@ class TestWorkflowSyncServices(unittest.TestCase):
             playbook=UnavailableSnapshotPlaybook(),
         )
 
-        snapshots = service.sync_project("repo")
+        snapshots = service.sync_project(self.project_path)
 
         self.assertEqual(len(snapshots), 4)
-        context = self.repository.find_work_item_by_source("playbook", "sync:repo")
+        context = self.repository.find_work_item_by_source("playbook", f"sync:{self.project_path}")
         summaries = [item.summary for item in self.repository.list_evidence(context.id)]
         self.assertTrue(any("playbook unavailable" in summary for summary in summaries))
         self.assertTrue(any("closeout dry-run unavailable" in item.output_excerpt for item in self.repository.list_evidence(context.id)))
+
+    def test_sync_project_rejects_missing_project_directory_before_connectors_run(self):
+        service = WorkflowSyncService(
+            self.repository,
+            git=FakeGit(),
+            openspec=FakeOpenSpec(),
+            playbook=FakePlaybook(),
+        )
+        missing_path = os.path.join(self.temp_dir.name, "missing")
+
+        with self.assertRaisesRegex(RuntimeError, "project path is not a directory"):
+            service.sync_project(missing_path)
 
     def test_status_summary_marks_stale_sync_data(self):
         item = WorkItemService(self.repository).create_manual("旧同步工作项")

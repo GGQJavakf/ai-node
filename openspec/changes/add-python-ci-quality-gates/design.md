@@ -53,6 +53,10 @@ Run OpenSpec 1.4.1 with Node 24 using an exact `npx` package version. All checko
 
 The quality job runs Ruff on the entire repository. `pyproject.toml` explicitly owns the Python 3.10 target and the established `E4`, `E7`, `E9`, and `F` rule set so a Ruff upgrade or workstation configuration cannot silently change the merge gate. Remove the four unused local assignments in `examples/demo.py` instead of weakening the check or excluding the examples tree. The demonstration calls and observable output remain unchanged.
 
+### Repair reproduced compatibility failures instead of excluding them
+
+The first hosted matrix run revealed three existing portability assumptions. Windows batch-shim resolution patched `os.name` in tests while retaining the host's POSIX path module, invalid `/sync` paths relied on platform-specific subprocess exceptions, and a candidate-budget test counted internal `Path.stat()` calls that vary by Python version even though its actual invariant is the selected path set. Use `ntpath` inside the Windows-only resolver, preflight `/sync` directories before connector execution, and keep the candidate-set/no-old-candidate assertions while removing only the interpreter-internal call-count assertion. Do not skip platforms, mark expected failures, or shrink the matrix.
+
 ## Risks / Trade-offs
 
 - **Historical scan finds a real credential** → Fail closed, redact output, do not upload packages, and stop for explicit credential/history-remediation authorization.

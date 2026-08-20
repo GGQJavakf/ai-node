@@ -10,6 +10,7 @@ The repository currently has no automated pull-request checks, so the locally ve
 - Build distributable artifacts, validate their metadata and contents, install the wheel into an isolated environment, and smoke both installed console commands.
 - Upload only non-sensitive distribution artifacts and keep job permissions, timeouts, concurrency, and dependency/action versions explicit.
 - Remove the four existing unused example assignments that prevent a truthful repository-wide Ruff gate.
+- Correct the reproduced cross-runtime baseline defects in Windows shim path resolution, invalid `/sync` project-path handling, and a Python-version-sensitive candidate-budget assertion without weakening their intended safety guarantees.
 
 ## Capabilities
 
@@ -27,3 +28,4 @@ None.
 - Adds CI-only tooling installation for pytest, Ruff, the declared setuptools build backend, build, and package metadata validation; runtime dependencies and public CLI contracts remain unchanged.
 - GitHub pull requests and pushes to `main` gain observable automated checks. The workflow does not deploy, publish packages, read user configuration, use production credentials, or mutate application data.
 - `pyproject.toml` owns the deterministic Ruff target and rule selection; `examples/demo.py` receives a non-functional lint-baseline cleanup only.
+- The compatibility corrections preserve existing Windows and `/sync` contracts while making their tests deterministic on every supported CI runtime.

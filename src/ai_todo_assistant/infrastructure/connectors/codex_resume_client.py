@@ -1,6 +1,7 @@
 """Command-backed Codex thread resume client."""
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import shutil
@@ -65,15 +66,17 @@ def _base_command(command: str) -> list[str]:
 
 def _native_windows_codex_command(batch_command: str) -> list[str]:
     """Resolve a Windows batch shim without passing report-derived arguments to it."""
-    base_dir = os.path.dirname(batch_command)
-    native_codex = os.path.join(base_dir, "codex.exe")
+    base_dir = ntpath.dirname(batch_command)
+    native_codex = ntpath.join(base_dir, "codex.exe")
     if os.path.isfile(native_codex):
         return [native_codex]
 
-    codex_js = os.path.join(base_dir, "node_modules", "@openai", "codex", "bin", "codex.js")
+    codex_js = ntpath.join(
+        base_dir, "node_modules", "@openai", "codex", "bin", "codex.js"
+    )
     if not os.path.isfile(codex_js):
         return []
-    bundled_node = os.path.join(base_dir, "node.exe")
+    bundled_node = ntpath.join(base_dir, "node.exe")
     node = bundled_node if os.path.isfile(bundled_node) else shutil.which("node")
     if not node or not node.lower().endswith(".exe") or not os.path.isfile(node):
         return []
