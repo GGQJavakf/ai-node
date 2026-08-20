@@ -1,7 +1,7 @@
 ## 1. Baseline and Guardrails
 
 - [x] 1.1 Record the five ai-todo C901 findings above 15 and run the focused command, workflow, and Codex-resume regression baseline.
-- [ ] 1.2 Add the ai-todo complexity manifest, package-wide C901@15 script, and architecture regressions for target validity and extracted ownership.
+- [x] 1.2 Add the ai-todo complexity manifest, package-wide C901@15 script, and architecture regressions for target validity and extracted ownership.
 - [x] 1.3 Add missing characterization for handler monkeypatching, mixed list/source behavior, work-command failures, overlapping triage reasons, and resume skip precedence/de-duplication.
 
 ## 2. Codex Resume Selection
@@ -23,7 +23,7 @@
 
 ## 5. Verification and Delivery
 
-- [ ] 5.1 Make the manifest and full `src/ai_todo_assistant` scan pass C901 at 15, plus Ruff, focused mypy, compileall, architecture checks, and `git diff --check` without suppressions.
-- [ ] 5.2 Run the full branch-aware pytest and coverage gate, package build/Twine/isolated-wheel smoke, UTF-8/GBK command smoke, and strict validation for this change and all OpenSpec artifacts.
-- [ ] 5.3 Run OCR delegate preview/rule over the exact diff and a fresh compatibility review of routing, rendering, persistence, triage precedence, resume exclusions, and skip ordering; resolve every material finding and account for exclusions.
+- [x] 5.1 Make the manifest and full `src/ai_todo_assistant` scan pass C901 at 15, plus Ruff, focused mypy, compileall, architecture checks, and `git diff --check` without suppressions.
+- [x] 5.2 Run the full branch-aware pytest and coverage gate, package build/Twine/isolated-wheel smoke, UTF-8/GBK command smoke, and strict validation for this change and all OpenSpec artifacts.
+- [x] 5.3 Run OCR delegate preview/rule over the exact diff and a fresh compatibility review of routing, rendering, persistence, triage precedence, resume exclusions, and skip ordering; resolve every material finding and account for exclusions.
 - [ ] 5.4 Publish responsibility-sized commits to a Draft PR with exact evidence, verify remote CI on the immutable head, then perform authorized Ready/merge and archive readback.
