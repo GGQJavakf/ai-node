@@ -20,13 +20,15 @@ TODO CLI 交互层
 """
 import sys
 import os
+import shlex
+import sqlite3
 from datetime import datetime
 
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-    from prompt_toolkit.completion import WordCompleter, Completer, Completion
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.styles import Style
     PROMPT_TOOLKIT_AVAILABLE = True
 except ImportError:
@@ -35,20 +37,31 @@ except ImportError:
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import Spinner
 from rich.text import Text
 from rich.table import Table
 from rich.prompt import Prompt
 
-from ai_todo_assistant.infrastructure.persistence import build_todo_repository, build_workflow_repository
+from ai_todo_assistant.application.system_cli import SystemCliService, record_system_cli_evidence
+from ai_todo_assistant.infrastructure.connectors import CodexCliResumeClient
+from ai_todo_assistant.infrastructure.persistence import (
+    JsonCodexResumeExclusionStore,
+    build_todo_repository,
+    build_workflow_repository,
+)
 from ai_todo_assistant.application.agent import AgentCore
 from ai_todo_assistant.application.workflow import (
     CodexTaskReportService,
+    CodexResumeExclusionService,
+    CodexResumeService,
     ContinueService,
     DailyReviewService,
     EvidenceService,
+    SyncWatchRunner,
     WorkItemService,
     WorkflowSyncService,
+    codex_resume_display_rows,
+    format_codex_resume_result,
+    format_sync_watch_report,
 )
 from ai_todo_assistant.domain.workflow import WorkItemStatus
 from ai_todo_assistant.infrastructure.config import load_settings
@@ -82,6 +95,7 @@ class CommandCompleter(Completer):
             '/list month': '查看本月的待办',
             '/list pending': '查看未完成的待办',
             '/list completed': '查看已完成的待办',
+            '/list all': '查看所有任务',
             '/list overdue': '查看过期的待办',
             '/list upcoming': '查看即将到期的待办',
             '/list high': '查看高优先级待办',
@@ -115,6 +129,16 @@ class CommandCompleter(Completer):
             '/sync': '同步 Codex 报告和当前项目上下文',
             '/sync --dry-run': '预览同步结果但不写入',
             '/sync status': '查看同步健康状态',
+            '/sync watch': '本地前台定时触发同步并汇报每轮结果',
+            '/sync watch --resume': '本地前台定时同步后推进可继续 Codex 会话',
+            '/system list': '查看只读系统 CLI 命令目录',
+            '/system run': '执行只读系统 CLI catalog 命令',
+            '/system policy': '查看系统 CLI 执行策略',
+            '/r': '查看 Codex 可推进任务序号表',
+            '/r all': '批量推进可继续 Codex 会话',
+            '/r skip': '按序号排除 Codex 自动推进',
+            '/r unskip': '按序号解除 Codex 自动推进排除',
+            '/resume': '查看 Codex 可推进任务序号表',
             '/next': '推荐下一步工作',
             '/review': '生成工作日复盘草稿',
             '/continue': '兼容命令：推荐下一步工作',
@@ -124,8 +148,9 @@ class CommandCompleter(Completer):
             '/help': '显示帮助信息',
             '/help todo': '查看 Todo 管理命令',
             '/help work': '查看工作流和证据命令',
+            '/help codex': '查看 Codex 自动推进指南',
             '/help prefs': '查看长期偏好命令',
-            '/help system': '查看历史、退出和颜色说明',
+            '/help system': '查看系统 CLI、历史、退出和颜色说明',
             '/exit': '退出应用',
             '/quit': '退出应用',
             '/history': '查看命令历史记录'
@@ -208,7 +233,7 @@ class TodoCLI:
     def _load_config(self):
         """加载配置"""
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-        # 统一配置优先级：默认值 < config/settings.json < 环境变量。
+        # 统一配置优先级：默认值 < 本地运行配置 < 环境变量。
         return load_settings(project_root)
 
     def _get_task_status_color(self, todo):
@@ -290,11 +315,15 @@ class TodoCLI:
         elif cmd == "/forget":
             return self._handle_forget_command(subcmd)
         elif cmd == "/codex":
-            return self._handle_codex_command(subcmd)
+            return self._handle_codex_command(subcmd, args)
+        elif cmd in {"/r", "/resume"}:
+            return self._handle_resume_shortcut(subcmd, args)
         elif cmd == "/work":
             return self._handle_work_command(subcmd, args)
         elif cmd == "/sync":
             return self._handle_sync_command(subcmd, args)
+        elif cmd == "/system":
+            return self._handle_system_command(subcmd, args)
         elif cmd == "/next":
             return self._handle_continue_command()
         elif cmd == "/continue":
@@ -336,6 +365,9 @@ class TodoCLI:
         elif subcmd == "completed":
             todos = self.manager.get_by_status(True)
             title = "✅ 已完成任务"
+        elif subcmd == "all":
+            todos = self.manager.get_all()
+            title = "📋 所有任务"
         elif subcmd == "overdue":
             todos = self.manager.get_overdue()
             title = "🔴 已过期的待办事项"
@@ -357,39 +389,51 @@ class TodoCLI:
             return f"{title}\n\n  暂无任务"
 
         # 使用 Rich Table 显示
-        table = Table(title=title)
+        rows = []
+        for index, todo in enumerate(todos):
+            rows.append(
+                {
+                    "category": _todo_list_category(todo),
+                    "order": index,
+                    "id": todo.id[:8],
+                    "priority": self._get_priority_marker(todo.priority),
+                    "title": Text(todo.title, style=self._get_task_status_color(todo)),
+                    "status": Text("完成" if todo.completed else "未完成", style="grey50" if todo.completed else "green"),
+                    "next": Text(todo.end_time if todo.end_time else "-", style=self._get_due_time_color(todo)),
+                }
+            )
+        for index, item in enumerate(work_items):
+            status_style = "yellow" if item.status == "blocked" else "grey50" if item.status == "done" else "cyan"
+            rows.append(
+                {
+                    "category": _work_item_list_category(item),
+                    "order": len(todos) + index,
+                    "id": item.id[:8],
+                    "priority": self._get_priority_marker(item.priority),
+                    "title": Text(item.title, style="grey50" if item.status == "done" else "default"),
+                    "status": Text(_work_item_status_label(item.status), style=status_style),
+                    "next": item.next_action or item.sync_summary or "-",
+                }
+            )
+
+        rows.sort(key=lambda row: (_list_category_rank(row["category"]), row["order"]))
+
+        table = Table(title=title, show_lines=True)
         table.add_column("ID", style="dim", width=8)
-        table.add_column("来源", width=8)
+        table.add_column("分类", width=10)
         table.add_column("优先级", width=6)
         table.add_column("标题")
         table.add_column("状态", width=8)
         table.add_column("截止/下一步")
 
-        for todo in todos:
-            status_text = Text("✓ 完成", style="grey50") if todo.completed else Text("○ 未完成", style="green")
-            priority_marker = self._get_priority_marker(todo.priority)
-            
-            due_time = todo.end_time if todo.end_time else "-"
-            due_style = self._get_due_time_color(todo)
-            
+        for row in rows:
             table.add_row(
-                todo.id[:8],
-                "todo",
-                priority_marker,
-                Text(todo.title, style=self._get_task_status_color(todo)),
-                status_text,
-                Text(due_time, style=due_style)
-            )
-        for item in work_items:
-            status_style = "yellow" if item.status == "blocked" else "grey50" if item.status == "done" else "cyan"
-            priority_marker = self._get_priority_marker(item.priority)
-            table.add_row(
-                item.id[:8],
-                item.source,
-                priority_marker,
-                Text(item.title, style="grey50" if item.status == "done" else "default"),
-                Text(item.status, style=status_style),
-                item.next_action or item.sync_summary or "-",
+                row["id"],
+                row["category"],
+                row["priority"],
+                row["title"],
+                row["status"],
+                row["next"],
             )
 
         return table
@@ -401,22 +445,21 @@ class TodoCLI:
         work_items = []
         if source_filter != "todo":
             try:
-                work_items = self._workflow_repo().list_work_items(include_closed=True)
+                work_items = self._workflow_repo().list_work_items(include_closed=False)
             except Exception:
                 work_items = []
             if source_filter:
                 work_items = [item for item in work_items if item.source == source_filter]
             work_items = _dedupe_work_items(work_items)
         evidence_by_item = {}
+        evidence_read_failures = []
         if work_items:
-            try:
-                repo = self._workflow_repo()
-                evidence_by_item = {
-                    item.id: repo.list_evidence(item.id)
-                    for item in work_items
-                }
-            except Exception:
-                evidence_by_item = {}
+            repo = self._workflow_repo()
+            for item in work_items:
+                try:
+                    evidence_by_item[item.id] = repo.list_evidence(item.id)
+                except (OSError, ValueError, sqlite3.Error) as exc:
+                    evidence_read_failures.append((item.id, type(exc).__name__))
 
         rows = _daily_triage_work_item_rows(work_items, evidence_by_item)
         for todo in self._rank_tasks(todos):
@@ -434,42 +477,43 @@ class TodoCLI:
             )
 
         if not rows:
-            return "📋 每日工作分诊\n\n  暂无任务"
+            result = "📋 每日工作分诊\n\n  暂无任务"
+            if evidence_read_failures:
+                result += f"\n\n{_evidence_read_failure_message(evidence_read_failures)}"
+            return result
 
-        table = Table(title="📋 每日工作分诊")
-        table.add_column("分组", width=22)
-        table.add_column("ID", style="dim", width=8)
-        table.add_column("来源", width=7)
-        table.add_column("优先级", width=4)
-        table.add_column("标题", no_wrap=True)
-        table.add_column("状态", width=7)
-        table.add_column("原因", width=38, no_wrap=True)
-        table.add_column("截止/下一步", width=14)
+        table = Table(title="📋 每日工作分诊", expand=True)
+        table.add_column("分组", width=10, no_wrap=True)
+        table.add_column("来源/状态", width=16, no_wrap=True)
+        table.add_column("标题", ratio=3, min_width=22, overflow="fold")
+        table.add_column("原因", width=22, no_wrap=True, overflow="ellipsis")
+        table.add_column("下一步/截止", ratio=2, min_width=28, overflow="fold")
 
         for row in rows:
             table.add_row(
-                row["group"],
-                row["id"],
-                row["source"],
-                row["priority"],
+                _daily_triage_group_label(row["group"]),
+                _daily_triage_meta(row),
                 row["title"],
-                row["status"],
-                row["reason"],
+                _daily_triage_reason_label(row["reason"]),
                 row["next"],
             )
+        if evidence_read_failures:
+            table.caption = _evidence_read_failure_message(evidence_read_failures)
         return table
 
     def _work_items_for_list(self, subcmd="", source_filter=""):
         if subcmd in {"today", "week", "month", "overdue", "upcoming", "high", "medium", "low"}:
             return []
         try:
-            items = self._workflow_repo().list_work_items(include_closed=(subcmd == "completed"))
+            items = self._workflow_repo().list_work_items(include_closed=(subcmd in {"all", "completed"}))
         except Exception:
             return []
         if source_filter and source_filter != "todo":
             items = [item for item in items if item.source == source_filter]
         elif source_filter == "todo":
             items = []
+        if subcmd == "all":
+            return _dedupe_work_items(items)
         if subcmd == "completed":
             return _dedupe_work_items([item for item in items if item.status == "done"])
         return _dedupe_work_items([item for item in items if item.status not in {"done", "archived"}])
@@ -707,7 +751,7 @@ class TodoCLI:
             return f"已忘记偏好：{key}"
         return f"未找到偏好：{key}"
 
-    def _handle_codex_command(self, subcmd):
+    def _handle_codex_command(self, subcmd, args=""):
         if subcmd not in {"tasks", "unfinished"}:
             return "用法: /codex tasks"
 
@@ -757,6 +801,86 @@ class TodoCLI:
         output += "─" * 80
         return output
 
+    def _handle_codex_resume_command(self, args=""):
+        options = _parse_codex_resume_options(args)
+        if options["invalid"]:
+            return _codex_resume_usage()
+        store = self._codex_resume_exclusion_store()
+        exclusion_service = CodexResumeExclusionService(store)
+        report, report_dir = self._latest_codex_report()
+        if options["action"] in {"exclude", "include", "resume"} and _is_index_text(options["thread_id"]):
+            if not report:
+                return f"Codex resume\n\n  暂无快照文件: {report_dir}"
+            resolved, error = self._resolve_codex_resume_index(report, store, options["thread_id"])
+            if error:
+                return error
+            options["thread_id"] = resolved
+        try:
+            if options["action"] == "exclude":
+                exclusion = exclusion_service.exclude(options["thread_id"], options["reason"])
+                suffix = f"：{exclusion.reason}" if exclusion.reason else ""
+                return f"已排除自动推进: {exclusion.thread_id}{suffix}"
+            if options["action"] == "include":
+                removed = exclusion_service.include(options["thread_id"])
+                if removed:
+                    return f"已解除自动推进排除: {options['thread_id']}"
+                return f"未找到自动推进排除: {options['thread_id']}"
+            if options["action"] == "list":
+                return _format_codex_resume_exclusions(exclusion_service.list_exclusions())
+        except (OSError, ValueError) as exc:
+            return _format_codex_resume_exclusion_error(exc)
+        if not report:
+            return f"Codex resume\n\n  暂无快照文件: {report_dir}"
+        service = CodexResumeService(
+            self._workflow_repo(),
+            client=getattr(self, "codex_resume_client", None) or CodexCliResumeClient(self.config),
+            exclusion_store=store,
+        )
+        result = service.resume(
+            report,
+            dry_run=options["dry_run"],
+            thread_id=options["thread_id"],
+        )
+        return format_codex_resume_result(result)
+
+    def _handle_resume_shortcut(self, subcmd="", args=""):
+        raw = " ".join(part for part in [subcmd, args] if part).strip()
+        if not raw or raw in {"ls", "list"}:
+            return self._handle_codex_resume_command("ls")
+        tokens = raw.split()
+        action = tokens[0]
+        tail = " ".join(tokens[1:]).strip()
+        if action == "all":
+            return self._handle_codex_resume_command("")
+        if action == "skip":
+            if not tail:
+                return _resume_shortcut_usage()
+            return self._handle_codex_resume_command(f"exclude {tail}")
+        if action == "unskip":
+            if not tail:
+                return _resume_shortcut_usage()
+            return self._handle_codex_resume_command(f"include {tail}")
+        if action == "skips":
+            return self._handle_codex_resume_command("exclusions")
+        if len(tokens) == 1:
+            return self._handle_codex_resume_command(action)
+        return _resume_shortcut_usage()
+
+    def _resolve_codex_resume_index(self, report, store, index_text: str) -> tuple[str, str]:
+        index = int(index_text)
+        result = CodexResumeService(
+            self._workflow_repo(),
+            client=getattr(self, "codex_resume_client", None) or CodexCliResumeClient(self.config),
+            exclusion_store=store,
+        ).resume(report, dry_run=True)
+        rows = codex_resume_display_rows(result)
+        if index < 1 or index > len(rows):
+            return "", f"Codex resume\n\n  序号超出范围: {index_text}，当前可选范围 1-{len(rows)}"
+        row = rows[index - 1]
+        if not row.thread_id:
+            return "", f"Codex resume\n\n  序号 {index_text} 没有关联 thread id，不能执行该操作"
+        return row.thread_id, ""
+
     def _import_latest_codex_report(self):
         report, report_dir = self._latest_codex_report()
         imported = WorkItemService(self._workflow_repo()).import_codex_report(report) if report else []
@@ -781,6 +905,18 @@ class TodoCLI:
             repo = build_workflow_repository(getattr(self, "config", None) or self._load_config())
             self.workflow_repository = repo
         return repo
+
+    def _codex_resume_exclusion_store(self):
+        store = getattr(self, "codex_resume_exclusion_store", None)
+        if store is not None:
+            return store
+        config = getattr(self, "config", None) or self._load_config()
+        path = config.get("codex_resume_exclusions_file", "data/codex-resume-exclusions.json")
+        if not os.path.isabs(path):
+            path = os.path.join(config.get("project_root", os.getcwd()), path)
+        store = JsonCodexResumeExclusionStore(path)
+        self.codex_resume_exclusion_store = store
+        return store
 
     def _handle_work_command(self, subcmd, args):
         repo = self._workflow_repo()
@@ -856,6 +992,10 @@ class TodoCLI:
 
     def _handle_sync_command(self, subcmd, args):
         options = _parse_sync_options(subcmd, args)
+        if options["watch"]:
+            if options["dry_run"] or options["status"]:
+                return "用法: /sync watch [interval-seconds] [path]，不能与 --dry-run 或 status 组合"
+            return self._handle_sync_watch_command(options)
         if options["status"]:
             return self._sync_status()
         path = options["path"] or os.getcwd()
@@ -874,6 +1014,9 @@ class TodoCLI:
             lines.append(f"  [SKIP] project: dry-run 不会同步项目上下文 {path}")
             lines.append("─" * 80)
             return "\n".join(lines)
+        return self._run_sync_once(path)
+
+    def _run_sync_once(self, path):
         report, imported, report_dir = self._import_latest_codex_report()
         snapshots = []
         path_error = ""
@@ -902,6 +1045,34 @@ class TodoCLI:
                 lines.append(f"     {snapshot.error}")
         lines.append("─" * 80)
         return "\n".join(lines)
+
+    def _handle_sync_watch_command(self, options, max_runs=None, sleep=None):
+        interval = options["interval_seconds"] or int(
+            self.config.get("sync_watch_interval_seconds", 1800)
+        )
+        path = options["path"] or os.getcwd()
+        caller_supplied_max_runs = max_runs is not None
+        if options.get("once"):
+            max_runs = 1
+        print_each_report = not caller_supplied_max_runs
+        runner = SyncWatchRunner(
+            sync_once=self._run_sync_once,
+            recommend_next=self._handle_continue_command,
+            sleep=sleep,
+        )
+        last_report = ""
+        try:
+            for result in runner.run(interval, path, max_runs=max_runs):
+                last_report = format_sync_watch_report(result)
+                if options.get("resume"):
+                    last_report = "\n\n".join([last_report, self._handle_codex_resume_command("")])
+                if print_each_report:
+                    self.console.print(last_report)
+        except KeyboardInterrupt:
+            return "已停止 sync watch"
+        if print_each_report and last_report:
+            return f"sync watch 已完成 {max_runs} 轮" if max_runs else "已停止 sync watch"
+        return last_report or "sync watch 未触发"
 
     def _sync_status(self):
         report, report_dir = self._latest_codex_report()
@@ -937,6 +1108,28 @@ class TodoCLI:
         lines.append(f"  最近 WorkItem 同步: {latest_sync or '-'}")
         lines.append("─" * 80)
         return "\n".join(lines)
+
+    def _system_cli_service(self):
+        return SystemCliService(self.config, runner=getattr(self, "system_cli_runner", None))
+
+    def _handle_system_command(self, subcmd="", args=""):
+        service = self._system_cli_service()
+        if subcmd in {"", "list"}:
+            return service.format_command_list()
+        if subcmd == "policy":
+            return service.format_policy()
+        if subcmd == "run":
+            command_key, cwd, work_item_id = _parse_system_run_args(args)
+            if not command_key:
+                return "用法: /system run <key> [--cwd <path>] [--evidence <work-id>]"
+            record = service.run(command_key, cwd=cwd)
+            lines = [service.format_for_tool(record)]
+            if work_item_id:
+                evidence_result = record_system_cli_evidence(self._workflow_repo(), work_item_id, record)
+                action = "recorded" if evidence_result.created else "reused"
+                lines.append(f"Evidence {action}: {evidence_result.evidence.id}")
+            return "\n".join(lines)
+        return "用法: /system [list|policy|run <key> [--cwd <path>] [--evidence <work-id>]]"
 
     def _show_work_item(self, work_item_id):
         item = self._workflow_repo().get_work_item(work_item_id)
@@ -1006,8 +1199,9 @@ class TodoCLI:
                 "分类帮助:",
                 "  /help todo    Todo 管理命令",
                 "  /help work    工作流、证据和兼容命令",
+                "  /help codex   Codex 自动推进指南",
                 "  /help prefs   长期偏好命令",
-                "  /help system  历史、退出和颜色说明",
+                "  /help system  系统 CLI、历史、退出和颜色说明",
                 "─" * 80,
                 "💡 你也可以直接输入自然语言，让 AI 助手帮你管理待办事项",
             ])
@@ -1015,7 +1209,7 @@ class TodoCLI:
             return "\n".join([
                 "📖 Todo 管理",
                 "─" * 80,
-                "  /list [today|week|month|pending|completed|overdue|upcoming|high|medium|low]",
+                "  /list [all|today|week|month|pending|completed|overdue|upcoming|high|medium|low]",
                 "  /add [high|medium|low] <标题>",
                 "  /today",
                 "  /plan day",
@@ -1033,6 +1227,8 @@ class TodoCLI:
                 "  /sync [path]",
                 "  /sync --dry-run [path]",
                 "  /sync status",
+                "  /sync watch [interval-seconds] [path]  本地前台定时触发并汇报",
+                "  /sync watch --resume [interval-seconds] [path]",
                 "  /work status",
                 "  /work conflicts",
                 "  /work add <标题>",
@@ -1044,6 +1240,11 @@ class TodoCLI:
                 "  /work evidence summary <work-id>",
                 "  /work evidence timeline <work-id>",
                 "  /codex tasks",
+                "  /r",
+                "  /r <序号>",
+                "  /r all",
+                "  /r skip <序号> [reason]",
+                "  /r unskip <序号>",
                 "  /next",
                 "  /review",
                 "",
@@ -1051,6 +1252,32 @@ class TodoCLI:
                 "  /continue    等同 /next",
                 "  /review day  等同 /review",
                 "  /start day",
+            ])
+        if topic == "codex":
+            return "\n".join([
+                "📖 Codex 自动推进",
+                "─" * 80,
+                "  /codex tasks",
+                "      读取最新 Codex 任务报告并同步 WorkItem",
+                "  /r",
+                "      查看可推进/跳过任务序号表；不发送消息，不写 Evidence",
+                "  /r <序号>",
+                "      手动推进指定序号；不受自动排除限制",
+                "  /r all",
+                "      批量推进全部可继续线程，跳过 blocked/completed/needs_user",
+                "  /r skip <序号> [reason]",
+                "      排除指定序号，后续批量和定时自动推进会持续跳过",
+                "  /r unskip <序号>",
+                "      解除指定序号的排除",
+                "  /r skips",
+                "      查看排除列表",
+                "  /sync watch --resume [interval-seconds] [path]",
+                "      前台定时同步后自动推进可继续线程",
+                "",
+                "安全边界:",
+                "  - 只推进明确 resumeable 的 unfinished 线程",
+                "  - 需要用户输入、阻塞、完成、缺少 prompt 的线程会跳过",
+                "  - 重复 prompt 会按 prompt_sha256 幂等跳过",
             ])
         if topic in ("prefs", "preference", "preferences"):
             return "\n".join([
@@ -1064,6 +1291,13 @@ class TodoCLI:
             return "\n".join([
                 "📖 系统 / 历史",
                 "─" * 80,
+                "  /system list",
+                "      查看只读系统 CLI catalog",
+                "  /system policy",
+                "      查看 read_only、shell 禁用和允许根目录策略",
+                "  /system run <key> [--cwd <path>] [--evidence <work-id>]",
+                "      执行 catalog 中的只读命令，返回脱敏、截断后的摘要；可挂到 WorkItem Evidence",
+                "",
                 "  /history",
                 "  /exit 或 /quit",
                 "",
@@ -1079,7 +1313,7 @@ class TodoCLI:
                 "  🟢 绿色: 低优先级 / 正常",
                 "  灰色: 已完成",
             ])
-        return "用法: /help [todo|work|prefs|system]"
+        return "用法: /help [todo|work|codex|prefs|system]"
 
     def _startup_panel_text(self):
         return """
@@ -1095,8 +1329,9 @@ TodoAgent CLI
 分类帮助
 /help todo    Todo 管理命令
 /help work    工作流、证据和兼容命令
+/help codex   Codex 自动推进指南
 /help prefs   长期偏好命令
-/help system  历史、退出和颜色说明
+/help system  系统 CLI、历史、退出和颜色说明
 
 也可以直接输入自然语言。
 """
@@ -1119,7 +1354,7 @@ TodoAgent CLI
     def _handle_natural_language(self, text):
         """处理自然语言命令 - 支持流式输出"""
         # 显示 Thinking 状态
-        with self.console.status("[cyan]Thinking...[/cyan]") as status:
+        with self.console.status("[cyan]Thinking...[/cyan]"):
             try:
                 # 准备流式输出
                 full_response = []
@@ -1155,14 +1390,27 @@ TodoAgent CLI
             if not isinstance(response, str):
                 self.console.print(response)
                 return True
+            if _is_plain_report_response(response):
+                self.console.print(response, markup=False)
+                return True
 
             # 尝试作为 Markdown 渲染
+            markdown = Markdown(response)
+            output = self.console.file
+            encoding = getattr(output, "encoding", None) or "utf-8"
             try:
-                markdown = Markdown(response)
+                rendered = "".join(
+                    segment.text for segment in self.console.render(markdown)
+                )
+                rendered.encode(encoding, errors="strict")
+            except UnicodeEncodeError:
+                safe_response = response.encode(
+                    encoding, errors="replace"
+                ).decode(encoding, errors="replace")
+                output.write(safe_response + "\n")
+                output.flush()
+            else:
                 self.console.print(markdown)
-            except:
-                # 如果不是 Markdown，直接打印
-                self.console.print(response)
 
         return True
 
@@ -1219,7 +1467,7 @@ TodoAgent CLI
                 self.console.print("\n[yellow]EOF 退出[/yellow]")
                 break
 
-        self.console.print("\n👋 Goodbye!")
+        self._display_response("\n👋 Goodbye!")
 
 
 def main():
@@ -1245,7 +1493,7 @@ def _daily_triage_work_item_rows(items, evidence_by_item=None):
     grouped = {name: [] for name in _DAILY_TRIAGE_GROUPS}
     for item in items:
         group = _daily_triage_group(item, evidence_by_item.get(item.id, []))
-        if not group:
+        if not group or group not in grouped:
             continue
         grouped[group].append(item)
 
@@ -1268,11 +1516,134 @@ def _daily_triage_work_item_rows(items, evidence_by_item=None):
                     "priority": _priority_marker(item.priority),
                     "title": Text(item.title, style="grey50" if item.status == "done" else "default"),
                     "status": Text(item.status, style=status_style),
-                    "reason": Text(reason_text),
+                    "reason": reason_text,
                     "next": item.next_action or item.sync_summary or "-",
                 }
             )
     return rows
+
+
+def _daily_triage_group_label(group):
+    return {
+        "blocked": "受阻",
+        "active needs action": "待处理",
+        "waiting closeout": "待闭环",
+        "stale sync": "需同步",
+        "recently completed": "近期完成",
+        "todo reminders": "提醒",
+    }.get(group, group)
+
+
+def _daily_triage_reason_label(reason):
+    reason_text = reason.plain if isinstance(reason, Text) else str(reason)
+    stale = " [stale]" in reason_text
+    reason_text = reason_text.replace(" [stale]", "")
+    label = {
+        "blocked by Redmine": "Redmine 阻塞",
+        "blocked by MR": "MR 阻塞",
+        "blocked by OpenSpec": "OpenSpec 阻塞",
+        "MR merged but Redmine not closed": "MR 合并后待关 Redmine",
+        "Redmine resolved; validation missing": "Redmine 已解决待验证",
+        "OpenSpec completed but not archived": "OpenSpec 已完成待归档",
+        "MR merged but closeout missing": "MR 已合并待闭环",
+        "Redmine closeout missing": "Redmine 待闭环",
+        "OpenSpec closeout missing": "OpenSpec 待归档",
+        "needs validation": "待验证",
+        "Codex thread still active": "Codex 运行中",
+        "merge conflict needs manual resolution": "合并冲突待处理",
+        "sync stale": "同步已过期",
+        "recently completed": "最近已完成",
+        "blocked": "已阻塞",
+        "needs action": "需要处理",
+        "todo reminder": "本地提醒",
+    }.get(reason_text, reason_text)
+    return f"{label} / 同步" if stale else label
+
+
+def _daily_triage_meta(row):
+    status_value = row["status"].plain if isinstance(row["status"], Text) else str(row["status"])
+    status_label = {
+        WorkItemStatus.ACTIVE.value: "活动",
+        WorkItemStatus.BLOCKED.value: "受阻",
+        WorkItemStatus.DONE.value: "完成",
+        "○ 未完成": "未完成",
+        "✓ 完成": "完成",
+    }.get(status_value, status_value)
+    parts = [str(row["source"])]
+    if row["priority"]:
+        parts.append(_daily_triage_priority_label(row["priority"]))
+    parts.append(status_label)
+    return " ".join(parts)
+
+
+def _daily_triage_priority_label(priority):
+    return {
+        "🔴": "高",
+        "🟡": "中",
+        "🟢": "低",
+    }.get(str(priority), str(priority))
+
+
+def _work_item_status_label(status):
+    return {
+        WorkItemStatus.ACTIVE.value: "活动",
+        WorkItemStatus.BLOCKED.value: "受阻",
+        WorkItemStatus.DONE.value: "完成",
+        WorkItemStatus.ARCHIVED.value: "归档",
+    }.get(status, status)
+
+
+def _todo_list_category(todo):
+    return "Todo"
+
+
+def _work_item_list_category(item):
+    title_text = " ".join(
+        str(part)
+        for part in [item.title, item.source_ref]
+        if part
+    ).lower()
+    full_text = " ".join(
+        str(part)
+        for part in [
+            item.source,
+            item.source_ref,
+            item.title,
+            item.next_action,
+            item.sync_summary,
+            *getattr(item, "source_identities", []),
+        ]
+        if part
+    ).lower()
+    if _mentions(full_text, "redmine"):
+        return "Redmine"
+    if _mentions(title_text, "公众号", "wechat", "md2wechat"):
+        return "公众号"
+    if _mentions(title_text, "openspec", "spec "):
+        return "OpenSpec"
+    if item.source == "playbook" or _mentions(title_text, "playbook"):
+        return "Playbook"
+    if _mentions(title_text, "ai-node"):
+        return "ai-node"
+    return {
+        "manual": "手动",
+        "codex": "Codex",
+        "todo": "Todo",
+    }.get(item.source, item.source or "其他")
+
+
+def _list_category_rank(category):
+    return {
+        "Redmine": 10,
+        "Playbook": 20,
+        "OpenSpec": 30,
+        "公众号": 40,
+        "ai-node": 50,
+        "Codex": 60,
+        "手动": 70,
+        "Todo": 80,
+        "其他": 90,
+    }.get(category, 85)
 
 
 _DAILY_TRIAGE_GROUPS = [
@@ -1280,9 +1651,13 @@ _DAILY_TRIAGE_GROUPS = [
     "active needs action",
     "waiting closeout",
     "stale sync",
-    "recently completed",
     "todo reminders",
 ]
+
+
+def _evidence_read_failure_message(failures):
+    details = ", ".join(f"{item_id[:8]} ({error_type})" for item_id, error_type in failures)
+    return f"⚠ 证据读取失败: {details}"
 
 
 def _daily_triage_group(item, evidence=None):
@@ -1455,10 +1830,39 @@ def _parse_source_filter(args):
     return tokens[index + 1].strip().lower()
 
 
+def _parse_system_run_args(args):
+    try:
+        tokens = shlex.split(args or "", posix=False)
+    except ValueError:
+        tokens = (args or "").split()
+    if not tokens:
+        return "", None, None
+    command_key = tokens[0]
+    cwd = None
+    work_item_id = None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--cwd" and index + 1 < len(tokens):
+            cwd = tokens[index + 1].strip('"')
+            index += 2
+            continue
+        if token == "--evidence" and index + 1 < len(tokens):
+            work_item_id = tokens[index + 1].strip('"')
+            index += 2
+            continue
+        index += 1
+    return command_key, cwd, work_item_id
+
+
 def _parse_sync_options(subcmd, args):
     tokens = [part for part in [subcmd, *args.split()] if part]
     dry_run = False
     status = False
+    watch = False
+    once = False
+    resume = False
+    interval_seconds = None
     path_parts = []
     index = 0
     while index < len(tokens):
@@ -1467,14 +1871,132 @@ def _parse_sync_options(subcmd, args):
             dry_run = True
         elif token == "status":
             status = True
+        elif token == "watch":
+            watch = True
+        elif token == "--once":
+            once = True
+        elif token == "--resume":
+            resume = True
+        elif watch and interval_seconds is None:
+            try:
+                interval_seconds = int(token)
+            except ValueError:
+                path_parts.append(token)
         else:
             path_parts.append(token)
         index += 1
     return {
         "dry_run": dry_run,
         "status": status,
+        "watch": watch,
+        "once": once,
+        "resume": resume,
+        "interval_seconds": interval_seconds,
         "path": " ".join(path_parts).strip(),
     }
+
+
+def _parse_codex_resume_options(args):
+    tokens = args.split()
+    if tokens and tokens[0] in {"exclude", "block"}:
+        if len(tokens) < 2:
+            return {"action": "exclude", "dry_run": False, "thread_id": "", "reason": "", "invalid": True}
+        return {
+            "action": "exclude",
+            "dry_run": False,
+            "thread_id": tokens[1],
+            "reason": " ".join(tokens[2:]).strip(),
+            "invalid": False,
+        }
+    if tokens and tokens[0] in {"include", "unblock"}:
+        return {
+            "action": "include",
+            "dry_run": False,
+            "thread_id": tokens[1] if len(tokens) == 2 else "",
+            "reason": "",
+            "invalid": len(tokens) != 2,
+        }
+    if tokens and tokens[0] in {"exclusions", "excluded", "list"}:
+        return {
+            "action": "list",
+            "dry_run": False,
+            "thread_id": "",
+            "reason": "",
+            "invalid": len(tokens) != 1,
+        }
+    if tokens and tokens[0] in {"ls", "preview", "dry-run"}:
+        return {
+            "action": "resume",
+            "dry_run": True,
+            "thread_id": tokens[1] if len(tokens) == 2 else "",
+            "reason": "",
+            "invalid": len(tokens) > 2,
+        }
+    dry_run = False
+    thread_id = ""
+    invalid = False
+    for token in tokens:
+        if token in {"--dry-run", "-n"}:
+            dry_run = True
+        elif token.startswith("-"):
+            invalid = True
+        elif not thread_id:
+            thread_id = token
+        else:
+            invalid = True
+    return {"action": "resume", "dry_run": dry_run, "thread_id": thread_id, "reason": "", "invalid": invalid}
+
+
+def _codex_resume_usage():
+    return _resume_shortcut_usage()
+
+
+def _resume_shortcut_usage():
+    return "\n".join([
+        "用法: /r",
+        "  /r <序号>",
+        "  /r all",
+        "  /r skip <序号> [reason]",
+        "  /r unskip <序号>",
+        "  /r skips",
+    ])
+
+
+def _is_index_text(value: str) -> bool:
+    return value.isdigit()
+
+
+def _is_plain_report_response(response: str) -> bool:
+    prefixes = (
+        "Codex resume",
+        "Codex 自动推进排除列表",
+        "Codex 自动推进排除列表不可用",
+    )
+    return response.startswith(prefixes)
+
+
+def _format_codex_resume_exclusions(exclusions):
+    lines = ["Codex 自动推进排除列表", "─" * 80]
+    if not exclusions:
+        lines.append("  暂无排除项")
+    else:
+        for exclusion in exclusions:
+            suffix = f" | {exclusion.reason}" if exclusion.reason else ""
+            created = f" | {exclusion.created_at}" if exclusion.created_at else ""
+            lines.append(f"  {exclusion.thread_id}{suffix}{created}")
+    lines.append("─" * 80)
+    return "\n".join(lines)
+
+
+def _format_codex_resume_exclusion_error(exc):
+    message = str(exc) or exc.__class__.__name__
+    return "\n".join([
+        "Codex 自动推进排除列表不可用",
+        "─" * 80,
+        f"  {message}",
+        "  自动推进会 fail-closed；请修复或删除排除列表文件后重试。",
+        "─" * 80,
+    ])
 
 
 if __name__ == "__main__":

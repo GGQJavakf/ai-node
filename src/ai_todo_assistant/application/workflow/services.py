@@ -908,13 +908,11 @@ def _codex_strong_completion_signals(entry: dict) -> list[str]:
 
 
 def _codex_signal_texts(entry: dict) -> list[str]:
+    # Descriptive fields such as title and next_action can discuss a completion
+    # signal without proving completion. Only summary/evidence fields are
+    # eligible to promote an unfinished or blocked report entry to done.
     values = [
-        entry.get("source_ref"),
-        entry.get("title"),
-        entry.get("name"),
-        entry.get("status"),
         entry.get("summary"),
-        entry.get("next_action"),
     ]
     raw_signals = entry.get("completion_signals")
     if isinstance(raw_signals, list):
@@ -972,6 +970,13 @@ def _has_pending_closeout_language(normalized_text: str) -> bool:
     pending_terms = [
         "closeout missing",
         "missing closeout",
+        "not closed",
+        "not archived",
+        "not validated",
+        "not verified",
+        "validation evidence missing",
+        "validation missing",
+        "missing validation",
         "not complete",
         "not completed",
         "pending",

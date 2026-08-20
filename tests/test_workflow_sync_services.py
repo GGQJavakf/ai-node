@@ -556,7 +556,7 @@ class TestWorkflowSyncServices(unittest.TestCase):
                 {
                     "thread_id": "thread-validation",
                     "title": "Validation passed task",
-                    "next_action": "final validation passed with no follow-up",
+                    "completion_signals": ["final validation passed with no follow-up"],
                 },
             ],
             blocked=[
@@ -576,6 +576,53 @@ class TestWorkflowSyncServices(unittest.TestCase):
             item = self.repository.find_work_item_by_source("codex", thread_id)
             self.assertEqual(item.status, WorkItemStatus.DONE.value)
             self.assertTrue(self.repository.list_evidence(item.id))
+
+    def test_closeout_gaps_and_ambiguous_titles_do_not_close_codex_items(self):
+        entries = [
+            {
+                "thread_id": "thread-mr-gap",
+                "title": "MR closeout",
+                "summary": "MR merged but Redmine not closed",
+            },
+            {
+                "thread_id": "thread-validation-gap",
+                "title": "Redmine validation",
+                "summary": "Redmine resolved but validation evidence missing",
+            },
+            {
+                "thread_id": "thread-openspec-gap",
+                "title": "OpenSpec closeout",
+                "summary": "OpenSpec completed but not archived",
+            },
+            {
+                "thread_id": "thread-ambiguous-title",
+                "title": "Investigate why MR !42 merged detection is wrong",
+            },
+        ]
+        for entry in entries:
+            self.repository.save_work_item(
+                WorkItem(
+                    title=entry["title"],
+                    source="codex",
+                    source_ref=entry["thread_id"],
+                )
+            )
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-06-21T08:00:00+08:00",
+            total_unfinished=len(entries),
+            unfinished=entries,
+            blocked=[],
+            completed=[],
+        )
+
+        result = WorkItemService(self.repository).import_codex_report(report)
+
+        self.assertEqual(result.completed, 0)
+        for entry in entries:
+            item = self.repository.find_work_item_by_source("codex", entry["thread_id"])
+            self.assertEqual(item.status, WorkItemStatus.ACTIVE.value)
 
     def test_done_items_become_reopen_candidates_without_status_regression(self):
         done = WorkItem(title="已闭环但又出现", source="codex", source_ref="thread-done")

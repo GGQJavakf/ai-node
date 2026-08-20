@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -40,9 +42,10 @@ class CommandRunner:
         self.timeout = timeout
 
     def run(self, args: list[str], cwd: str = "") -> CommandResult:
+        run_args = _resolve_command_args(args)
         try:
             completed = subprocess.run(
-                args,
+                run_args,
                 cwd=cwd or None,
                 text=True,
                 encoding="utf-8",
@@ -70,6 +73,15 @@ class CommandRunner:
                 stderr=_to_text(exc.stderr),
                 timed_out=True,
             )
+
+
+def _resolve_command_args(args: list[str]) -> list[str]:
+    if not args:
+        return args
+    executable = shutil.which(args[0], path=os.environ.get("PATH", ""))
+    if not executable:
+        return args
+    return [executable, *args[1:]]
 
 
 def _to_text(value: str | bytes | None) -> str:

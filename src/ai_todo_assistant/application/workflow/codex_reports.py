@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -54,7 +54,10 @@ class CodexTaskReportService:
                 reports.append(self._load_report(path))
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
-        return sorted(reports, key=lambda report: (report.generated_at, report.path))
+        return sorted(
+            reports,
+            key=lambda report: (_parse_generated_at(report.generated_at), report.path),
+        )
 
     def _load_report(self, path: str) -> CodexTaskReport:
         with open(path, "r", encoding="utf-8") as handle:
@@ -62,7 +65,7 @@ class CodexTaskReportService:
         if not isinstance(payload, dict):
             raise ValueError("Codex task report must be a JSON object.")
 
-        unfinished = _as_list(payload.get("unfinished"))
+        unfinished = [_normalize_unfinished_entry(item) for item in _as_list(payload.get("unfinished"))]
         blocked = _as_list(payload.get("blocked"))
         completed = _as_list(payload.get("completed"))
         total = payload.get("total_unfinished", len(unfinished) + len(blocked))
@@ -72,6 +75,7 @@ class CodexTaskReportService:
             total_unfinished = len(unfinished) + len(blocked)
 
         generated_at = str(payload.get("generated_at") or _mtime_iso(path))
+        _parse_generated_at(generated_at)
         summary = str(payload.get("summary") or "")
         summary_path, daily_summary_markdown = _load_paired_markdown(path)
         return CodexTaskReport(
@@ -93,8 +97,97 @@ def _as_list(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)]
 
 
+def _normalize_unfinished_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(entry)
+    if _has_resume_marker(normalized):
+        return normalized
+    prompt = str(
+        normalized.get("resume_prompt")
+        or normalized.get("next_action")
+        or normalized.get("next")
+        or ""
+    ).strip()
+    if not prompt:
+        return normalized
+    statuses = [
+        str(normalized.get(field) or "").strip().lower()
+        for field in ("classification", "status", "state")
+    ]
+    statuses = [status for status in statuses if status]
+    if statuses != ["unfinished"]:
+        return normalized
+    if any(_needs_user_or_blocked_status(status) for status in statuses):
+        return normalized
+    if _looks_like_manual_action(prompt):
+        return normalized
+    normalized["resume_eligible"] = True
+    normalized["status"] = "continueable"
+    normalized.setdefault("resume_prompt", prompt)
+    return normalized
+
+
+def _has_resume_marker(entry: dict[str, Any]) -> bool:
+    marker = entry.get("resume_eligible")
+    if marker is True:
+        return True
+    if isinstance(marker, str) and marker.strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    statuses = {
+        str(entry.get(field) or "").strip().lower()
+        for field in ("classification", "status", "state")
+    }
+    return bool(statuses & {"continueable", "continuable", "paused", "ready", "needs_action", "needs_resume"})
+
+
+def _needs_user_or_blocked_status(status: str) -> bool:
+    return status in {
+        "blocked",
+        "complete",
+        "completed",
+        "done",
+        "needs_user",
+        "needs_human",
+        "waiting_user",
+        "user_input_required",
+    }
+
+
+def _looks_like_manual_action(prompt: str) -> bool:
+    text = prompt.lower()
+    manual_markers = [
+        "人工确认",
+        "人工将",
+        "人工处理",
+        "等待人工",
+        "等待用户",
+        "需要用户",
+        "用户输入",
+        "人为确认",
+        "权限",
+        "审批",
+        "释放占用",
+        "manual",
+        "human",
+        "user input",
+        "waiting user",
+    ]
+    return any(marker in text for marker in manual_markers)
+
+
 def _mtime_iso(path: str) -> str:
-    return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(
+        os.path.getmtime(path), tz=timezone.utc
+    ).isoformat(timespec="seconds")
+
+
+def _parse_generated_at(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _paired_markdown_path(path: str) -> str:

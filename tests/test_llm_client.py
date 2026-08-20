@@ -56,6 +56,25 @@ class TestCodexAppServerClient(unittest.TestCase):
         self.assertEqual(response["choices"][0]["message"]["content"], "ok")
         request.assert_called_once()
 
+    @patch("ai_todo_assistant.infrastructure.llm.clients.CodexCliClient.request")
+    def test_structured_failure_retry_bypasses_app_server(self, request):
+        request.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        client = CodexAppServerClient({
+            "codex_command": "codex",
+            "codex_app_server_fallback_to_exec": True,
+        })
+        client._proc = Mock()
+        client._proc.poll.return_value = None
+
+        response = client.retry_after_structured_failure(
+            {"messages": []}, timeout=19
+        )
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "ok")
+        request.assert_called_once_with(
+            {"messages": []}, stream=False, timeout=19
+        )
+
 
 class TestOpenAICompatibleClient(unittest.TestCase):
     def _http_error(self, code):
@@ -110,6 +129,32 @@ class TestCodexCliClient(unittest.TestCase):
         client = CodexCliClient({"codex_command": "codex"})
 
         self.assertTrue(client.is_configured())
+
+    def test_prompt_forwards_inner_response_schema_for_structured_content(self):
+        client = CodexCliClient({"codex_command": "codex"})
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "agentretro_probe",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {"status": {"const": "ok"}},
+                    "required": ["status"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+        prompt = client._build_prompt(
+            {"messages": [], "tools": [], "response_format": response_format}
+        )
+
+        self.assertIn("response_format", prompt)
+        self.assertIn(
+            json.dumps(response_format, ensure_ascii=False, sort_keys=True), prompt
+        )
+        self.assertIn("content 字符串本身", prompt)
 
     @patch("ai_todo_assistant.infrastructure.llm.clients.subprocess.run")
     @patch("ai_todo_assistant.infrastructure.llm.clients.shutil.which", return_value="C:\\bin\\codex.exe")

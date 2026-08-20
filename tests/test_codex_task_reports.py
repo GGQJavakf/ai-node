@@ -116,6 +116,92 @@ class TestCodexTaskReports(unittest.TestCase):
         self.assertEqual(report.path, good_path)
         self.assertEqual(report.total_unfinished, 1)
 
+    def test_latest_report_orders_iso_timestamps_by_instant_and_skips_invalid(self):
+        earlier_path = os.path.join(self.temp_dir.name, "earlier.json")
+        later_path = os.path.join(self.temp_dir.name, "later.json")
+        invalid_path = os.path.join(self.temp_dir.name, "invalid.json")
+        with open(earlier_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"generated_at": "2026-06-19T09:00:00+08:00", "summary": "earlier"},
+                handle,
+            )
+        with open(later_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"generated_at": "2026-06-19T02:00:00Z", "summary": "later"},
+                handle,
+            )
+        with open(invalid_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"generated_at": "not-a-timestamp", "summary": "invalid"},
+                handle,
+            )
+
+        reports = CodexTaskReportService(self.temp_dir.name).list_reports()
+
+        self.assertEqual([report.path for report in reports], [earlier_path, later_path])
+        self.assertEqual(reports[-1].summary, "later")
+
+    def test_unfinished_entries_with_next_action_are_normalized_as_resumeable(self):
+        report_path = os.path.join(self.temp_dir.name, "2026-06-20.json")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-20T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-ready",
+                            "title": "继续开发",
+                            "status": "unfinished",
+                            "next_action": "继续执行到测试通过",
+                        },
+                        {
+                            "thread_id": "thread-human",
+                            "title": "等待确认",
+                            "status": "unfinished",
+                            "next_action": "人工确认是否继续",
+                        },
+                    ],
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        report = CodexTaskReportService(self.temp_dir.name).latest_report()
+
+        self.assertEqual(report.unfinished[0]["status"], "continueable")
+        self.assertTrue(report.unfinished[0]["resume_eligible"])
+        self.assertEqual(report.unfinished[0]["resume_prompt"], "继续执行到测试通过")
+        self.assertEqual(report.unfinished[1]["status"], "unfinished")
+        self.assertNotIn("resume_eligible", report.unfinished[1])
+
+    def test_only_legacy_unfinished_status_is_normalized_as_resumeable(self):
+        report_path = os.path.join(self.temp_dir.name, "2026-06-21.json")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "generated_at": "2026-06-21T08:30:00+08:00",
+                    "unfinished": [
+                        {
+                            "thread_id": "thread-idle",
+                            "status": "idle",
+                            "next_action": "继续执行",
+                        },
+                        {
+                            "thread_id": "thread-missing-status",
+                            "next_action": "继续执行",
+                        },
+                    ],
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        report = CodexTaskReportService(self.temp_dir.name).latest_report()
+
+        self.assertEqual(report.unfinished[0]["status"], "idle")
+        self.assertNotIn("resume_eligible", report.unfinished[0])
+        self.assertNotIn("resume_eligible", report.unfinished[1])
+
 
 if __name__ == "__main__":
     unittest.main()

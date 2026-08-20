@@ -3,7 +3,6 @@
 """
 import unittest
 import os
-import json
 from datetime import datetime, timedelta
 
 import _path  # noqa: F401
@@ -160,7 +159,7 @@ class TestTodoManager(unittest.TestCase):
     def test_get_by_status(self):
         """测试按状态筛选"""
         todo1 = self.manager.add("任务1")
-        todo2 = self.manager.add("任务2")
+        _todo2 = self.manager.add("任务2")
         self.manager.toggle_completed(todo1.id)
         
         completed = self.manager.get_by_status(True)
@@ -205,7 +204,7 @@ class TestTodoManager(unittest.TestCase):
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         
         todo1 = self.manager.add("任务1")
-        todo2 = self.manager.add("任务2", due_date=yesterday)
+        _todo2 = self.manager.add("任务2", due_date=yesterday)
         self.manager.toggle_completed(todo1.id)
         
         stats = self.manager.get_statistics()
@@ -228,7 +227,7 @@ class TestTodoManager(unittest.TestCase):
         """测试清除已完成"""
         todo1 = self.manager.add("任务1")
         todo2 = self.manager.add("任务2")
-        todo3 = self.manager.add("任务3")
+        _todo3 = self.manager.add("任务3")
         
         self.manager.toggle_completed(todo1.id)
         self.manager.toggle_completed(todo2.id)

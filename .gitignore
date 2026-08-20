@@ -15,6 +15,7 @@ venv/
 env/
 
 # Local runtime state
+config/settings.local.json
 todos.json
 data/*.db
 data/*.db-shm

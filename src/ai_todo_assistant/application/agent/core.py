@@ -143,7 +143,7 @@ class AgentCore:
         if not self.is_configured():
             if self.auth_mode == "codex_cli":
                 return "❌ 未找到 Codex CLI，请先安装并运行 `codex login` 完成登录"
-            return "❌ 未配置 API Key，请检查 config/settings.json"
+            return "❌ 未配置 API Key，请检查 config/settings.local.json"
 
         # Chat Completions 的流式 tool_calls 需要增量拼接参数；当前 Agent
         # 工具循环依赖完整 message.tool_calls，因此带工具时使用非流式请求。
