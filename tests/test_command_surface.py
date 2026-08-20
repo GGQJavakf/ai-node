@@ -35,6 +35,19 @@ class TestAssistantCommandSurface(unittest.TestCase):
             self.cli._handle_slash_command("/continue"),
         )
 
+    def test_slash_dispatch_resolves_instance_handlers_at_call_time(self):
+        calls = []
+        self.cli._handle_resume_shortcut = lambda subcmd, args: calls.append((subcmd, args)) or "patched resume"
+        self.cli._handle_continue_command = lambda: "patched continue"
+
+        self.assertEqual(self.cli._handle_slash_command("/resume 2 extra"), "patched resume")
+        self.assertEqual(self.cli._handle_slash_command("/r all"), "patched resume")
+        self.assertEqual(self.cli._handle_slash_command("/next"), "patched continue")
+        self.assertEqual(self.cli._handle_slash_command("/continue"), "patched continue")
+        self.assertEqual(self.cli._handle_slash_command("/quit"), "exit")
+        self.assertEqual(self.cli._handle_slash_command("/unknown value"), "未知命令: /unknown")
+        self.assertEqual(calls, [("2", "extra"), ("all", "")])
+
     def test_bare_review_is_preferred_alias_for_review_day(self):
         self.assertEqual(
             self.cli._handle_slash_command("/review"),
