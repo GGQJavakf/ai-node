@@ -9,6 +9,8 @@ from ai_todo_assistant.application.workflow.codex_resume import (
     CodexResumeExclusionService,
     CodexResumeService,
     CodexThreadResumeOutcome,
+    _skip_next_action,
+    _skip_progress,
     format_codex_resume_result,
 )
 from ai_todo_assistant.domain.workflow import WorkItem
@@ -68,6 +70,27 @@ class TestCodexThreadResume(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_skip_copy_preserves_ordered_pairs_and_fallbacks(self):
+        cases = [
+            ("COMPLETED BUCKET and blocked bucket", "已完成", "无需继续推进"),
+            ("blocked bucket", "阻塞中", "等待阻塞解除或人工确认"),
+            ("manual exclusion", "已手动排除", "需要恢复自动推进时执行 /r unskip <序号>"),
+            ("需要用户输入", "需要用户输入", "补充用户输入后再生成可推进指令"),
+            ("缺少 thread id", "缺少线程 ID", "更新 report，补充稳定 thread_id"),
+            ("缺少 continuation prompt", "缺少后续指令", "更新 report，补充 next_action/resume_prompt"),
+            ("not marked resumeable", "未标记可继续", "确认安全后标记 resume_eligible 或 continueable"),
+            ("already resumed successfully", "同指令已推进", "无需重复发送"),
+            ("already failed", "同指令曾失败", "排查失败原因；必要时 /r <序号> 手动重试"),
+            ("manual exclusion policy unavailable", "已手动排除", "需要恢复自动推进时执行 /r unskip <序号>"),
+            ("not resumeable", "不可自动推进", "确认状态后再重新纳入自动推进"),
+            ("custom reason", "custom reason", "查看原因后人工判断"),
+            ("", "暂不推进", "查看原因后人工判断"),
+        ]
+        for reason, progress, next_action in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(_skip_progress(reason), progress)
+                self.assertEqual(_skip_next_action(reason), next_action)
 
     def test_dry_run_lists_only_explicitly_continueable_entries(self):
         client = FakeResumeClient()

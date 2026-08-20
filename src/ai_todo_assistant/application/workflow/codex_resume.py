@@ -598,58 +598,36 @@ def _is_blocked_or_done(status: str) -> bool:
     return status in {"blocked", "complete", "completed", "done"}
 
 
+_SKIP_COPY_RULES = (
+    ("completed bucket", True, "已完成", "无需继续推进"),
+    ("blocked bucket", True, "阻塞中", "等待阻塞解除或人工确认"),
+    ("manual exclusion", True, "已手动排除", "需要恢复自动推进时执行 /r unskip <序号>"),
+    ("需要用户输入", False, "需要用户输入", "补充用户输入后再生成可推进指令"),
+    ("缺少 thread id", False, "缺少线程 ID", "更新 report，补充稳定 thread_id"),
+    ("缺少 continuation prompt", False, "缺少后续指令", "更新 report，补充 next_action/resume_prompt"),
+    ("not marked resumeable", True, "未标记可继续", "确认安全后标记 resume_eligible 或 continueable"),
+    ("already resumed successfully", True, "同指令已推进", "无需重复发送"),
+    ("already failed", True, "同指令曾失败", "排查失败原因；必要时 /r <序号> 手动重试"),
+    ("manual exclusion policy unavailable", True, "排除列表不可用", "修复排除列表文件后重试"),
+    ("not resumeable", True, "不可自动推进", "确认状态后再重新纳入自动推进"),
+)
+
+
+def _skip_copy(reason: str) -> tuple[str, str]:
+    raw = str(reason or "")
+    normalized = raw.lower()
+    for marker, use_normalized, progress, next_action in _SKIP_COPY_RULES:
+        if marker in (normalized if use_normalized else raw):
+            return progress, next_action
+    return raw or "暂不推进", "查看原因后人工判断"
+
+
 def _skip_progress(reason: str) -> str:
-    text = str(reason or "").lower()
-    if "completed bucket" in text:
-        return "已完成"
-    if "blocked bucket" in text:
-        return "阻塞中"
-    if "manual exclusion" in text:
-        return "已手动排除"
-    if "需要用户输入" in reason:
-        return "需要用户输入"
-    if "缺少 thread id" in reason:
-        return "缺少线程 ID"
-    if "缺少 continuation prompt" in reason:
-        return "缺少后续指令"
-    if "not marked resumeable" in text:
-        return "未标记可继续"
-    if "already resumed successfully" in text:
-        return "同指令已推进"
-    if "already failed" in text:
-        return "同指令曾失败"
-    if "manual exclusion policy unavailable" in text:
-        return "排除列表不可用"
-    if "not resumeable" in text:
-        return "不可自动推进"
-    return reason or "暂不推进"
+    return _skip_copy(reason)[0]
 
 
 def _skip_next_action(reason: str) -> str:
-    text = str(reason or "").lower()
-    if "completed bucket" in text:
-        return "无需继续推进"
-    if "blocked bucket" in text:
-        return "等待阻塞解除或人工确认"
-    if "manual exclusion" in text:
-        return "需要恢复自动推进时执行 /r unskip <序号>"
-    if "需要用户输入" in reason:
-        return "补充用户输入后再生成可推进指令"
-    if "缺少 thread id" in reason:
-        return "更新 report，补充稳定 thread_id"
-    if "缺少 continuation prompt" in reason:
-        return "更新 report，补充 next_action/resume_prompt"
-    if "not marked resumeable" in text:
-        return "确认安全后标记 resume_eligible 或 continueable"
-    if "already resumed successfully" in text:
-        return "无需重复发送"
-    if "already failed" in text:
-        return "排查失败原因；必要时 /r <序号> 手动重试"
-    if "manual exclusion policy unavailable" in text:
-        return "修复排除列表文件后重试"
-    if "not resumeable" in text:
-        return "确认状态后再重新纳入自动推进"
-    return "查看原因后人工判断"
+    return _skip_copy(reason)[1]
 
 
 def _looks_like_manual_action_prompt(prompt: str) -> bool:
