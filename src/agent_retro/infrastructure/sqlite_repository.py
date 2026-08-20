@@ -17,6 +17,8 @@ from agent_retro.application.ports import RetroRepository
 from agent_retro.domain.models import (
     AcceptanceDecision,
     AuditEntry,
+    AwaitingSessionSummary,
+    BriefHealthCounts,
     Candidate,
     CandidateStatus,
     Evidence,
@@ -25,6 +27,7 @@ from agent_retro.domain.models import (
     KnowledgeType,
     NormalizedEvent,
     NormalizedSession,
+    PendingCandidateSummary,
     ProjectMapping,
     Reclassification,
     ManagedFileState,
@@ -667,6 +670,126 @@ class SQLiteRetroRepository(RetroRepository):
                 (session_id, session_id),
             ).fetchall()
             return [self._evidence_with_locators(connection, row) for row in rows]
+        finally:
+            connection.close()
+
+    def list_pending_candidate_summaries(
+        self, project_id: str | None = None
+    ) -> list[PendingCandidateSummary]:
+        """Return only IDs, routing, time, and derived retryability."""
+
+        connection = self._connect()
+        try:
+            sql = """SELECT c.id, c.project_id, c.created_at,
+                CASE WHEN c.review_json IN ('', '{}', 'null')
+                    THEN 0 ELSE 1 END AS has_review,
+                (
+                    SELECT attempt.status FROM review_attempts AS attempt
+                    WHERE attempt.candidate_id = c.id
+                    ORDER BY attempt.attempt_no DESC LIMIT 1
+                ) AS latest_attempt_status
+                FROM candidates AS c WHERE c.status = ?"""
+            values: list[object] = [CandidateStatus.PENDING_REVIEW.value]
+            if project_id is not None:
+                sql += " AND c.project_id = ?"
+                values.append(project_id)
+            sql += " ORDER BY c.created_at, c.id"
+            rows = connection.execute(sql, values).fetchall()
+            return [
+                PendingCandidateSummary(
+                    id=str(row["id"]),
+                    project_id=str(row["project_id"]),
+                    created_at=_datetime(str(row["created_at"])),
+                    retryable=(
+                        not bool(row["has_review"])
+                        and row["latest_attempt_status"] in (None, "failed")
+                    ),
+                )
+                for row in rows
+            ]
+        finally:
+            connection.close()
+
+    def list_awaiting_session_summaries(self) -> list[AwaitingSessionSummary]:
+        """Return safe identifiers for captures awaiting explicit routing."""
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """SELECT source_session_id, project_id, captured_at FROM sessions
+                WHERE project_id IN ('awaiting:unknown', 'awaiting:ambiguous')
+                ORDER BY captured_at, source_session_id"""
+            ).fetchall()
+            return [
+                AwaitingSessionSummary(
+                    source_session_id=str(row["source_session_id"]),
+                    routing_status=str(row["project_id"]).removeprefix("awaiting:"),
+                    captured_at=_datetime(str(row["captured_at"])),
+                )
+                for row in rows
+            ]
+        finally:
+            connection.close()
+
+    def brief_health_counts(
+        self, project_id: str, at: datetime
+    ) -> BriefHealthCounts:
+        """Return content-free counts using the effective read-time lifecycle."""
+
+        at_text = _datetime_text(at)
+        connection = self._connect()
+        try:
+            captured = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()[0]
+            )
+            pending = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE project_id = ? AND status = ?",
+                    (project_id, CandidateStatus.PENDING_REVIEW.value),
+                ).fetchone()[0]
+            )
+            knowledge_row = connection.execute(
+                """WITH latest AS (
+                    SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
+                ), visible AS (
+                    SELECT item.* FROM knowledge AS item
+                    JOIN latest ON latest.id = item.id
+                      AND latest.version = item.version
+                    WHERE (item.project_id = ? OR item.scope = 'global')
+                      AND item.status = 'active'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM conflicts
+                          WHERE active_knowledge_id = item.id AND status = 'open'
+                      )
+                )
+                SELECT
+                    SUM(CASE WHEN valid_until IS NULL OR valid_until > ? THEN 1 ELSE 0 END)
+                        AS eligible_count,
+                    SUM(CASE WHEN knowledge_type = ? AND valid_until IS NOT NULL
+                        AND valid_until <= ? THEN 1 ELSE 0 END) AS expired_count,
+                    SUM(CASE WHEN knowledge_type = ?
+                        AND (valid_until IS NULL OR valid_until > ?) THEN 1 ELSE 0 END)
+                        AS active_task_count
+                FROM visible""",
+                (
+                    project_id,
+                    at_text,
+                    KnowledgeType.TASK_STATE.value,
+                    at_text,
+                    KnowledgeType.TASK_STATE.value,
+                    at_text,
+                ),
+            ).fetchone()
+            return BriefHealthCounts(
+                captured_session_count=captured,
+                pending_review_count=pending,
+                eligible_knowledge_count=int(knowledge_row["eligible_count"] or 0),
+                expired_task_state_count=int(knowledge_row["expired_count"] or 0),
+                active_task_state_count=int(knowledge_row["active_task_count"] or 0),
+            )
         finally:
             connection.close()
 

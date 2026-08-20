@@ -14,27 +14,37 @@ from agentretro_scenarios import (
 )
 
 
-CHANGE_ROOT = Path(__file__).parents[1] / "openspec" / "changes" / "add-agentretro-mvp"
-HARDENING_CHANGE_ROOT = (
-    Path(__file__).parents[1]
-    / "openspec"
-    / "changes"
-    / "harden-recent-session-capture"
-)
+REPO_ROOT = Path(__file__).parents[1]
+
+
+def _change_root(name: str) -> Path:
+    active = REPO_ROOT / "openspec" / "changes" / name
+    if active.is_dir():
+        return active
+    archived = sorted(
+        (REPO_ROOT / "openspec" / "changes" / "archive").glob(f"*-{name}")
+    )
+    assert len(archived) == 1, f"expected one active or archived change for {name}"
+    return archived[0]
+
+
+CHANGE_ROOT = _change_root("add-agentretro-mvp")
+HARDENING_CHANGE_ROOT = _change_root("harden-recent-session-capture")
+VALUE_LOOP_CHANGE_ROOT = _change_root("improve-agentretro-value-loop")
 SCENARIO_PATTERN = re.compile(
     r"^#### Scenario: \[(CR|KR|OS|BR)-(\d{2})\]", re.MULTILINE
 )
 EXPECTED_IDS = {
-    *(f"CR-{number:02d}" for number in range(1, 23)),
-    *(f"KR-{number:02d}" for number in range(1, 25)),
+    *(f"CR-{number:02d}" for number in range(1, 29)),
+    *(f"KR-{number:02d}" for number in range(1, 31)),
     *(f"OS-{number:02d}" for number in range(1, 30)),
-    *(f"BR-{number:02d}" for number in range(1, 29)),
+    *(f"BR-{number:02d}" for number in range(1, 37)),
 }
 
 
-def _discovered_scenario_ids() -> list[str]:
+def _discovered_scenario_ids(change_root: Path) -> list[str]:
     found: list[str] = []
-    for spec in sorted((CHANGE_ROOT / "specs").glob("**/spec.md")):
+    for spec in sorted((change_root / "specs").glob("**/spec.md")):
         text = spec.read_text(encoding="utf-8")
         found.extend(
             f"{prefix}-{number}" for prefix, number in SCENARIO_PATTERN.findall(text)
@@ -45,7 +55,7 @@ def _discovered_scenario_ids() -> list[str]:
 def _collected_node_ids() -> set[str]:
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q", "tests"],
-        cwd=CHANGE_ROOT.parents[2],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -61,13 +71,15 @@ def _collected_node_ids() -> set[str]:
 
 
 def test_all_openspec_scenarios_have_exact_collected_pytest_evidence():
-    discovered = _discovered_scenario_ids()
+    base_discovered = _discovered_scenario_ids(CHANGE_ROOT)
+    value_loop_discovered = _discovered_scenario_ids(VALUE_LOOP_CHANGE_ROOT)
+    discovered = {*base_discovered, *value_loop_discovered}
     verification_rows = scenario_verification_rows()
     verification_report = "\n".join(verification_rows)
-    assert len(discovered) == 103
-    assert len(set(discovered)) == 103, "duplicate OpenSpec scenario IDs found"
-    assert set(discovered) == EXPECTED_IDS
-    assert set(SCENARIO_TESTS) == set(discovered), verification_report
+    assert len(base_discovered) == len(set(base_discovered)) == 103
+    assert len(value_loop_discovered) == len(set(value_loop_discovered)) == 27
+    assert discovered == EXPECTED_IDS
+    assert set(SCENARIO_TESTS) == discovered, verification_report
     assert all(SCENARIO_TESTS.values())
 
     mapped_nodes = {node for nodes in SCENARIO_TESTS.values() for node in nodes}
@@ -78,7 +90,7 @@ def test_all_openspec_scenarios_have_exact_collected_pytest_evidence():
     assert mapped_nodes <= collected, (
         f"stale node IDs: {sorted(mapped_nodes - collected)}\n{verification_report}"
     )
-    assert len(verification_rows) == 103
+    assert len(verification_rows) == 123
 
 
 def test_hardening_openspec_scenarios_have_exact_collected_pytest_evidence():

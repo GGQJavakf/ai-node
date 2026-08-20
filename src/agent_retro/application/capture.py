@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
@@ -27,6 +28,22 @@ class SourceIntegrityError(RuntimeError):
     """A known source identity was observed with changed bytes."""
 
 
+class RecentCaptureBoundsError(ValueError):
+    def __init__(self, count: int, maximum: int) -> None:
+        super().__init__("recent_capture_count_out_of_bounds")
+        self.count = count
+        self.maximum = maximum
+        self.reason = "recent_capture_count_out_of_bounds"
+
+
+class CapturePlanChangedError(ValueError):
+    def __init__(self, count: int) -> None:
+        super().__init__("capture_plan_changed")
+        self.count = count
+        self.reason = "capture_plan_changed"
+        self.recovery_command = f"retro capture --recent {count} --dry-run"
+
+
 @dataclass(frozen=True)
 class CaptureResult:
     session_id: str
@@ -34,6 +51,72 @@ class CaptureResult:
     reused: bool
     warnings: tuple[str, ...]
     project_status: str
+
+
+@dataclass(frozen=True)
+class RecentCapturePlanItem:
+    session_id: str
+    source_hash: str
+    resolution_status: str
+    canonical_project_id: str
+    mapping_id: str
+    reuse_status: str
+
+
+@dataclass(frozen=True)
+class RecentCapturePlan:
+    plan_id: str
+    schema_version: int
+    requested_count: int
+    recent_capture_max: int
+    items: tuple[RecentCapturePlanItem, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BatchCaptureItem:
+    session_id: str
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class RecentCaptureResult:
+    plan_id: str
+    requested_count: int
+    captured: tuple[BatchCaptureItem, ...]
+    reused: tuple[BatchCaptureItem, ...]
+    failed: tuple[BatchCaptureItem, ...]
+    skipped: tuple[BatchCaptureItem, ...]
+    recovery_command: str
+
+
+def _recent_capture_plan_id(
+    schema_version: int,
+    requested_count: int,
+    recent_capture_max: int,
+    items: Sequence[RecentCapturePlanItem],
+) -> str:
+    payload = {
+        "schema_version": schema_version,
+        "requested_count": requested_count,
+        "recent_capture_max": recent_capture_max,
+        "items": [
+            {
+                "session_id": item.session_id,
+                "source_hash": item.source_hash,
+                "resolution_status": item.resolution_status,
+                "canonical_project_id": item.canonical_project_id,
+                "mapping_id": item.mapping_id,
+                "reuse_status": item.reuse_status,
+            }
+            for item in items
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 class CaptureService:
@@ -62,7 +145,110 @@ class CaptureService:
     def capture_session(self, session_id: str) -> CaptureResult:
         return self._capture(self.source.load(session_id))
 
-    def _capture(self, source_session: NormalizedSession) -> CaptureResult:
+    def preview_recent(self, count: int, maximum: int) -> RecentCapturePlan:
+        plan, _, _ = self._recent_plan(count, maximum)
+        return plan
+
+    def apply_recent(
+        self, count: int, maximum: int, expected_plan_id: str
+    ) -> RecentCaptureResult:
+        plan, sessions, resolutions = self._recent_plan(count, maximum)
+        if plan.plan_id != expected_plan_id:
+            raise CapturePlanChangedError(count)
+
+        captured: list[BatchCaptureItem] = []
+        reused: list[BatchCaptureItem] = []
+        failed: list[BatchCaptureItem] = []
+        skipped: list[BatchCaptureItem] = []
+        stopped = False
+        for item, session, resolution in zip(plan.items, sessions, resolutions):
+            if stopped:
+                skipped.append(BatchCaptureItem(item.session_id, "batch_stopped"))
+                continue
+            if item.resolution_status != "resolved":
+                skipped.append(
+                    BatchCaptureItem(item.session_id, item.resolution_status)
+                )
+                continue
+            try:
+                result = self._capture(session, resolution=resolution)
+            except Exception:
+                failed.append(BatchCaptureItem(item.session_id, "capture_failed"))
+                stopped = True
+                continue
+            target = reused if result.reused else captured
+            target.append(BatchCaptureItem(item.session_id))
+
+        return RecentCaptureResult(
+            plan_id=plan.plan_id,
+            requested_count=count,
+            captured=tuple(captured),
+            reused=tuple(reused),
+            failed=tuple(failed),
+            skipped=tuple(skipped),
+            recovery_command=f"retro capture --recent {count} --dry-run",
+        )
+
+    def _recent_plan(
+        self, count: int, maximum: int
+    ) -> tuple[
+        RecentCapturePlan,
+        tuple[NormalizedSession, ...],
+        tuple[ProjectResolution, ...],
+    ]:
+        if count < 1 or maximum < 1 or count > maximum:
+            raise RecentCaptureBoundsError(count, maximum)
+        sessions = self.source.recent_completed(count)
+        items: list[RecentCapturePlanItem] = []
+        resolutions: list[ProjectResolution] = []
+        for session in sessions:
+            resolution = self._resolve_project(session.project_id)
+            resolutions.append(resolution)
+            existing = self.repository.find_session(
+                session.source_session_id, session.source_hash
+            )
+            conflicting = self.repository.find_session_by_source_id(
+                session.source_session_id
+            )
+            reuse_status = (
+                "reused"
+                if existing is not None
+                else "source_conflict"
+                if conflicting is not None
+                else "new"
+            )
+            items.append(
+                RecentCapturePlanItem(
+                    session_id=session.source_session_id,
+                    source_hash=session.source_hash,
+                    resolution_status=resolution.status,
+                    canonical_project_id=resolution.project_id,
+                    mapping_id=resolution.mapping_id,
+                    reuse_status=reuse_status,
+                )
+            )
+        item_tuple = tuple(items)
+        schema_version = 1
+        plan_id = _recent_capture_plan_id(schema_version, count, maximum, item_tuple)
+        return (
+            RecentCapturePlan(
+                plan_id=plan_id,
+                schema_version=schema_version,
+                requested_count=count,
+                recent_capture_max=maximum,
+                items=item_tuple,
+                warnings=self.source.last_discovery.warnings,
+            ),
+            sessions,
+            tuple(resolutions),
+        )
+
+    def _capture(
+        self,
+        source_session: NormalizedSession,
+        *,
+        resolution: ProjectResolution | None = None,
+    ) -> CaptureResult:
         existing = self.repository.find_session(
             source_session.source_session_id, source_session.source_hash
         )
@@ -82,7 +268,7 @@ class CaptureService:
                 f"Codex 会话源哈希发生冲突: {source_session.source_session_id}"
             )
 
-        resolution = self._resolve_project(source_session.project_id)
+        resolution = resolution or self._resolve_project(source_session.project_id)
         # Pass 1: values are redacted before any future model consumer can see
         # the normalized capture payload.
         model_safe_session = self._redacted_session(source_session)

@@ -8,12 +8,17 @@ import sys
 from collections.abc import Callable
 
 from agent_retro.application.knowledge import KnowledgeService
+from agent_retro.application.inbox import ReviewInboxService
 from agent_retro.application.merge import MergeService
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
 from agent_retro.application.sync import ProjectionCoordinator, ProjectionResult
 from agent_retro.domain.models import CandidateStatus, KnowledgeType
 from agent_retro.infrastructure.settings import RetroSettings
+from agent_retro.infrastructure.project_mapping import (
+    ProjectReferenceError,
+    ProjectReferenceResolver,
+)
 from agent_retro.presentation.output import safe_text, write_json
 
 
@@ -29,6 +34,35 @@ def run_review_command(
     projection_coordinator: ProjectionCoordinator | None = None,
 ) -> int:
     command = args.review_command
+    if command == "inbox":
+        inbox_service = ReviewInboxService(repository)
+        if args.inbox_awaiting:
+            data = _awaiting_inbox_data(inbox_service.awaiting(args.inbox_limit))
+            code = "RETRO_REVIEW_INBOX_AWAITING"
+            message = "Awaiting project-routing work listed."
+        elif args.inbox_project:
+            resolution = ProjectReferenceResolver(
+                repository.list_project_mappings()
+            ).resolve(args.inbox_project)
+            if resolution.status != "resolved":
+                raise ProjectReferenceError(resolution)
+            data = _project_inbox_data(
+                inbox_service.project(resolution.project_id, args.inbox_limit)
+            )
+            code = "RETRO_REVIEW_INBOX_PROJECT"
+            message = "Project review work listed."
+        else:
+            data = _cross_project_inbox_data(inbox_service.cross_project())
+            code = "RETRO_REVIEW_INBOX"
+            message = "Cross-project review work listed."
+        _write_result(
+            args.json_output,
+            code=code,
+            message=message,
+            human=json.dumps(data, ensure_ascii=False, sort_keys=True),
+            data=data,
+        )
+        return 0
     if command == "list":
         if args.candidate_status:
             candidates = repository.list_candidates(
@@ -276,6 +310,72 @@ def _candidate_data(candidate) -> dict[str, object]:
         "evidence_ids": list(candidate.evidence_ids),
         "status": candidate.status.value,
         "extraction_confidence": candidate.extraction_confidence,
+    }
+
+
+def _cross_project_inbox_data(result) -> dict[str, object]:
+    return {
+        "projects": [
+            {
+                "project_id": item.project_id,
+                "pending_count": item.pending_count,
+                "retryable_count": item.retryable_count,
+                "oldest_pending_age_seconds": item.oldest_pending_age_seconds,
+                "eligible_knowledge_count": item.eligible_knowledge_count,
+                "expired_task_state_count": item.expired_task_state_count,
+                "active_task_state_count": item.active_task_state_count,
+            }
+            for item in result.projects
+        ],
+        "awaiting_unknown_count": result.awaiting_unknown_count,
+        "awaiting_ambiguous_count": result.awaiting_ambiguous_count,
+    }
+
+
+def _project_inbox_data(result) -> dict[str, object]:
+    return {
+        "project_id": result.project_id,
+        "total_count": result.total_count,
+        "returned_count": result.returned_count,
+        "truncated": result.truncated,
+        "retryable_count": result.retryable_count,
+        "eligible_knowledge_count": result.health.eligible_knowledge_count,
+        "expired_task_state_count": result.health.expired_task_state_count,
+        "active_task_state_count": result.health.active_task_state_count,
+        "captured_session_count": result.health.captured_session_count,
+        "pending_review_count": result.health.pending_review_count,
+        "inbox_command": result.inbox_command,
+        "items": [
+            {
+                "candidate_id": item.candidate_id,
+                "age_seconds": item.age_seconds,
+                "retryable": item.retryable,
+                "show_command": item.show_command,
+                "accept_command": item.accept_command,
+                "edit_command": item.edit_command,
+                "reject_command": item.reject_command,
+                "retry_command": item.retry_command,
+            }
+            for item in result.items
+        ],
+    }
+
+
+def _awaiting_inbox_data(result) -> dict[str, object]:
+    return {
+        "total_count": result.total_count,
+        "returned_count": result.returned_count,
+        "truncated": result.truncated,
+        "project_list_command": result.project_list_command,
+        "items": [
+            {
+                "session_id": item.session_id,
+                "routing_status": item.routing_status,
+                "age_seconds": item.age_seconds,
+                "reclassify_command": item.reclassify_command,
+            }
+            for item in result.items
+        ],
     }
 
 

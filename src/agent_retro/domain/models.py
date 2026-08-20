@@ -142,6 +142,36 @@ class ReviewAttempt:
 
 
 @dataclass(frozen=True)
+class PendingCandidateSummary:
+    """Content-free pending-review projection for inbox commands."""
+
+    id: str
+    project_id: str
+    created_at: datetime
+    retryable: bool
+
+
+@dataclass(frozen=True)
+class AwaitingSessionSummary:
+    """Content-free captured-session projection awaiting project routing."""
+
+    source_session_id: str
+    routing_status: str
+    captured_at: datetime
+
+
+@dataclass(frozen=True)
+class BriefHealthCounts:
+    """Aggregate-only project health facts shared by brief and inbox."""
+
+    captured_session_count: int
+    pending_review_count: int
+    eligible_knowledge_count: int
+    expired_task_state_count: int
+    active_task_state_count: int
+
+
+@dataclass(frozen=True)
 class AcceptanceDecision:
     """Typed automatic-acceptance facts persisted in the audit record."""
 

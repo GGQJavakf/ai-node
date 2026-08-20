@@ -22,6 +22,7 @@ class RetroSettings:
     discovery_max_files: int
     discovery_timeout_seconds: float
     session_max_bytes: int
+    recent_capture_max: int
     model_timeout_seconds: int | None
     brief_timeout_seconds: float
     thresholds: Mapping[KnowledgeType, float]
@@ -67,6 +68,7 @@ def load_retro_settings(
         session_max_bytes=_read_int(
             values, "AGENTRETRO_SESSION_MAX_BYTES", 128 * 1024 * 1024
         ),
+        recent_capture_max=_read_int(values, "AGENTRETRO_RECENT_CAPTURE_MAX", 20),
         model_timeout_seconds=(
             _read_int(values, "AGENTRETRO_MODEL_TIMEOUT_SECONDS", 120)
             if model_timeout_value
@@ -107,6 +109,7 @@ def _validate_settings(settings: RetroSettings) -> None:
             settings.discovery_timeout_seconds,
         ),
         ("AGENTRETRO_SESSION_MAX_BYTES", settings.session_max_bytes),
+        ("AGENTRETRO_RECENT_CAPTURE_MAX", settings.recent_capture_max),
         ("AGENTRETRO_MODEL_TIMEOUT_SECONDS", settings.model_timeout_seconds),
         ("AGENTRETRO_BRIEF_TIMEOUT_SECONDS", settings.brief_timeout_seconds),
     )
