@@ -40,7 +40,6 @@ from agent_retro.domain.models import (
     PurgeCopy,
     PurgeInspection,
     PurgeJournal,
-    PurgeJournalOperation,
     PurgeStatus,
     PurgeTombstone,
     ReviewAttempt,
@@ -52,6 +51,20 @@ from agent_retro.domain.models import (
 )
 from agent_retro.domain.projection import ProjectionFenceError, projection_input_hash
 from agent_retro.infrastructure.obsidian import render_aggregate
+from agent_retro.infrastructure._sqlite_migration import (
+    create_migration_backup,
+    migrate_repository,
+    remove_database_sidecars,
+    remove_failed_database,
+    verify_database_readback,
+)
+from agent_retro.infrastructure._sqlite_purge import (
+    purge_entity_copies,
+    purge_journal_from_rows,
+    purge_operation_error,
+    purge_residual_labels,
+    purge_tombstone_from_json,
+)
 
 
 _SCHEMA_VERSION = 3
@@ -372,80 +385,7 @@ class SQLiteRetroRepository(RetroRepository):
 
     def migrate(self, target_version: int = _SCHEMA_VERSION) -> None:
         """Migrate under one writer fence after a verified SQLite snapshot."""
-
-        if target_version < 1:
-            raise ValueError("target_version must be at least 1")
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        created_database = False
-        if not self.db_path.exists():
-            try:
-                self.db_path.touch(exist_ok=False)
-                created_database = True
-            except FileExistsError:
-                pass
-        connection: sqlite3.Connection | None = None
-        backup_path: Path | None = None
-        current_version = 0
-        try:
-            connection = self._connect()
-            connection.execute("BEGIN IMMEDIATE")
-            current_version = self._schema_version(connection)
-            if current_version > 0:
-                created_database = False
-            if current_version == target_version:
-                connection.rollback()
-                connection.close()
-                connection = None
-                return
-            if current_version > target_version:
-                raise ValueError("database downgrades are not supported")
-
-            if not created_database:
-                self.backup_dir.mkdir(parents=True, exist_ok=True)
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                backup_path = self.backup_dir / (
-                    f"migration-{current_version}-to-{target_version}-{stamp}.db"
-                )
-                self._create_migration_backup(backup_path)
-
-            for version in range(current_version + 1, target_version + 1):
-                self._apply_migration(connection, version)
-                self._append_audit_record(
-                    connection,
-                    self._audit_entry(
-                        action="migration_applied",
-                        entity_type="schema",
-                        entity_id=str(version),
-                        before_hash=str(version - 1),
-                        after_hash=str(version),
-                        detail={"from": version - 1, "to": version},
-                    ),
-                )
-            connection.commit()
-        except BaseException:
-            if connection is not None:
-                try:
-                    connection.rollback()
-                except BaseException:
-                    pass
-                try:
-                    connection.close()
-                except BaseException:
-                    pass
-                connection = None
-            if created_database:
-                self._remove_failed_database()
-            elif backup_path is not None and backup_path.exists():
-                try:
-                    self._verify_database_readback(current_version)
-                except BaseException as recovery_error:
-                    raise RuntimeError(
-                        "migration rollback verification failed; verified backup retained"
-                    ) from recovery_error
-            raise
-        else:
-            assert connection is not None
-            connection.close()
+        migrate_repository(self, target_version, _SCHEMA_VERSION)
 
     def _apply_migration(self, connection: sqlite3.Connection, version: int) -> None:
         if version == 1:
@@ -467,61 +407,21 @@ class SQLiteRetroRepository(RetroRepository):
 
     def _create_migration_backup(self, backup_path: Path) -> None:
         """Create a logical snapshot while the migration connection fences writers."""
-
-        if backup_path.exists():
-            raise FileExistsError(f"migration backup already exists: {backup_path}")
-        source: sqlite3.Connection | None = None
-        destination: sqlite3.Connection | None = None
-        backup_complete = False
-        backup_created = False
-        try:
-            source = sqlite3.connect(self.db_path)
-            destination = sqlite3.connect(backup_path)
-            backup_created = True
-            source.backup(destination)
-            result = destination.execute("PRAGMA quick_check").fetchone()
-            if result is None or str(result[0]).lower() != "ok":
-                raise RuntimeError("migration backup failed readback")
-            destination.commit()
-            backup_complete = True
-        finally:
-            if destination is not None:
-                destination.close()
-            if source is not None:
-                source.close()
-            if backup_created and not backup_complete:
-                for path in (
-                    backup_path,
-                    Path(f"{backup_path}-journal"),
-                    Path(f"{backup_path}-wal"),
-                    Path(f"{backup_path}-shm"),
-                ):
-                    path.unlink(missing_ok=True)
-        if not backup_path.exists():
-            raise RuntimeError("migration backup was not created")
+        create_migration_backup(self.db_path, backup_path, sqlite3)
 
     def _verify_database_readback(self, expected_version: int) -> None:
-        connection = sqlite3.connect(self.db_path)
-        try:
-            result = connection.execute("PRAGMA quick_check").fetchone()
-            if result is None or str(result[0]).lower() != "ok":
-                raise RuntimeError("migration rollback failed readback")
-            if self._schema_version(connection) != expected_version:
-                raise RuntimeError("migration rollback did not restore the schema version")
-        finally:
-            connection.close()
+        verify_database_readback(
+            self.db_path,
+            expected_version,
+            sqlite3,
+            self._schema_version,
+        )
 
     def _remove_database_sidecars(self) -> None:
-        for path in (
-            Path(f"{self.db_path}-journal"),
-            Path(f"{self.db_path}-wal"),
-            Path(f"{self.db_path}-shm"),
-        ):
-            path.unlink(missing_ok=True)
+        remove_database_sidecars(self.db_path)
 
     def _remove_failed_database(self) -> None:
-        self.db_path.unlink(missing_ok=True)
-        self._remove_database_sidecars()
+        remove_failed_database(self.db_path)
 
     def find_session(
         self, source_session_id: str, source_hash: str
@@ -2949,168 +2849,7 @@ class SQLiteRetroRepository(RetroRepository):
         knowledge_id: str,
         knowledge_rows: Sequence[sqlite3.Row] | None = None,
     ) -> tuple[tuple[bytes, ...], list[PurgeCopy]]:
-        rows = list(
-            knowledge_rows
-            if knowledge_rows is not None
-            else connection.execute(
-                "SELECT * FROM knowledge WHERE id = ? ORDER BY version",
-                (knowledge_id,),
-            ).fetchall()
-        )
-        if not rows:
-            return (), []
-
-        candidate_ids = tuple(sorted({str(row["candidate_id"]) for row in rows}))
-        candidate_placeholders = ",".join("?" for _ in candidate_ids)
-        candidates = connection.execute(
-            f"SELECT * FROM candidates WHERE id IN ({candidate_placeholders}) ORDER BY id",
-            candidate_ids,
-        ).fetchall()
-        evidence_ids = {
-            str(row["evidence_id"])
-            for row in connection.execute(
-                "SELECT evidence_id FROM knowledge_evidence WHERE knowledge_id = ?",
-                (knowledge_id,),
-            ).fetchall()
-        }
-        evidence_ids.update(
-            str(row["evidence_id"])
-            for row in connection.execute(
-                f"SELECT evidence_id FROM candidate_evidence "
-                f"WHERE candidate_id IN ({candidate_placeholders})",
-                candidate_ids,
-            ).fetchall()
-        )
-        ordered_evidence_ids = tuple(sorted(evidence_ids))
-        evidence = (
-            connection.execute(
-                f"SELECT * FROM evidence WHERE id IN "
-                f"({','.join('?' for _ in ordered_evidence_ids)}) ORDER BY id",
-                ordered_evidence_ids,
-            ).fetchall()
-            if ordered_evidence_ids
-            else []
-        )
-        reviews = connection.execute(
-            f"SELECT * FROM review_attempts "
-            f"WHERE candidate_id IN ({candidate_placeholders}) ORDER BY id",
-            candidate_ids,
-        ).fetchall()
-        conflicts = connection.execute(
-            f"SELECT * FROM conflicts WHERE active_knowledge_id = ? "
-            f"OR candidate_id IN ({candidate_placeholders}) ORDER BY id",
-            (knowledge_id, *candidate_ids),
-        ).fetchall()
-
-        marker_values = {
-            str(value).encode("utf-8")
-            for value in (
-                *(row["text"] for row in rows),
-                *(row["proposed_text"] for row in candidates),
-                *(row["excerpt"] for row in evidence),
-                *(
-                    row[field]
-                    for row in conflicts
-                    for field in ("reason", "merge_text")
-                ),
-            )
-            if str(value)
-        }
-        markers = tuple(sorted(marker_values, key=lambda item: (-len(item), item)))
-        copies: list[PurgeCopy] = []
-
-        def add(
-            kind: str, table: str, key: object, row: sqlite3.Row, *fields: str
-        ) -> None:
-            for field in fields:
-                value = row[field]
-                content = (
-                    bytes(value)
-                    if isinstance(value, bytes)
-                    else str(value).encode("utf-8")
-                )
-                if content:
-                    copies.append(PurgeCopy(kind, f"{table}:{key}:{field}", content))
-
-        for row in rows:
-            add(
-                "sqlite_knowledge",
-                "knowledge",
-                f"{knowledge_id}:{row['version']}",
-                row,
-                "text",
-            )
-        for row in candidates:
-            add(
-                "sqlite_candidate",
-                "candidates",
-                row["id"],
-                row,
-                "proposed_text",
-                "review_json",
-            )
-        for row in evidence:
-            add("sqlite_evidence", "evidence", row["id"], row, "excerpt")
-        for row in reviews:
-            add(
-                "sqlite_review",
-                "review_attempts",
-                row["id"],
-                row,
-                "result_json",
-                "error",
-            )
-        for row in conflicts:
-            add("sqlite_conflict", "conflicts", row["id"], row, "reason", "merge_text")
-
-        related_ids = {
-            knowledge_id,
-            *candidate_ids,
-            *ordered_evidence_ids,
-            *(str(row["id"]) for row in reviews),
-            *(str(row["id"]) for row in conflicts),
-        }
-        placeholders = ",".join("?" for _ in related_ids)
-        related_values = tuple(sorted(related_ids))
-        audits = connection.execute(
-            f"SELECT * FROM audit_log WHERE entity_id IN ({placeholders}) ORDER BY id",
-            related_values,
-        ).fetchall()
-        projections = connection.execute(
-            f"SELECT * FROM projection_events WHERE cause_entity_id IN ({placeholders}) ORDER BY id",
-            related_values,
-        ).fetchall()
-        for row in audits:
-            add("sqlite_audit", "audit_log", row["id"], row, "detail_json")
-        for row in projections:
-            for field in ("input_hash", "error"):
-                content = str(row[field]).encode("utf-8")
-                if content and any(marker in content for marker in markers):
-                    add("sqlite_projection", "projection_events", row["id"], row, field)
-
-        project_id = str(rows[-1]["project_id"])
-        for table, key_field, fields in (
-            ("sync_jobs", "id", ("plan_json", "error")),
-            ("managed_file_snapshots", "path", ("owned_bytes",)),
-        ):
-            project_rows = connection.execute(
-                f"SELECT * FROM {table} WHERE project_id = ? ORDER BY {key_field}",
-                (project_id,),
-            ).fetchall()
-            for row in project_rows:
-                for field in fields:
-                    value = row[field]
-                    content = (
-                        bytes(value)
-                        if isinstance(value, bytes)
-                        else str(value).encode("utf-8")
-                    )
-                    if content and any(marker in content for marker in markers):
-                        add("sqlite_projection", table, row[key_field], row, field)
-
-        copies.sort(key=lambda item: (item.location_kind, item.locator))
-        return markers, copies
-
+        return purge_entity_copies(connection, knowledge_id, knowledge_rows)
     def begin_purge(
         self,
         plan: PurgePlan,
@@ -3258,16 +2997,7 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if row is None:
                 return None
-            payload = json.loads(str(row["tombstone_json"]))
-            return PurgeTombstone(
-                knowledge_id=str(payload["knowledge_id"]),
-                actor=str(payload["actor"]),
-                started_at=_datetime(payload["started_at"]),
-                updated_at=_datetime(payload["updated_at"]),
-                status=PurgeStatus(payload["status"]),
-                operation_count=int(payload["operation_count"]),
-                residual_count=int(payload["residual_count"]),
-            )
+            return purge_tombstone_from_json(str(row["tombstone_json"]), _datetime)
         finally:
             connection.close()
 
@@ -3281,36 +3011,13 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if row is None:
                 return None
-            try:
-                metadata = json.loads(str(row["plan_hash"]))
-            except json.JSONDecodeError:
-                metadata = {}
             operation_rows = connection.execute(
                 """SELECT * FROM purge_operations WHERE purge_job_id = ?
                 ORDER BY location_kind, id""",
                 (row["id"],),
             ).fetchall()
-            fingerprints = _purge_marker_fingerprints(metadata)
-            return PurgeJournal(
-                id=str(row["id"]),
-                knowledge_id=str(row["knowledge_id"]),
-                project_id=str(metadata.get("project_id", "")),
-                marker_hash=str(metadata.get("marker_hash", "")),
-                marker_length=int(metadata.get("marker_length", 0)),
-                marker_fingerprints=fingerprints,
-                status=PurgeStatus(row["status"]),
-                tombstone_json=str(row["tombstone_json"]),
-                operations=tuple(
-                    PurgeJournalOperation(
-                        id=str(item["id"]),
-                        location_kind=str(item["location_kind"]),
-                        locator=str(item["location"]),
-                        expected_hash=str(item["expected_hash"]),
-                        status=str(item["status"]),
-                        recovery_json=str(item["error"]),
-                    )
-                    for item in operation_rows
-                ),
+            return purge_journal_from_rows(
+                row, operation_rows, _purge_marker_fingerprints
             )
         finally:
             connection.close()
@@ -3375,16 +3082,7 @@ class SQLiteRetroRepository(RetroRepository):
             ).fetchone()
             if row is None:
                 raise KeyError(f"purge operation not found: {operation_id}")
-            stored_error = ""
-            if status == "failed" and row["error"]:
-                try:
-                    payload = json.loads(str(row["error"]))
-                except json.JSONDecodeError:
-                    payload = {}
-                payload["last_error"] = error or "cleanup_failed"
-                stored_error = json.dumps(
-                    payload, separators=(",", ":"), sort_keys=True
-                )
+            stored_error = purge_operation_error(row["error"], status, error)
             cursor = connection.execute(
                 "UPDATE purge_operations SET status = ?, error = ? WHERE id = ?",
                 (status, stored_error, operation_id),
@@ -3448,35 +3146,13 @@ class SQLiteRetroRepository(RetroRepository):
                         recovery_json,
                     ),
                 )
-            residual_labels: list[dict[str, str]] = []
-            kind_ordinals: dict[str, int] = {}
-            for location_kind, status in connection.execute(
-                """SELECT location_kind, status FROM purge_operations
-                WHERE purge_job_id = ? ORDER BY location_kind, id""",
-                (plan_id,),
-            ):
-                if status == "completed":
-                    continue
-                ordinal = kind_ordinals.get(location_kind, 0) + 1
-                kind_ordinals[location_kind] = ordinal
-                residual_labels.append(
-                    {
-                        "location_kind": location_kind,
-                        "location": f"{location_kind}:residual:{ordinal}",
-                    }
-                )
-            for location_kind in safe_kinds:
-                if location_kind in kind_ordinals:
-                    continue
-                kind_ordinals[location_kind] = 1
-                residual_labels.append(
-                    {
-                        "location_kind": location_kind,
-                        "location": f"{location_kind}:residual:1",
-                    }
-                )
-            residual_labels.sort(
-                key=lambda item: (item["location_kind"], item["location"])
+            residual_labels = purge_residual_labels(
+                connection.execute(
+                    """SELECT location_kind, status FROM purge_operations
+                    WHERE purge_job_id = ? ORDER BY location_kind, id""",
+                    (plan_id,),
+                ).fetchall(),
+                safe_kinds,
             )
             cursor = connection.execute(
                 """UPDATE purge_jobs SET status = ?, tombstone_json = ?,
