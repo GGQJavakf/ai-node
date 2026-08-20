@@ -21,4 +21,4 @@
 ## 4. Deliver reviewable remote evidence
 
 - [x] 4.1 Commit and push the isolated branch, then create a Draft PR targeting `main` with verification and rollback details.
-- [ ] 4.2 Read back the remote PR head and every new CI job; keep the PR Draft until all jobs pass on the delivered commit.
+- [x] 4.2 Read back the remote PR head and every new CI job; keep the PR Draft until all jobs pass on the delivered commit.
