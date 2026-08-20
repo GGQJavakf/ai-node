@@ -1,0 +1,12 @@
+# AgentRetro modules owned by reduce-agentretro-complexity.
+src/agent_retro/presentation/cli.py
+src/agent_retro/presentation/_command_dispatch.py
+src/agent_retro/infrastructure/sqlite_repository.py
+src/agent_retro/infrastructure/_sqlite_migration.py
+src/agent_retro/infrastructure/_sqlite_purge.py
+src/agent_retro/application/sync.py
+src/agent_retro/application/_sync_operations.py
+src/agent_retro/application/merge.py
+src/agent_retro/application/_merge_operations.py
+src/agent_retro/application/purge.py
+src/agent_retro/application/_purge_operations.py
