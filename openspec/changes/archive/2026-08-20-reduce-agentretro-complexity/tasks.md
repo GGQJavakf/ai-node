@@ -32,4 +32,4 @@
 - [x] 6.1 Make every declared target and extracted module pass scoped C901 at 15, Ruff, focused mypy, compileall, import/architecture checks, and `git diff --check` without per-function suppression.
 - [x] 6.2 Run the full deterministic pytest suite, branch-coverage gate, package build/Twine/isolated-wheel smoke, Windows UTF-8/GBK smoke, and strict validation for this change and all OpenSpec artifacts.
 - [x] 6.3 Run OCR delegate preview/rule over the exact branch diff and a fresh high-risk review of SQLite concurrency, filesystem containment, rollback, CLI compatibility, and excluded-file accounting; resolve every material finding.
-- [ ] 6.4 Record exact commit/check evidence in the Draft PR, verify remote CI on the published head, and keep the change unmerged until its external state is read back.
+- [x] 6.4 Record exact commit/check evidence in the Draft PR, verify remote CI on the published head, and keep the change unmerged until its external state is read back.
