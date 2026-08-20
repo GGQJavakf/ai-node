@@ -17,47 +17,23 @@ from agent_retro.application.bootstrap import (
     build_projection_coordinator,
     build_retro_repository,
 )
-from agent_retro.application.obsidian_init import (
-    BoundaryInitError,
-    BoundaryInitStalePlan,
-)
 from agent_retro.application.brief import (
-    BriefBudgetError,
     BriefRequest,
     BriefService,
-    BriefTimeoutError,
 )
-from agent_retro.application.merge import (
-    ConfirmationRequiredError,
-    MergeIntegrityError,
-    MergeService,
-    StalePlanError,
-)
+from agent_retro.application.merge import MergeService
 from agent_retro.application.merge_planner import MergePlanner
 from agent_retro.application.purge import (
     IncompletePurgeConfirmation,
-    KnowledgeAlreadyPurged,
-    KnowledgeSyncPending,
-    PurgeAlreadyComplete,
-    PurgeBlockedError,
-    PurgeError,
-    PurgeKnowledgeNotFound,
-    PurgeRecoveryNotFound,
-    PurgeRecoveryNotIncomplete,
     StalePurgePlan,
-    UnknownPurgePlan,
 )
-from agent_retro.application.sync import ProjectionPersistenceError
 from agent_retro.application.capture import (
-    CapturePlanChangedError,
     CaptureResult,
     CaptureService,
-    RecentCaptureBoundsError,
     RecentCapturePlan,
     RecentCaptureResult,
 )
-from agent_retro.application.inbox import InboxLimitError
-from agent_retro.application.review import ReviewService, ReviewUnavailableError
+from agent_retro.application.review import ReviewService
 from agent_retro.domain.models import (
     CandidateStatus,
     KnowledgeType,
@@ -68,10 +44,7 @@ from agent_retro.infrastructure.codex_sessions import (
     CodexSessionSource,
     effective_codex_home,
 )
-from agent_retro.infrastructure.codex_guidance import (
-    CodexGuidance,
-    GuidanceError,
-)
+from agent_retro.infrastructure.codex_guidance import CodexGuidance
 from agent_retro.infrastructure.legacy_model import (
     build_retro_llm_client_from_config,
     load_legacy_model_config,
@@ -103,6 +76,12 @@ from agent_retro.presentation.output import (
     render_doctor_terminal,
     safe_text,
     write_json,
+)
+from agent_retro.presentation._command_dispatch import (
+    dispatch_command,
+    run_with_error_handling,
+    write_operation_outcome,
+    write_success,
 )
 from agent_retro.presentation.review_commands import run_review_command
 
@@ -275,292 +254,10 @@ def main(
 ) -> int:
     args = build_parser().parse_args(argv)
     if args.command is not None:
-        try:
-            return _run_command(args, home=home, env=env)
-        except BriefBudgetError as exc:
-            data = {
-                "max_tokens": exc.max_tokens,
-                "reason": exc.reason,
-                "required_tokens": exc.required_tokens,
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_BRIEF_BUDGET_EXCEEDED",
-                        "message": "Mandatory rules exceed the brief budget.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except BriefTimeoutError as exc:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_BRIEF_DEADLINE_EXCEEDED",
-                        "message": "Local brief rendering exceeded its deadline.",
-                        "data": {"reason": exc.reason},
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(str(exc)) + "\n")
-            return 2
-        except ProjectReferenceError as exc:
-            code = (
-                "RETRO_AMBIGUOUS_PROJECT_REFERENCE"
-                if exc.status == "ambiguous"
-                else "RETRO_UNKNOWN_PROJECT_REFERENCE"
-            )
-            data = {
-                "reason": exc.reason,
-                "mapping_ids": list(exc.mapping_ids),
-                "recovery_command": exc.recovery_command,
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": code,
-                        "message": "Project reference could not be resolved safely.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except RecentCaptureBoundsError as exc:
-            data = {
-                "reason": exc.reason,
-                "requested_count": exc.count,
-                "recent_capture_max": exc.maximum,
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_RECENT_CAPTURE_COUNT_OUT_OF_BOUNDS",
-                        "message": "Recent capture count is outside the safe bound.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except InboxLimitError as exc:
-            data = {
-                "reason": exc.reason,
-                "limit": exc.limit,
-                "minimum": 1,
-                "maximum": 50,
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_REVIEW_INBOX_LIMIT_OUT_OF_BOUNDS",
-                        "message": "Review inbox limit is outside the safe bound.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except CapturePlanChangedError as exc:
-            data = {
-                "reason": exc.reason,
-                "recovery_command": exc.recovery_command,
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_CAPTURE_PLAN_CHANGED",
-                        "message": "Recent capture plan changed before apply.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except GuidanceError as exc:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_CODEX_INTEGRATION_FAILED",
-                        "message": "Codex guidance integration failed safely.",
-                        "data": {"reason": getattr(exc, "reason", "guidance_error")},
-                    }
-                )
-            else:
-                sys.stderr.write(
-                    safe_text(getattr(exc, "reason", "guidance_error")) + "\n"
-                )
-            return 2
-        except BoundaryInitError as exc:
-            code = (
-                "RETRO_SYNC_INIT_STALE"
-                if isinstance(exc, BoundaryInitStalePlan)
-                else "RETRO_SYNC_INIT_FAILED"
-            )
-            data = {
-                "reason": exc.reason,
-                "recovery_command": exc.recovery_command,
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": code,
-                        "message": "Obsidian managed-boundary initialization failed safely.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except ReviewUnavailableError:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_REVIEW_RETRYABLE",
-                        "message": ("Model review is unavailable; retry is available."),
-                        "data": {"retryable": True},
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text("模型审核暂不可用；可安全重试。") + "\n")
-            return 2
-        except ProjectionPersistenceError as exc:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_SYNC_STATE_UNAVAILABLE",
-                        "message": "Projection state is unavailable; SQLite knowledge remains authoritative.",
-                        "data": {
-                            "reason": exc.reason,
-                            "recovery_command": exc.recovery_command,
-                        },
-                    }
-                )
-            else:
-                sys.stderr.write(
-                    safe_text(
-                        "SQLite 知识保持权威；"
-                        f"{exc.reason}；恢复命令: {exc.recovery_command}"
-                    )
-                    + "\n"
-                )
-            return 2
-        except PurgeError as exc:
-            code = _purge_error_code(exc)
-            recovery_command = getattr(
-                exc,
-                "recovery_command",
-                (
-                    "retro kb purge <id> --plan"
-                    if isinstance(
-                        exc,
-                        (
-                            IncompletePurgeConfirmation,
-                            KnowledgeAlreadyPurged,
-                            KnowledgeSyncPending,
-                            PurgeKnowledgeNotFound,
-                            StalePurgePlan,
-                            UnknownPurgePlan,
-                        ),
-                    )
-                    else "retro kb purge <id> --recover"
-                ),
-            )
-            data = {"recovery_command": recovery_command}
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": code,
-                        "message": "Sensitive purge command failed safely.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except ConfirmationRequiredError as exc:
-            data = {
-                "missing_operation_ids": list(exc.missing_operation_ids),
-                "recovery_command": "retro merge preview <plan-id>",
-            }
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_MERGE_CONFIRMATION_REQUIRED",
-                        "message": "Exact merge confirmation is required.",
-                        "data": data,
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(json_text(data)) + "\n")
-            return 2
-        except StalePlanError:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_MERGE_PLAN_STALE",
-                        "message": "Merge plan inputs changed; create a new plan.",
-                        "data": {},
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text("合并计划已过期，请重新生成。") + "\n")
-            return 2
-        except MergeIntegrityError:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_MERGE_PLAN_INVALID",
-                        "message": "Merge plan integrity validation failed.",
-                        "data": {},
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text("合并计划完整性校验失败。") + "\n")
-            return 2
-        except MergeProposalUnavailableError:
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_MERGE_MODEL_UNAVAILABLE",
-                        "message": "Semantic merge model is unavailable.",
-                        "data": {"retryable": True},
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text("语义合并模型暂不可用；可安全重试。") + "\n")
-            return 2
-        except (KeyError, OSError, RuntimeError, ValueError) as exc:
-            detail = Redactor().redact(str(exc))
-            if args.json_output:
-                write_json(
-                    {
-                        "status": "error",
-                        "code": "RETRO_COMMAND_FAILED",
-                        "message": "AgentRetro command failed.",
-                        "data": {"detail": detail},
-                    }
-                )
-            else:
-                sys.stderr.write(safe_text(detail) + "\n")
-            return 2
+        return run_with_error_handling(
+            json_output=args.json_output,
+            command=lambda: _run_command(args, home=home, env=env),
+        )
     if args.json_output:
         write_json(_READY_ENVELOPE)
     else:
@@ -577,113 +274,18 @@ def _run_command(
     values = os.environ if env is None else env
     settings = load_retro_settings(home=home, env=values)
     codex_home = effective_codex_home(home=home, env=values)
-
-    if args.command == "doctor":
-        report = build_doctor_service(
-            settings, codex_home, load_legacy_model_config
-        ).run()
-        doctor_data = doctor_json_data(report)
-        if args.json_output:
-            write_json(
-                {
-                    "status": "ok" if report.exit_code == 0 else "error",
-                    "code": (
-                        "RETRO_DOCTOR_READY"
-                        if report.exit_code == 0
-                        else "RETRO_DOCTOR_ISSUES"
-                    ),
-                    "message": "AgentRetro doctor checks completed.",
-                    "data": doctor_data,
-                }
-            )
-        else:
-            sys.stdout.write(safe_text(render_doctor_terminal(report)))
-        return report.exit_code
-
-    if args.command == "integrate":
-        guidance = CodexGuidance(codex_home, settings.backup_dir)
-        action = (
-            "remove"
-            if args.integrate_remove
-            else "apply"
-            if args.integrate_apply
-            else "preview"
-        )
-        preview = (
-            guidance.preview_remove() if action == "remove" else guidance.preview()
-        )
-        guidance_data = _guidance_preview_data(preview)
-        guidance_data["override_conflict"] = (
-            codex_home / "AGENTS.override.md"
-        ).exists() or (
-            codex_home / "AGENTS.override.md"
-        ).is_symlink()
-        if action != "preview":
-            guidance_result = (
-                guidance.remove(preview.id)
-                if action == "remove"
-                else guidance.apply(preview.id)
-            )
-            guidance_data.update(
-                {
-                    "changed": guidance_result.changed,
-                    "result_status": guidance_result.status,
-                    "target_hash": guidance_result.target_hash,
-                }
-            )
-            if action == "apply":
-                guidance_data["discoverable"] = guidance_result.discoverable
-        code = {
-            "preview": "RETRO_CODEX_INTEGRATION_PREVIEW",
-            "apply": "RETRO_CODEX_INTEGRATION_APPLIED",
-            "remove": "RETRO_CODEX_INTEGRATION_REMOVED",
-        }[action]
-        if args.json_output:
-            write_json(
-                {
-                    "status": "ok",
-                    "code": code,
-                    "message": "Codex guidance integration command completed.",
-                    "data": guidance_data,
-                }
-            )
-        else:
-            sys.stdout.write(safe_text(json_text(guidance_data)) + "\n")
-        return 0
+    early_handlers = {
+        "doctor": lambda: _run_doctor_command(args, settings, codex_home),
+        "integrate": lambda: _run_integrate_command(
+            args, settings, codex_home
+        ),
+    }
+    if args.command in early_handlers:
+        return dispatch_command(args.command, early_handlers)
 
     repository = build_retro_repository(settings)
     if args.command == "brief":
-        project_resolution = ProjectReferenceResolver(
-            repository.list_project_mappings()
-        ).resolve(args.project_id)
-        if project_resolution.status != "resolved":
-            raise ProjectReferenceError(project_resolution)
-        brief_result = BriefService(
-            repository,
-            timeout_seconds=settings.brief_timeout_seconds,
-            default_max_tokens=settings.brief_max_tokens,
-            recent_capture_max=settings.recent_capture_max,
-        ).build(
-            BriefRequest(
-                task=args.task,
-                project_id=project_resolution.project_id,
-                max_tokens=args.max_tokens,
-            )
-        )
-        if args.json_output:
-            write_json(
-                {
-                    "status": "ok",
-                    "code": "RETRO_BRIEF_READY",
-                    "message": "Task-scoped brief generated.",
-                    "data": brief_json_data(brief_result),
-                }
-            )
-        elif args.markdown:
-            sys.stdout.write(safe_text(render_brief_markdown(brief_result)))
-        else:
-            sys.stdout.write(safe_text(render_brief_terminal(brief_result)))
-        return 0
+        return _run_brief_command(args, settings, repository)
 
     coordinator = build_projection_coordinator(settings, repository)
     if args.command in {"kb", "knowledge"}:
@@ -695,206 +297,347 @@ def _run_command(
                 completed_projection=coordinator.after_commit,
             ),
         )
-    resolver = ProjectResolver(repository.list_project_mappings())
-    if args.command == "sync":
-        exit_code = 0
-        if args.sync_command == "init":
-            initializer = build_managed_boundary_initializer(settings, repository)
-            init_plan = initializer.preview(args.project_id)
-            sync_data = _boundary_init_plan_data(init_plan)
-            if args.init_plan_id:
-                init_result = initializer.apply(args.project_id, args.init_plan_id)
-                sync_data = _boundary_init_plan_data(init_result.plan)
-                sync_data.update(
-                    {
-                        "status": init_result.status.value,
-                        "changed": init_result.changed,
-                        "reason": init_result.reason,
-                        "recovery_command": init_result.recovery_command,
-                    }
-                )
-                code = (
-                    "RETRO_SYNC_INIT_APPLIED"
-                    if init_result.status is ProjectionStatus.SYNCED
-                    else "RETRO_SYNC_INIT_FAILED"
-                )
-                if init_result.status is not ProjectionStatus.SYNCED:
-                    exit_code = 2
-                message = "Obsidian managed-boundary initialization applied."
-            else:
-                code = "RETRO_SYNC_INIT_PREVIEW"
-                message = "Obsidian managed-boundary initialization previewed."
-        elif args.sync_command == "retry":
-            retry_result = coordinator.retry(args.event_id)
-            sync_data = {
-                "event_id": retry_result.event_id,
-                "projection_status": retry_result.status.value,
-                "warning": retry_result.warning,
-                "recovery_command": retry_result.recovery_command,
-                "reason": retry_result.reason,
-            }
-            if retry_result.status is ProjectionStatus.SYNCED:
-                code = "RETRO_SYNC_RETRIED"
-                message = "Obsidian projection retry completed."
-            else:
-                exit_code = 2
-                code = retry_result.warning or (
-                    "RETRO_ROLLBACK_REQUIRED"
-                    if retry_result.status is ProjectionStatus.ROLLBACK_REQUIRED
-                    else "RETRO_SYNC_PENDING"
-                )
-                if not sync_data["recovery_command"]:
-                    sync_data["recovery_command"] = (
-                        "retro doctor --repair-sync"
-                        if retry_result.status is ProjectionStatus.ROLLBACK_REQUIRED
-                        else f"retro sync retry {retry_result.event_id}"
-                    )
-                message = "Obsidian projection retry remains incomplete."
-        else:
-            merge_service = MergeService(
-                repository,
-                settings.obsidian_root,
-                settings.backup_dir,
-            )
-            if args.sync_command == "conflicts":
-                conflicts = merge_service.find_external_edits(args.project_id)
-                sync_data = {
-                    "conflicts": [
-                        {
-                            "id": item.id,
-                            "project_id": item.project_id,
-                            "path": item.path.as_posix(),
-                            "recorded_hash": item.recorded_hash,
-                            "vault_hash": item.vault_hash,
-                            "status": item.status,
-                        }
-                        for item in conflicts
-                    ]
-                }
-                code = "RETRO_SYNC_CONFLICTS"
-                message = "Obsidian external-edit conflicts inspected."
-            else:
-                reconciled = merge_service.reconcile(
-                    args.conflict_id, args.action, actor="user"
-                )
-                sync_data = {
-                    "conflict_id": reconciled.conflict_id,
-                    "status": reconciled.status,
-                    "candidate_id": reconciled.candidate_id,
-                    "plan_id": reconciled.plan_id,
-                }
-                code = "RETRO_SYNC_RECONCILED"
-                message = "Obsidian external edit reconciliation recorded."
-        if args.json_output:
-            write_json(
-                {
-                    "status": "ok" if exit_code == 0 else "error",
-                    "code": code,
-                    "message": message,
-                    "data": sync_data,
-                }
-            )
-        else:
-            sys.stdout.write(safe_text(json_text(sync_data)) + "\n")
-        return exit_code
-    if args.command == "merge":
-        exit_code = 0
-        merge_service = MergeService(
-            repository,
-            settings.obsidian_root,
-            settings.backup_dir,
-        )
-        if args.merge_command == "plan":
-            merge_plan = _build_merge_planner(settings, repository).plan(
-                args.project_id, args.instruction
-            )
-            merge_data = _merge_plan_data(merge_plan)
-            code = "RETRO_MERGE_PLANNED"
-            message = "Preview-only semantic merge plan created."
-        elif args.merge_command == "preview":
-            merge_plan = merge_service.preview(args.plan_id)
-            merge_data = _merge_plan_data(merge_plan)
-            code = "RETRO_MERGE_PREVIEW"
-            message = "Current complete merge plan preview."
-        else:
-            merge_result = merge_service.apply(
-                args.plan_id,
-                confirmed=args.merge_confirmed,
-                confirmed_operations=tuple(args.confirmed_operations),
-            )
-            merge_data = {
-                "plan_id": merge_result.plan_id,
-                "status": merge_result.status,
-                "reason": merge_result.reason,
-            }
-            if merge_result.status in {"synced", "already_applied"}:
-                code = "RETRO_MERGE_APPLIED"
-                message = "Confirmed merge apply completed."
-            else:
-                exit_code = 2
-                if merge_result.status == "rollback_required":
-                    code = "RETRO_ROLLBACK_REQUIRED"
-                    recovery_command = "retro doctor --repair-sync"
-                else:
-                    code = "RETRO_MERGE_SYNC_PENDING"
-                    recovery_command = f"retro merge preview {merge_result.plan_id}"
-                merge_data["recovery_command"] = recovery_command
-                message = "Confirmed merge apply remains incomplete."
-        if args.json_output:
-            write_json(
-                {
-                    "status": "ok" if exit_code == 0 else "error",
-                    "code": code,
-                    "message": message,
-                    "data": merge_data,
-                }
-            )
-        else:
-            sys.stdout.write(safe_text(json_text(merge_data)) + "\n")
-        return exit_code
-    if args.command == "capture":
-        source = CodexSessionSource(
-            effective_codex_home(home=home, env=values),
-            max_candidates=settings.discovery_max_files,
-            discovery_timeout_seconds=settings.discovery_timeout_seconds,
-            max_session_bytes=settings.session_max_bytes,
-        )
-        capture_service = CaptureService(source, repository, Redactor(), resolver)
-        if args.recent_count is not None:
-            if not args.capture_dry_run and not args.capture_plan_id:
-                raise ValueError("recent capture requires --dry-run or --apply <plan-id>")
-            if args.capture_dry_run:
-                capture_plan = capture_service.preview_recent(
-                    args.recent_count, settings.recent_capture_max
-                )
-                _write_recent_capture_plan(capture_plan, args.json_output)
-                return 0
-            capture_batch = capture_service.apply_recent(
-                args.recent_count,
-                settings.recent_capture_max,
-                args.capture_plan_id,
-            )
-            _write_recent_capture_result(capture_batch, args.json_output)
-            return 2 if capture_batch.failed else 0
-        if args.capture_dry_run or args.capture_plan_id:
-            raise ValueError("--dry-run and --apply require --recent <count>")
-        capture_result = (
-            capture_service.capture_last()
-            if args.capture_last
-            else capture_service.capture_session(args.session_id)
-        )
-        _write_capture_result(capture_result, args.json_output)
-        return 0
 
-    if args.command == "review":
-        return run_review_command(
+    resolver = ProjectResolver(repository.list_project_mappings())
+    handlers = {
+        "sync": lambda: _run_sync_command(
+            args, settings, repository, coordinator
+        ),
+        "merge": lambda: _run_merge_command(args, settings, repository),
+        "capture": lambda: _run_capture_command(
+            args, settings, repository, resolver, home, values
+        ),
+        "review": lambda: run_review_command(
             args,
             settings,
             repository,
             build_review_service=_build_review_service,
             projection_coordinator=coordinator,
-        )
+        ),
+        "project": lambda: _run_project_command(args, settings, repository),
+    }
+    return dispatch_command(args.command, handlers)
 
+
+def _run_doctor_command(args, settings, codex_home: Path) -> int:
+    report = build_doctor_service(
+        settings, codex_home, load_legacy_model_config
+    ).run()
+    if args.json_output:
+        write_json(
+            {
+                "status": "ok" if report.exit_code == 0 else "error",
+                "code": (
+                    "RETRO_DOCTOR_READY"
+                    if report.exit_code == 0
+                    else "RETRO_DOCTOR_ISSUES"
+                ),
+                "message": "AgentRetro doctor checks completed.",
+                "data": doctor_json_data(report),
+            }
+        )
+    else:
+        sys.stdout.write(safe_text(render_doctor_terminal(report)))
+    return report.exit_code
+
+
+def _run_integrate_command(args, settings, codex_home: Path) -> int:
+    guidance = CodexGuidance(codex_home, settings.backup_dir)
+    action = (
+        "remove"
+        if args.integrate_remove
+        else "apply"
+        if args.integrate_apply
+        else "preview"
+    )
+    preview = guidance.preview_remove() if action == "remove" else guidance.preview()
+    guidance_data = _guidance_preview_data(preview)
+    override = codex_home / "AGENTS.override.md"
+    guidance_data["override_conflict"] = override.exists() or override.is_symlink()
+    if action != "preview":
+        guidance_result = (
+            guidance.remove(preview.id)
+            if action == "remove"
+            else guidance.apply(preview.id)
+        )
+        guidance_data.update(
+            {
+                "changed": guidance_result.changed,
+                "result_status": guidance_result.status,
+                "target_hash": guidance_result.target_hash,
+            }
+        )
+        if action == "apply":
+            guidance_data["discoverable"] = guidance_result.discoverable
+    code = {
+        "preview": "RETRO_CODEX_INTEGRATION_PREVIEW",
+        "apply": "RETRO_CODEX_INTEGRATION_APPLIED",
+        "remove": "RETRO_CODEX_INTEGRATION_REMOVED",
+    }[action]
+    _write_success(
+        args,
+        code,
+        "Codex guidance integration command completed.",
+        guidance_data,
+    )
+    return 0
+
+
+def _run_brief_command(args, settings, repository) -> int:
+    project_resolution = ProjectReferenceResolver(
+        repository.list_project_mappings()
+    ).resolve(args.project_id)
+    if project_resolution.status != "resolved":
+        raise ProjectReferenceError(project_resolution)
+    brief_result = BriefService(
+        repository,
+        timeout_seconds=settings.brief_timeout_seconds,
+        default_max_tokens=settings.brief_max_tokens,
+        recent_capture_max=settings.recent_capture_max,
+    ).build(
+        BriefRequest(
+            task=args.task,
+            project_id=project_resolution.project_id,
+            max_tokens=args.max_tokens,
+        )
+    )
+    if args.json_output:
+        write_json(
+            {
+                "status": "ok",
+                "code": "RETRO_BRIEF_READY",
+                "message": "Task-scoped brief generated.",
+                "data": brief_json_data(brief_result),
+            }
+        )
+    elif args.markdown:
+        sys.stdout.write(safe_text(render_brief_markdown(brief_result)))
+    else:
+        sys.stdout.write(safe_text(render_brief_terminal(brief_result)))
+    return 0
+
+
+def _run_sync_command(args, settings, repository, coordinator) -> int:
+    if args.sync_command == "init":
+        outcome = _sync_init_outcome(args, settings, repository)
+    elif args.sync_command == "retry":
+        outcome = _sync_retry_outcome(args, coordinator)
+    else:
+        outcome = _sync_external_edit_outcome(args, settings, repository)
+    return _write_operation_outcome(args, outcome)
+
+
+def _sync_init_outcome(args, settings, repository):
+    initializer = build_managed_boundary_initializer(settings, repository)
+    init_plan = initializer.preview(args.project_id)
+    sync_data = _boundary_init_plan_data(init_plan)
+    if not args.init_plan_id:
+        return (
+            0,
+            "RETRO_SYNC_INIT_PREVIEW",
+            "Obsidian managed-boundary initialization previewed.",
+            sync_data,
+        )
+    init_result = initializer.apply(args.project_id, args.init_plan_id)
+    sync_data = _boundary_init_plan_data(init_result.plan)
+    sync_data.update(
+        {
+            "status": init_result.status.value,
+            "changed": init_result.changed,
+            "reason": init_result.reason,
+            "recovery_command": init_result.recovery_command,
+        }
+    )
+    synced = init_result.status is ProjectionStatus.SYNCED
+    return (
+        0 if synced else 2,
+        "RETRO_SYNC_INIT_APPLIED" if synced else "RETRO_SYNC_INIT_FAILED",
+        "Obsidian managed-boundary initialization applied.",
+        sync_data,
+    )
+
+
+def _sync_retry_outcome(args, coordinator):
+    retry_result = coordinator.retry(args.event_id)
+    sync_data = {
+        "event_id": retry_result.event_id,
+        "projection_status": retry_result.status.value,
+        "warning": retry_result.warning,
+        "recovery_command": retry_result.recovery_command,
+        "reason": retry_result.reason,
+    }
+    if retry_result.status is ProjectionStatus.SYNCED:
+        return (
+            0,
+            "RETRO_SYNC_RETRIED",
+            "Obsidian projection retry completed.",
+            sync_data,
+        )
+    code = retry_result.warning or (
+        "RETRO_ROLLBACK_REQUIRED"
+        if retry_result.status is ProjectionStatus.ROLLBACK_REQUIRED
+        else "RETRO_SYNC_PENDING"
+    )
+    if not sync_data["recovery_command"]:
+        sync_data["recovery_command"] = (
+            "retro doctor --repair-sync"
+            if retry_result.status is ProjectionStatus.ROLLBACK_REQUIRED
+            else f"retro sync retry {retry_result.event_id}"
+        )
+    return (
+        2,
+        code,
+        "Obsidian projection retry remains incomplete.",
+        sync_data,
+    )
+
+
+def _sync_external_edit_outcome(args, settings, repository):
+    merge_service = MergeService(
+        repository,
+        settings.obsidian_root,
+        settings.backup_dir,
+    )
+    if args.sync_command == "conflicts":
+        conflicts = merge_service.find_external_edits(args.project_id)
+        return (
+            0,
+            "RETRO_SYNC_CONFLICTS",
+            "Obsidian external-edit conflicts inspected.",
+            {
+                "conflicts": [
+                    {
+                        "id": item.id,
+                        "project_id": item.project_id,
+                        "path": item.path.as_posix(),
+                        "recorded_hash": item.recorded_hash,
+                        "vault_hash": item.vault_hash,
+                        "status": item.status,
+                    }
+                    for item in conflicts
+                ]
+            },
+        )
+    reconciled = merge_service.reconcile(
+        args.conflict_id, args.action, actor="user"
+    )
+    return (
+        0,
+        "RETRO_SYNC_RECONCILED",
+        "Obsidian external edit reconciliation recorded.",
+        {
+            "conflict_id": reconciled.conflict_id,
+            "status": reconciled.status,
+            "candidate_id": reconciled.candidate_id,
+            "plan_id": reconciled.plan_id,
+        },
+    )
+
+
+def _run_merge_command(args, settings, repository) -> int:
+    merge_service = MergeService(
+        repository,
+        settings.obsidian_root,
+        settings.backup_dir,
+    )
+    if args.merge_command == "plan":
+        merge_plan = _build_merge_planner(settings, repository).plan(
+            args.project_id, args.instruction
+        )
+        outcome = (
+            0,
+            "RETRO_MERGE_PLANNED",
+            "Preview-only semantic merge plan created.",
+            _merge_plan_data(merge_plan),
+        )
+    elif args.merge_command == "preview":
+        merge_plan = merge_service.preview(args.plan_id)
+        outcome = (
+            0,
+            "RETRO_MERGE_PREVIEW",
+            "Current complete merge plan preview.",
+            _merge_plan_data(merge_plan),
+        )
+    else:
+        outcome = _merge_apply_outcome(args, merge_service)
+    return _write_operation_outcome(args, outcome)
+
+
+def _merge_apply_outcome(args, merge_service):
+    merge_result = merge_service.apply(
+        args.plan_id,
+        confirmed=args.merge_confirmed,
+        confirmed_operations=tuple(args.confirmed_operations),
+    )
+    merge_data = {
+        "plan_id": merge_result.plan_id,
+        "status": merge_result.status,
+        "reason": merge_result.reason,
+    }
+    if merge_result.status in {"synced", "already_applied"}:
+        return (
+            0,
+            "RETRO_MERGE_APPLIED",
+            "Confirmed merge apply completed.",
+            merge_data,
+        )
+    if merge_result.status == "rollback_required":
+        code = "RETRO_ROLLBACK_REQUIRED"
+        recovery_command = "retro doctor --repair-sync"
+    else:
+        code = "RETRO_MERGE_SYNC_PENDING"
+        recovery_command = f"retro merge preview {merge_result.plan_id}"
+    merge_data["recovery_command"] = recovery_command
+    return (
+        2,
+        code,
+        "Confirmed merge apply remains incomplete.",
+        merge_data,
+    )
+
+
+def _run_capture_command(
+    args, settings, repository, resolver, home: Path | None, values
+) -> int:
+    source = CodexSessionSource(
+        effective_codex_home(home=home, env=values),
+        max_candidates=settings.discovery_max_files,
+        discovery_timeout_seconds=settings.discovery_timeout_seconds,
+        max_session_bytes=settings.session_max_bytes,
+    )
+    capture_service = CaptureService(source, repository, Redactor(), resolver)
+    if args.recent_count is not None:
+        return _run_recent_capture(args, settings, capture_service)
+    if args.capture_dry_run or args.capture_plan_id:
+        raise ValueError("--dry-run and --apply require --recent <count>")
+    capture_result = (
+        capture_service.capture_last()
+        if args.capture_last
+        else capture_service.capture_session(args.session_id)
+    )
+    _write_capture_result(capture_result, args.json_output)
+    return 0
+
+
+def _run_recent_capture(args, settings, capture_service) -> int:
+    if not args.capture_dry_run and not args.capture_plan_id:
+        raise ValueError("recent capture requires --dry-run or --apply <plan-id>")
+    if args.capture_dry_run:
+        capture_plan = capture_service.preview_recent(
+            args.recent_count, settings.recent_capture_max
+        )
+        _write_recent_capture_plan(capture_plan, args.json_output)
+        return 0
+    capture_batch = capture_service.apply_recent(
+        args.recent_count,
+        settings.recent_capture_max,
+        args.capture_plan_id,
+    )
+    _write_recent_capture_result(capture_batch, args.json_output)
+    return 2 if capture_batch.failed else 0
+
+
+def _run_project_command(args, settings, repository) -> int:
     review_stored_evidence = _review_unavailable
     if args.project_command == "reclassify":
         review_stored_evidence = _build_review_service(
@@ -905,43 +648,50 @@ def _run_command(
         vault_root=settings.obsidian_root,
         review_stored_evidence=review_stored_evidence,
     )
-    if args.project_command == "map":
-        mapping = project_service.map(args.root, args.vault_project)
-        project_data: dict[str, object] | list[dict[str, object]] = _mapping_data(
-            mapping
-        )
-    elif args.project_command == "map-workspace":
-        mapping = project_service.map_workspace(args.root, args.vault_project)
-        project_data = _mapping_data(mapping)
-    elif args.project_command == "list":
-        project_data = [_mapping_data(mapping) for mapping in project_service.list()]
-    elif args.project_command == "remove":
-        project_service.remove(args.mapping_id)
-        project_data = {"mapping_id": args.mapping_id, "active": False}
-    elif args.project_command == "reclassify":
-        project_service.reclassify(args.session_id, args.mapping_id)
-        project_data = {
-            "session_id": args.session_id,
-            "mapping_id": args.mapping_id,
-        }
-    else:
-        raise ValueError(f"unsupported project command: {args.project_command}")
-    if args.json_output:
-        write_json(
-            {
-                "status": "ok",
-                "code": "RETRO_PROJECT_UPDATED",
-                "message": (
-                    "Project session reclassified."
-                    if args.project_command == "reclassify"
-                    else "Project mapping command completed."
-                ),
-                "data": project_data,
-            }
-        )
-    else:
-        sys.stdout.write(safe_text(json_text(project_data)) + "\n")
+    project_data = _project_command_data(args, project_service)
+    _write_success(
+        args,
+        "RETRO_PROJECT_UPDATED",
+        (
+            "Project session reclassified."
+            if args.project_command == "reclassify"
+            else "Project mapping command completed."
+        ),
+        project_data,
+    )
     return 0
+
+
+def _project_command_data(args, project_service):
+    if args.project_command == "map":
+        return _mapping_data(
+            project_service.map(args.root, args.vault_project)
+        )
+    if args.project_command == "map-workspace":
+        return _mapping_data(
+            project_service.map_workspace(args.root, args.vault_project)
+        )
+    if args.project_command == "list":
+        return [_mapping_data(mapping) for mapping in project_service.list()]
+    if args.project_command == "remove":
+        project_service.remove(args.mapping_id)
+        return {"mapping_id": args.mapping_id, "active": False}
+    if args.project_command == "reclassify":
+        project_service.reclassify(args.session_id, args.mapping_id)
+        return {"session_id": args.session_id, "mapping_id": args.mapping_id}
+    raise ValueError(f"unsupported project command: {args.project_command}")
+
+
+def _write_success(args, code: str, message: str, data) -> None:
+    write_success(
+        json_output=args.json_output, code=code, message=message, data=data
+    )
+
+
+def _write_operation_outcome(args, outcome) -> int:
+    return write_operation_outcome(
+        json_output=args.json_output, outcome=outcome
+    )
 
 
 def _run_purge_command(args: argparse.Namespace, service) -> int:
@@ -1011,28 +761,6 @@ def _run_purge_command(args: argparse.Namespace, service) -> int:
         output = sys.stdout if exit_code == 0 else sys.stderr
         output.write(safe_text(json_text(data)) + "\n")
     return exit_code
-
-
-def _purge_error_code(exc: PurgeError) -> str:
-    if isinstance(exc, IncompletePurgeConfirmation):
-        return "RETRO_PURGE_CONFIRMATION_REQUIRED"
-    if isinstance(exc, (StalePurgePlan, UnknownPurgePlan)):
-        return "RETRO_PURGE_PLAN_STALE"
-    if isinstance(exc, PurgeBlockedError):
-        return "RETRO_PURGE_BLOCKED"
-    if isinstance(exc, PurgeRecoveryNotFound):
-        return "RETRO_PURGE_RECOVERY_NOT_FOUND"
-    if isinstance(exc, PurgeAlreadyComplete):
-        return "RETRO_PURGE_ALREADY_COMPLETE"
-    if isinstance(exc, PurgeRecoveryNotIncomplete):
-        return "RETRO_PURGE_RECOVERY_NOT_INCOMPLETE"
-    if isinstance(exc, PurgeKnowledgeNotFound):
-        return "RETRO_PURGE_KNOWLEDGE_NOT_FOUND"
-    if isinstance(exc, KnowledgeAlreadyPurged):
-        return "RETRO_PURGE_ALREADY_COMPLETE"
-    if isinstance(exc, KnowledgeSyncPending):
-        return "RETRO_PURGE_SYNC_PENDING"
-    return "RETRO_PURGE_FAILED"
 
 
 def _write_capture_result(result: CaptureResult, json_output: bool) -> None:

@@ -44,6 +44,9 @@ jobs:
       - name: Check repository lint
         run: python -m ruff check .
 
+      - name: Check AgentRetro complexity boundaries
+        run: python scripts/check_agentretro_complexity.py
+
       - name: Compile source modules
         run: python -m compileall -q src
 
