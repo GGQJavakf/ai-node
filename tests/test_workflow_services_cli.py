@@ -158,6 +158,53 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
         self.assertEqual(items[0].status, WorkItemStatus.DONE.value)
         self.assertIn("MR !14 merged", self.repository.list_evidence(items[0].id)[0].summary)
 
+    def test_codex_report_formatting_remains_exact(self):
+        report = SimpleNamespace(
+            generated_at="2026-08-21T08:30:00+08:00",
+            total_unfinished=2,
+            summary_path="summary.md",
+            summary="daily summary",
+            unfinished=[
+                {
+                    "thread_id": "thread-open",
+                    "title": "Open task",
+                    "status": "needs_action",
+                    "next_action": "Continue",
+                }
+            ],
+            blocked=[{"name": "Blocked task", "state": "blocked", "cwd": "repo"}],
+            completed=[
+                {
+                    "thread_id": "thread-done",
+                    "title": "Done",
+                    "completion_signals": ["one", "two", "three", "ignored"],
+                }
+            ],
+        )
+
+        response = self.cli._format_codex_report(report, [object()])
+
+        self.assertEqual(
+            response,
+            "Codex 未完成任务日报\n"
+            + "─" * 80
+            + "\n"
+            + "  生成时间: 2026-08-21T08:30:00+08:00\n"
+            + "  未完成/阻塞: 2 项\n"
+            + "  最近完成: 1 项\n"
+            + "  已同步工作项: 1 项\n"
+            + "  每日总结: summary.md\n"
+            + "  摘要: daily summary\n"
+            + "\n优先跟进:\n"
+            + "  1. [needs_action] Open task | thread-open\n"
+            + "     下一步: Continue\n"
+            + "  2. [blocked] Blocked task | repo\n"
+            + "\n最近完成:\n"
+            + "  1. Done | thread-done\n"
+            + "     完成证据: one；two；three\n"
+            + "─" * 80,
+        )
+
     def test_resume_shortcut_lists_candidate_without_writing(self):
         with open(os.path.join(self.report_dir, "2026-06-23.json"), "w", encoding="utf-8") as handle:
             json.dump(
