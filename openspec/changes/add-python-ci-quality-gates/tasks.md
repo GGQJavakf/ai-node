@@ -2,7 +2,7 @@
 
 - [x] 1.1 Add exact, CI-only Python tool versions without changing runtime dependencies.
 - [x] 1.2 Remove the four unused `examples/demo.py` assignments and prove example behavior remains unchanged.
-- [x] 1.3 Correct the four hosted-matrix portability failures without skipping platforms or weakening their intended invariants.
+- [x] 1.3 Correct the five hosted-matrix portability and determinism failures without skipping platforms or weakening their intended invariants.
 
 ## 2. Implement repository CI gates
 
