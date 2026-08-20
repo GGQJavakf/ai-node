@@ -1,6 +1,12 @@
-# AgentRetro modules owned by reduce-agentretro-complexity.
+# AgentRetro modules owned by the complexity-boundary changes.
+src/agent_retro/application/brief.py
+src/agent_retro/application/merge_planner.py
 src/agent_retro/presentation/cli.py
 src/agent_retro/presentation/_command_dispatch.py
+src/agent_retro/presentation/review_commands.py
+src/agent_retro/infrastructure/codex_guidance.py
+src/agent_retro/infrastructure/codex_sessions.py
+src/agent_retro/infrastructure/redaction.py
 src/agent_retro/infrastructure/sqlite_repository.py
 src/agent_retro/infrastructure/_sqlite_migration.py
 src/agent_retro/infrastructure/_sqlite_purge.py

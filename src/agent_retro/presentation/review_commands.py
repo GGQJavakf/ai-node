@@ -13,7 +13,7 @@ from agent_retro.application.merge import MergeService
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
 from agent_retro.application.sync import ProjectionCoordinator, ProjectionResult
-from agent_retro.domain.models import CandidateStatus, KnowledgeType
+from agent_retro.domain.models import Candidate, CandidateStatus, KnowledgeType
 from agent_retro.infrastructure.settings import RetroSettings
 from agent_retro.infrastructure.project_mapping import (
     ProjectReferenceError,
@@ -35,84 +35,116 @@ def run_review_command(
 ) -> int:
     command = args.review_command
     if command == "inbox":
-        inbox_service = ReviewInboxService(repository)
-        if args.inbox_awaiting:
-            data = _awaiting_inbox_data(inbox_service.awaiting(args.inbox_limit))
-            code = "RETRO_REVIEW_INBOX_AWAITING"
-            message = "Awaiting project-routing work listed."
-        elif args.inbox_project:
-            resolution = ProjectReferenceResolver(
-                repository.list_project_mappings()
-            ).resolve(args.inbox_project)
-            if resolution.status != "resolved":
-                raise ProjectReferenceError(resolution)
-            data = _project_inbox_data(
-                inbox_service.project(resolution.project_id, args.inbox_limit)
-            )
-            code = "RETRO_REVIEW_INBOX_PROJECT"
-            message = "Project review work listed."
-        else:
-            data = _cross_project_inbox_data(inbox_service.cross_project())
-            code = "RETRO_REVIEW_INBOX"
-            message = "Cross-project review work listed."
-        _write_result(
-            args.json_output,
-            code=code,
-            message=message,
-            human=json.dumps(data, ensure_ascii=False, sort_keys=True),
-            data=data,
-        )
-        return 0
+        return _run_inbox_command(args, repository)
     if command == "list":
-        if args.candidate_status:
-            candidates = repository.list_candidates(
-                CandidateStatus(args.candidate_status)
-            )
-        else:
-            candidates = [
-                candidate
-                for status in CandidateStatus
-                for candidate in repository.list_candidates(status)
-            ]
-            candidates.sort(key=lambda item: item.id)
-        _write_result(
-            args.json_output,
-            code="RETRO_REVIEW_LISTED",
-            message="Review candidates listed.",
-            human=f"知识候选: {len(candidates)} 条",
-            data={"candidates": [_candidate_data(item) for item in candidates]},
-        )
-        return 0
+        return _run_list_command(args, repository)
     if command == "show":
-        candidate = repository.get_candidate(args.candidate_id)
-        if candidate is None:
-            raise KeyError(f"candidate not found: {args.candidate_id}")
-        data = {
-            "candidate": _candidate_data(candidate),
-            "evidence": [
-                _evidence_data(item)
-                for item in repository.evidence_for_candidate(candidate.id)
-            ],
-            "review": _review_data(repository.get_review_result(candidate.id)),
-            "attempts": [
-                _review_attempt_data(item)
-                for item in repository.review_attempts_for_candidate(candidate.id)
-            ],
-        }
-        _write_result(
-            args.json_output,
-            code="RETRO_REVIEW_SHOWN",
-            message="Review candidate shown.",
-            human=json.dumps(data, ensure_ascii=False, sort_keys=True),
-            data=data,
-        )
-        return 0
+        return _run_show_command(args, repository)
     adoption_service = (
         None
         if settings.obsidian_root is None
         else MergeService(repository, settings.obsidian_root, settings.backup_dir)
     )
     lifecycle = KnowledgeService(repository, adoption_service=adoption_service)
+    if command in {"accept", "edit", "reject", "merge", "promote", "archive"}:
+        return _run_lifecycle_command(
+            args, lifecycle, projection_coordinator=projection_coordinator
+        )
+    if command in {"run", "retry"}:
+        return _run_model_review_command(
+            args,
+            settings,
+            repository,
+            build_review_service=build_review_service,
+            projection_coordinator=projection_coordinator,
+        )
+    raise ValueError(f"unsupported review command: {command}")
+
+
+def _run_inbox_command(args: argparse.Namespace, repository: RetroRepository) -> int:
+    inbox_service = ReviewInboxService(repository)
+    if args.inbox_awaiting:
+        data = _awaiting_inbox_data(inbox_service.awaiting(args.inbox_limit))
+        code = "RETRO_REVIEW_INBOX_AWAITING"
+        message = "Awaiting project-routing work listed."
+    elif args.inbox_project:
+        resolution = ProjectReferenceResolver(
+            repository.list_project_mappings()
+        ).resolve(args.inbox_project)
+        if resolution.status != "resolved":
+            raise ProjectReferenceError(resolution)
+        data = _project_inbox_data(
+            inbox_service.project(resolution.project_id, args.inbox_limit)
+        )
+        code = "RETRO_REVIEW_INBOX_PROJECT"
+        message = "Project review work listed."
+    else:
+        data = _cross_project_inbox_data(inbox_service.cross_project())
+        code = "RETRO_REVIEW_INBOX"
+        message = "Cross-project review work listed."
+    _write_result(
+        args.json_output,
+        code=code,
+        message=message,
+        human=json.dumps(data, ensure_ascii=False, sort_keys=True),
+        data=data,
+    )
+    return 0
+
+
+def _run_list_command(args: argparse.Namespace, repository: RetroRepository) -> int:
+    if args.candidate_status:
+        candidates = repository.list_candidates(CandidateStatus(args.candidate_status))
+    else:
+        candidates = [
+            candidate
+            for status in CandidateStatus
+            for candidate in repository.list_candidates(status)
+        ]
+        candidates.sort(key=lambda item: item.id)
+    _write_result(
+        args.json_output,
+        code="RETRO_REVIEW_LISTED",
+        message="Review candidates listed.",
+        human=f"知识候选: {len(candidates)} 条",
+        data={"candidates": [_candidate_data(item) for item in candidates]},
+    )
+    return 0
+
+
+def _run_show_command(args: argparse.Namespace, repository: RetroRepository) -> int:
+    candidate = repository.get_candidate(args.candidate_id)
+    if candidate is None:
+        raise KeyError(f"candidate not found: {args.candidate_id}")
+    data = {
+        "candidate": _candidate_data(candidate),
+        "evidence": [
+            _evidence_data(item)
+            for item in repository.evidence_for_candidate(candidate.id)
+        ],
+        "review": _review_data(repository.get_review_result(candidate.id)),
+        "attempts": [
+            _review_attempt_data(item)
+            for item in repository.review_attempts_for_candidate(candidate.id)
+        ],
+    }
+    _write_result(
+        args.json_output,
+        code="RETRO_REVIEW_SHOWN",
+        message="Review candidate shown.",
+        human=json.dumps(data, ensure_ascii=False, sort_keys=True),
+        data=data,
+    )
+    return 0
+
+
+def _run_lifecycle_command(
+    args: argparse.Namespace,
+    lifecycle: KnowledgeService,
+    *,
+    projection_coordinator: ProjectionCoordinator | None,
+) -> int:
+    command = args.review_command
     if command == "accept":
         knowledge = lifecycle.accept(args.candidate_id, actor="user")
         projection = _project(
@@ -207,61 +239,74 @@ def run_review_command(
             data={**_knowledge_data(knowledge), "projection": projection},
         )
         return 0
-    if command in {"run", "retry"}:
-        service = build_review_service(settings, repository)
-        if command == "run":
-            results = service.review_session(args.session_id)
-            message = "Session review completed."
-            code = "RETRO_REVIEW_COMPLETED"
-            human = f"会话审核完成: {args.session_id}"
-        elif args.retry_candidate_id:
-            results = [service.retry_candidate(args.retry_candidate_id)]
-            message = "Review retry completed."
-            code = "RETRO_REVIEW_RETRIED"
-            human = f"候选重试完成: {args.retry_candidate_id}"
-        else:
-            results = service.retry_session(args.retry_session_id)
-            message = "Review retry completed."
-            code = "RETRO_REVIEW_RETRIED"
-            human = f"会话重试完成: {args.retry_session_id}"
-        if any(result is None for result in results):
-            raise ReviewUnavailableError(
-                "model review failed; retry is available for stored candidates"
-            )
-        if command == "run":
-            candidates = repository.candidates_for_session(args.session_id)
-            cause_entity = args.session_id
-        elif args.retry_candidate_id:
-            candidate = repository.get_candidate(args.retry_candidate_id)
-            candidates = [] if candidate is None else [candidate]
-            cause_entity = args.retry_candidate_id
-        else:
-            candidates = repository.candidates_for_session(args.retry_session_id)
-            cause_entity = args.retry_session_id
-        active_projects: set[str] = set()
-        for reviewed_candidate in candidates:
-            accepted_knowledge = repository.knowledge_for_candidate(
-                reviewed_candidate.id
-            )
-            if accepted_knowledge is not None and accepted_knowledge.status == "active":
-                active_projects.add(accepted_knowledge.project_id)
-        projects = sorted(active_projects)
-        projections = [
-            _project(projection_coordinator, "auto_accept", cause_entity, project)
-            for project in projects
-        ]
-        _write_result(
-            args.json_output,
-            code=code,
-            message=message,
-            human=human,
-            data={
-                "results": [_review_data(item) for item in results],
-                "projections": projections,
-            },
-        )
-        return 0
     raise ValueError(f"unsupported review command: {command}")
+
+
+def _run_model_review_command(
+    args: argparse.Namespace,
+    settings: RetroSettings,
+    repository: RetroRepository,
+    *,
+    build_review_service: ReviewServiceBuilder,
+    projection_coordinator: ProjectionCoordinator | None,
+) -> int:
+    command = args.review_command
+    service = build_review_service(settings, repository)
+    if command == "run":
+        results = service.review_session(args.session_id)
+        message = "Session review completed."
+        code = "RETRO_REVIEW_COMPLETED"
+        human = f"会话审核完成: {args.session_id}"
+    elif args.retry_candidate_id:
+        results = [service.retry_candidate(args.retry_candidate_id)]
+        message = "Review retry completed."
+        code = "RETRO_REVIEW_RETRIED"
+        human = f"候选重试完成: {args.retry_candidate_id}"
+    else:
+        results = service.retry_session(args.retry_session_id)
+        message = "Review retry completed."
+        code = "RETRO_REVIEW_RETRIED"
+        human = f"会话重试完成: {args.retry_session_id}"
+    if any(result is None for result in results):
+        raise ReviewUnavailableError(
+            "model review failed; retry is available for stored candidates"
+        )
+    candidates, cause_entity = _reviewed_candidates(args, repository)
+    active_projects = {
+        knowledge.project_id
+        for candidate in candidates
+        if (knowledge := repository.knowledge_for_candidate(candidate.id)) is not None
+        and knowledge.status == "active"
+    }
+    projections = [
+        _project(projection_coordinator, "auto_accept", cause_entity, project)
+        for project in sorted(active_projects)
+    ]
+    _write_result(
+        args.json_output,
+        code=code,
+        message=message,
+        human=human,
+        data={
+            "results": [_review_data(item) for item in results],
+            "projections": projections,
+        },
+    )
+    return 0
+
+
+def _reviewed_candidates(
+    args: argparse.Namespace, repository: RetroRepository
+) -> tuple[list[Candidate], str]:
+    if args.review_command == "run":
+        return repository.candidates_for_session(args.session_id), args.session_id
+    if args.retry_candidate_id:
+        candidate = repository.get_candidate(args.retry_candidate_id)
+        return ([] if candidate is None else [candidate]), args.retry_candidate_id
+    return (
+        repository.candidates_for_session(args.retry_session_id),
+        args.retry_session_id,
+    )
 
 
 def _write_result(

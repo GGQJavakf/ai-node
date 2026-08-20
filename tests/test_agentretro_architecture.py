@@ -22,6 +22,14 @@ EXPECTED_INTERNAL_MODULES = {
     "agent_retro.infrastructure._sqlite_purge",
     "agent_retro.presentation._command_dispatch",
 }
+EXPECTED_COMPLETE_BOUNDARY_MODULES = {
+    "agent_retro.application.brief",
+    "agent_retro.application.merge_planner",
+    "agent_retro.infrastructure.codex_guidance",
+    "agent_retro.infrastructure.codex_sessions",
+    "agent_retro.infrastructure.redaction",
+    "agent_retro.presentation.review_commands",
+}
 
 
 def test_agentretro_public_refactor_entry_points_stay_compatible() -> None:
@@ -76,6 +84,7 @@ def test_complexity_manifest_covers_every_refactor_internal_module() -> None:
         for value in values
     }
     assert EXPECTED_INTERNAL_MODULES <= modules
+    assert EXPECTED_COMPLETE_BOUNDARY_MODULES <= modules
     for module in sorted(EXPECTED_INTERNAL_MODULES):
         assert importlib.import_module(module) is not None
 

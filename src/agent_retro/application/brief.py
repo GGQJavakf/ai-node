@@ -92,6 +92,17 @@ class BriefResult:
         return len(self.omitted)
 
 
+@dataclass(frozen=True)
+class _BriefContext:
+    task: str
+    project_id: str
+    generated_at: datetime
+    max_tokens: int
+    stale_ids: tuple[str, ...]
+    conflict_ids: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
 def tokenize(value: str) -> frozenset[str]:
     """Normalize Latin words and individual CJK characters deterministically."""
 
@@ -332,6 +343,34 @@ class BriefService:
         self.recent_capture_max = recent_capture_max
 
     def build(self, request: BriefRequest) -> BriefResult:
+        task, project_id, max_tokens = self._validate_request(request)
+        require_no_active_purge(self.repository, project_id=project_id)
+
+        deadline = self.monotonic() + self.timeout_seconds
+        at = self.now()
+        categories, omitted, stale_ids = self._collect_knowledge(
+            task, project_id, at, deadline
+        )
+        conflicts = self.repository.list_open_conflicts(project_id)
+        conflict_ids = tuple(sorted(item.id for item in conflicts))
+        omitted.extend(BriefOmission(item_id, "conflict") for item_id in conflict_ids)
+        context = _BriefContext(
+            task=task,
+            project_id=project_id,
+            generated_at=at,
+            max_tokens=max_tokens,
+            stale_ids=tuple(sorted(stale_ids)),
+            conflict_ids=conflict_ids,
+            warnings=self._warnings(project_id),
+        )
+        by_category = self._build_items(categories, deadline)
+        result = self._select_items(by_category, omitted, context, deadline)
+        if not result.items:
+            result = self._add_empty_health(result, context)
+        self._check_deadline(deadline)
+        return result
+
+    def _validate_request(self, request: BriefRequest) -> tuple[str, str, int]:
         task = request.task.strip()
         project_id = request.project_id.strip()
         max_tokens = (
@@ -345,14 +384,13 @@ class BriefService:
             raise ValueError("project_id must not be empty")
         if max_tokens <= 0:
             raise ValueError("max_tokens must be greater than zero")
+        return task, project_id, max_tokens
 
-        require_no_active_purge(self.repository, project_id=project_id)
-
-        deadline = self.monotonic() + self.timeout_seconds
-        at = self.now()
+    def _collect_knowledge(
+        self, task: str, project_id: str, at: datetime, deadline: float
+    ) -> tuple[dict[str, list[tuple[Knowledge, float]]], list[BriefOmission], set[str]]:
         knowledge = self.repository.list_brief_knowledge(project_id, at)
         self._check_deadline(deadline)
-
         categories: dict[str, list[tuple[Knowledge, float]]] = {
             "project_rule": [],
             "global_rule": [],
@@ -374,14 +412,15 @@ class BriefService:
             if category is None:
                 continue
             categories[category].append((item, relevance_score(task, item, at)))
-
         for values in categories.values():
             values.sort(key=lambda value: (-value[1], value[0].id))
+        return categories, omitted, stale_ids
 
-        conflicts = self.repository.list_open_conflicts(project_id)
-        conflict_ids = tuple(sorted(item.id for item in conflicts))
-        omitted.extend(BriefOmission(item_id, "conflict") for item_id in conflict_ids)
-        warnings = self._warnings(project_id)
+    def _build_items(
+        self,
+        categories: dict[str, list[tuple[Knowledge, float]]],
+        deadline: float,
+    ) -> dict[str, list[BriefItem]]:
         by_category: dict[str, list[BriefItem]] = {
             "project_rule": [],
             "global_rule": [],
@@ -406,7 +445,15 @@ class BriefService:
                         )
                     )
                 )
+        return by_category
 
+    def _select_items(
+        self,
+        by_category: dict[str, list[BriefItem]],
+        omitted: list[BriefOmission],
+        context: _BriefContext,
+        deadline: float,
+    ) -> BriefResult:
         mandatory = [
             *by_category["project_rule"],
             *by_category["global_rule"],
@@ -416,69 +463,70 @@ class BriefService:
             *omitted,
             *[BriefOmission(item.id, "budget") for item in optional],
         ]
-
-        def result_for(
-            items: list[BriefItem], current_omitted: list[BriefOmission]
-        ) -> BriefResult:
-            return _with_result_cost(
-                BriefResult(
-                    task=task,
-                    project_id=project_id,
-                    generated_at=at,
-                    max_tokens=max_tokens,
-                    estimated_tokens=0,
-                    items=tuple(items),
-                    omitted=tuple(
-                        sorted(
-                            current_omitted, key=lambda value: (value.id, value.reason)
-                        )
-                    ),
-                    stale_ids=tuple(sorted(stale_ids)),
-                    conflict_ids=conflict_ids,
-                    warnings=warnings,
-                )
-            )
-
         selected = list(mandatory)
         current_omitted = list(base_omitted)
-        required = result_for(selected, current_omitted)
+        required = self._result_for(context, selected, current_omitted)
         self._check_deadline(deadline)
-        if required.estimated_tokens > max_tokens:
-            raise BriefBudgetError(required.estimated_tokens, max_tokens)
+        if required.estimated_tokens > context.max_tokens:
+            raise BriefBudgetError(required.estimated_tokens, context.max_tokens)
 
         for brief_item in optional:
             self._check_deadline(deadline)
             trial_omitted = [
                 omission
                 for omission in current_omitted
-                if not (
-                    omission.id == brief_item.id and omission.reason == "budget"
-                )
+                if not (omission.id == brief_item.id and omission.reason == "budget")
             ]
-            trial = result_for([*selected, brief_item], trial_omitted)
+            trial = self._result_for(context, [*selected, brief_item], trial_omitted)
             self._check_deadline(deadline)
-            if trial.estimated_tokens <= max_tokens:
+            if trial.estimated_tokens <= context.max_tokens:
                 selected.append(brief_item)
                 current_omitted = trial_omitted
+        return self._result_for(context, selected, current_omitted)
 
-        result = result_for(selected, current_omitted)
-        if not result.items:
-            result = _with_result_cost(
-                replace(
-                    result,
-                    health=self.repository.brief_health_counts(project_id, at),
-                    review_inbox_command=(
-                        f"retro review inbox --project {project_id}"
-                    ),
-                    recent_capture_command=(
-                        "retro capture --recent "
-                        f"{min(5, self.recent_capture_max)} --dry-run"
-                    ),
-                )
+    @staticmethod
+    def _result_for(
+        context: _BriefContext,
+        items: list[BriefItem],
+        omissions: list[BriefOmission],
+    ) -> BriefResult:
+        return _with_result_cost(
+            BriefResult(
+                task=context.task,
+                project_id=context.project_id,
+                generated_at=context.generated_at,
+                max_tokens=context.max_tokens,
+                estimated_tokens=0,
+                items=tuple(items),
+                omitted=tuple(
+                    sorted(omissions, key=lambda value: (value.id, value.reason))
+                ),
+                stale_ids=context.stale_ids,
+                conflict_ids=context.conflict_ids,
+                warnings=context.warnings,
             )
-            if result.estimated_tokens > max_tokens:
-                raise BriefBudgetError(result.estimated_tokens, max_tokens)
-        self._check_deadline(deadline)
+        )
+
+    def _add_empty_health(
+        self, result: BriefResult, context: _BriefContext
+    ) -> BriefResult:
+        result = _with_result_cost(
+            replace(
+                result,
+                health=self.repository.brief_health_counts(
+                    context.project_id, context.generated_at
+                ),
+                review_inbox_command=(
+                    f"retro review inbox --project {context.project_id}"
+                ),
+                recent_capture_command=(
+                    "retro capture --recent "
+                    f"{min(5, self.recent_capture_max)} --dry-run"
+                ),
+            )
+        )
+        if result.estimated_tokens > context.max_tokens:
+            raise BriefBudgetError(result.estimated_tokens, context.max_tokens)
         return result
 
     def _warnings(self, project_id: str) -> tuple[str, ...]:

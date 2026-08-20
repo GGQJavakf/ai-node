@@ -73,6 +73,14 @@ class MergePlanner:
         self.redactor = Redactor()
 
     def plan(self, project_id: str, instruction: str) -> MergePlan:
+        project_root = self._project_root(project_id)
+        deadline = self.monotonic() + self.discovery_timeout_seconds
+        paths = self._discover_markdown(project_root, deadline)
+        documents = self._read_documents(project_root, paths, deadline)
+        proposal = self._request_proposal(project_id, instruction, documents)
+        return self._persist_plan(project_id, proposal)
+
+    def _project_root(self, project_id: str) -> Path:
         try:
             project_part = canonical_merge_project_path(project_id)
         except ValueError as exc:
@@ -91,8 +99,10 @@ class MergePlanner:
             current = current / part
             if current.exists() and current.is_symlink():
                 raise ValueError("merge_planner_unsafe_markdown")
-        deadline = self.monotonic() + self.discovery_timeout_seconds
-        paths = []
+        return project_root
+
+    def _discover_markdown(self, project_root: Path, deadline: float) -> list[Path]:
+        paths: list[Path] = []
         for path in project_root.rglob("*.md"):
             if self.monotonic() > deadline:
                 raise ValueError("merge_planner_discovery_timeout")
@@ -102,6 +112,11 @@ class MergePlanner:
         paths.sort(key=lambda item: item.as_posix())
         if not paths:
             raise ValueError("merge_planner_no_markdown")
+        return paths
+
+    def _read_documents(
+        self, project_root: Path, paths: list[Path], deadline: float
+    ) -> dict[str, str]:
         documents: dict[str, str] = {}
         total_bytes = 0
         for path in paths:
@@ -127,6 +142,11 @@ class MergePlanner:
             except UnicodeDecodeError as exc:
                 raise ValueError("merge_planner_markdown_invalid") from exc
             documents[relative] = self.redactor.redact(text)
+        return documents
+
+    def _request_proposal(
+        self, project_id: str, instruction: str, documents: Mapping[str, str]
+    ) -> MergeProposal:
         proposal = self.gateway.propose(
             project_id,
             self.redactor.redact(instruction),
@@ -145,6 +165,9 @@ class MergePlanner:
         ):
             raise ValueError("merge_planner_empty_proposal")
         self._validate_proposal_scope(project_id, proposal)
+        return proposal
+
+    def _persist_plan(self, project_id: str, proposal: MergeProposal) -> MergePlan:
         replacements = {
             Path(path): content.encode("utf-8")
             for path, content in proposal.replacements.items()
@@ -166,9 +189,9 @@ class MergePlanner:
         try:
             project_path = canonical_merge_project_path(project_id)
             project_prefix = ("项目", *project_path.parts)
-            expected = canonical_merge_path_identity(
-                Path("项目") / project_path
-            ).split("/")
+            expected = canonical_merge_path_identity(Path("项目") / project_path).split(
+                "/"
+            )
             vault = self.vault_root.resolve(strict=True)
             for raw_path in paths:
                 path = Path(raw_path)

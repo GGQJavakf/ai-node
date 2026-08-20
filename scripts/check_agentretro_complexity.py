@@ -1,4 +1,4 @@
-"""Run the scoped AgentRetro McCabe regression gate."""
+"""Run the declared and full-source AgentRetro McCabe regression gates."""
 
 from __future__ import annotations
 
@@ -35,18 +35,34 @@ def load_targets() -> tuple[Path, ...]:
 
 def main() -> int:
     targets = load_targets()
-    command = [
+    command_prefix = [
         sys.executable,
         "-m",
         "ruff",
         "check",
-        *(str(target.relative_to(ROOT)) for target in targets),
+    ]
+    command_suffix = [
         "--select",
         "C901",
         "--config",
         "lint.mccabe.max-complexity=15",
     ]
-    return subprocess.run(command, cwd=ROOT, check=False).returncode
+    manifest_result = subprocess.run(
+        [
+            *command_prefix,
+            *(str(target.relative_to(ROOT)) for target in targets),
+            *command_suffix,
+        ],
+        cwd=ROOT,
+        check=False,
+    )
+    if manifest_result.returncode:
+        return manifest_result.returncode
+    return subprocess.run(
+        [*command_prefix, str(SOURCE_ROOT.relative_to(ROOT)), *command_suffix],
+        cwd=ROOT,
+        check=False,
+    ).returncode
 
 
 if __name__ == "__main__":

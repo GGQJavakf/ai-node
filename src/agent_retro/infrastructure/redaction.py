@@ -91,6 +91,15 @@ def _skip_header_whitespace(text: str, start: int) -> tuple[int, bool]:
     return index, index > start
 
 
+def _folded_line_start(text: str, index: int) -> int | None:
+    newline_end = index + 1
+    if text[index] == "\r" and newline_end < len(text) and text[newline_end] == "\n":
+        newline_end += 1
+    if newline_end >= len(text) or text[newline_end] not in " \t":
+        return None
+    return newline_end
+
+
 def _header_value_end(
     text: str, start: int, *, allow_flattened_boundary: bool = True
 ) -> int:
@@ -101,18 +110,11 @@ def _header_value_end(
         char = text[index]
         if quote:
             if char in "\r\n":
-                newline_end = index + 1
-                if (
-                    char == "\r"
-                    and newline_end < len(text)
-                    and text[newline_end] == "\n"
-                ):
-                    newline_end += 1
-                if newline_end < len(text) and text[newline_end] in " \t":
-                    index = newline_end
-                    escaped = False
-                else:
+                folded_start = _folded_line_start(text, index)
+                if folded_start is None:
                     return index
+                index = folded_start
+                escaped = False
             elif escaped:
                 escaped = False
             elif char == "\\":
@@ -122,13 +124,10 @@ def _header_value_end(
         elif char in ('"', "'"):
             quote = char
         elif char in "\r\n":
-            newline_end = index + 1
-            if char == "\r" and newline_end < len(text) and text[newline_end] == "\n":
-                newline_end += 1
-            if newline_end < len(text) and text[newline_end] in " \t":
-                index = newline_end
-            else:
+            folded_start = _folded_line_start(text, index)
+            if folded_start is None:
                 return index
+            index = folded_start
         elif allow_flattened_boundary and char in " \t":
             next_token = index
             while next_token < len(text) and text[next_token] in " \t":
