@@ -6,8 +6,8 @@
 
 ## 2. Codex Resume Selection
 
-- [ ] 2.1 Decompose `_select_candidates` into named exclusion, unfinished-entry, non-resumeable-bucket, and missing-target steps without changing ordering, reasons, target semantics, or fail-closed policy behavior.
-- [ ] 2.2 Run Codex resume service and CLI shortcut regressions, including manual exclusions, malformed reports, denied buckets, duplicates, dry-run, and targeted selection.
+- [x] 2.1 Decompose `_select_candidates` into named exclusion, unfinished-entry, non-resumeable-bucket, and missing-target steps without changing ordering, reasons, target semantics, or fail-closed policy behavior.
+- [x] 2.2 Run Codex resume service and CLI shortcut regressions, including manual exclusions, malformed reports, denied buckets, duplicates, dry-run, and targeted selection.
 
 ## 3. Slash Routing and List Rendering
 
