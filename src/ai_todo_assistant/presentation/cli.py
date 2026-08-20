@@ -431,43 +431,58 @@ class TodoCLI:
         return table
 
     def _handle_daily_triage_list(self, source_filter=""):
-        todos = [] if source_filter and source_filter != "todo" else [
-            todo for todo in self.manager.get_all() if not todo.completed
-        ]
-        work_items = []
-        if source_filter != "todo":
-            try:
-                work_items = self._workflow_repo().list_work_items(include_closed=False)
-            except Exception:
-                work_items = []
-            if source_filter:
-                work_items = [item for item in work_items if item.source == source_filter]
-            work_items = _dedupe_work_items(work_items)
-        evidence_by_item = {}
-        evidence_read_failures = []
-        if work_items:
-            repo = self._workflow_repo()
-            for item in work_items:
-                try:
-                    evidence_by_item[item.id] = repo.list_evidence(item.id)
-                except (OSError, ValueError, sqlite3.Error) as exc:
-                    evidence_read_failures.append((item.id, type(exc).__name__))
-
+        todos = self._daily_triage_todos(source_filter)
+        work_items = self._daily_triage_work_items(source_filter)
+        evidence_by_item, evidence_read_failures = self._daily_triage_evidence(work_items)
         rows = _daily_triage_work_item_rows(work_items, evidence_by_item)
-        for todo in self._rank_tasks(todos):
-            rows.append(
-                {
-                    "group": "todo reminders",
-                    "id": todo.id[:8],
-                    "source": "todo",
-                    "priority": self._get_priority_marker(todo.priority),
-                    "title": Text(todo.title, style=self._get_task_status_color(todo)),
-                    "status": Text("○ 未完成", style="green"),
-                    "reason": "todo reminder",
-                    "next": Text(todo.end_time if todo.end_time else "-", style=self._get_due_time_color(todo)),
-                }
-            )
+        rows.extend(self._daily_triage_todo_rows(todos))
+        return self._render_daily_triage(rows, evidence_read_failures)
 
+    def _daily_triage_todos(self, source_filter):
+        if source_filter and source_filter != "todo":
+            return []
+        return [todo for todo in self.manager.get_all() if not todo.completed]
+
+    def _daily_triage_work_items(self, source_filter):
+        if source_filter == "todo":
+            return []
+        try:
+            work_items = self._workflow_repo().list_work_items(include_closed=False)
+        except Exception:
+            return []
+        if source_filter:
+            work_items = [item for item in work_items if item.source == source_filter]
+        return _dedupe_work_items(work_items)
+
+    def _daily_triage_evidence(self, work_items):
+        evidence_by_item = {}
+        failures = []
+        if not work_items:
+            return evidence_by_item, failures
+        repo = self._workflow_repo()
+        for item in work_items:
+            try:
+                evidence_by_item[item.id] = repo.list_evidence(item.id)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                failures.append((item.id, type(exc).__name__))
+        return evidence_by_item, failures
+
+    def _daily_triage_todo_rows(self, todos):
+        return [
+            {
+                "group": "todo reminders",
+                "id": todo.id[:8],
+                "source": "todo",
+                "priority": self._get_priority_marker(todo.priority),
+                "title": Text(todo.title, style=self._get_task_status_color(todo)),
+                "status": Text("○ 未完成", style="green"),
+                "reason": "todo reminder",
+                "next": Text(todo.end_time if todo.end_time else "-", style=self._get_due_time_color(todo)),
+            }
+            for todo in self._rank_tasks(todos)
+        ]
+
+    def _render_daily_triage(self, rows, evidence_read_failures):
         if not rows:
             result = "📋 每日工作分诊\n\n  暂无任务"
             if evidence_read_failures:
@@ -750,7 +765,9 @@ class TodoCLI:
         report, imported, report_dir = self._import_latest_codex_report()
         if not report:
             return f"Codex 未完成任务日报\n\n  暂无快照文件: {report_dir}"
+        return self._format_codex_report(report, imported)
 
+    def _format_codex_report(self, report, imported):
         output = "Codex 未完成任务日报\n"
         output += "─" * 80 + "\n"
         output += f"  生成时间: {report.generated_at}\n"
@@ -761,36 +778,38 @@ class TodoCLI:
             output += f"  每日总结: {report.summary_path}\n"
         if report.summary:
             output += f"  摘要: {report.summary}\n"
-
-        items = report.unfinished + report.blocked
-        if not items:
-            output += "\n  当前快照没有未完成任务\n"
-        else:
-            output += "\n优先跟进:\n"
-            for index, item in enumerate(items[:10], 1):
-                title = item.get("title") or item.get("name") or item.get("thread_id") or "未命名任务"
-                status = item.get("status") or item.get("state") or "unknown"
-                source = item.get("source") or item.get("thread_id") or item.get("cwd") or ""
-                next_action = item.get("next_action") or item.get("next") or ""
-                suffix = f" | {source}" if source else ""
-                output += f"  {index}. [{status}] {title}{suffix}\n"
-                if next_action:
-                    output += f"     下一步: {next_action}\n"
-        if report.completed:
-            output += "\n最近完成:\n"
-            for index, item in enumerate(report.completed[:5], 1):
-                title = item.get("title") or item.get("name") or item.get("thread_id") or "未命名任务"
-                source = item.get("source") or item.get("thread_id") or item.get("cwd") or ""
-                signals = item.get("completion_signals") or item.get("evidence") or []
-                if isinstance(signals, list):
-                    signal_text = "；".join(str(signal) for signal in signals[:3])
-                else:
-                    signal_text = str(signals)
-                suffix = f" | {source}" if source else ""
-                output += f"  {index}. {title}{suffix}\n"
-                if signal_text:
-                    output += f"     完成证据: {signal_text}\n"
+        output += self._format_codex_open_entries(report.unfinished + report.blocked)
+        output += self._format_codex_completed_entries(report.completed)
         output += "─" * 80
+        return output
+
+    def _format_codex_open_entries(self, items):
+        if not items:
+            return "\n  当前快照没有未完成任务\n"
+        output = "\n优先跟进:\n"
+        for index, item in enumerate(items[:10], 1):
+            title = item.get("title") or item.get("name") or item.get("thread_id") or "未命名任务"
+            status = item.get("status") or item.get("state") or "unknown"
+            source = item.get("source") or item.get("thread_id") or item.get("cwd") or ""
+            next_action = item.get("next_action") or item.get("next") or ""
+            suffix = f" | {source}" if source else ""
+            output += f"  {index}. [{status}] {title}{suffix}\n"
+            if next_action:
+                output += f"     下一步: {next_action}\n"
+        return output
+
+    def _format_codex_completed_entries(self, items):
+        if not items:
+            return ""
+        output = "\n最近完成:\n"
+        for index, item in enumerate(items[:5], 1):
+            title = item.get("title") or item.get("name") or item.get("thread_id") or "未命名任务"
+            source = item.get("source") or item.get("thread_id") or item.get("cwd") or ""
+            signal_text = _codex_completion_signal_text(item)
+            suffix = f" | {source}" if source else ""
+            output += f"  {index}. {title}{suffix}\n"
+            if signal_text:
+                output += f"     完成证据: {signal_text}\n"
         return output
 
     def _handle_codex_resume_command(self, args=""):
@@ -800,27 +819,15 @@ class TodoCLI:
         store = self._codex_resume_exclusion_store()
         exclusion_service = CodexResumeExclusionService(store)
         report, report_dir = self._latest_codex_report()
-        if options["action"] in {"exclude", "include", "resume"} and _is_index_text(options["thread_id"]):
-            if not report:
-                return f"Codex resume\n\n  暂无快照文件: {report_dir}"
-            resolved, error = self._resolve_codex_resume_index(report, store, options["thread_id"])
-            if error:
-                return error
-            options["thread_id"] = resolved
+        resolution_error = self._resolve_codex_resume_option_index(options, report, report_dir, store)
+        if resolution_error:
+            return resolution_error
         try:
-            if options["action"] == "exclude":
-                exclusion = exclusion_service.exclude(options["thread_id"], options["reason"])
-                suffix = f"：{exclusion.reason}" if exclusion.reason else ""
-                return f"已排除自动推进: {exclusion.thread_id}{suffix}"
-            if options["action"] == "include":
-                removed = exclusion_service.include(options["thread_id"])
-                if removed:
-                    return f"已解除自动推进排除: {options['thread_id']}"
-                return f"未找到自动推进排除: {options['thread_id']}"
-            if options["action"] == "list":
-                return _format_codex_resume_exclusions(exclusion_service.list_exclusions())
+            exclusion_result = self._handle_codex_exclusion_action(options, exclusion_service)
         except (OSError, ValueError) as exc:
             return _format_codex_resume_exclusion_error(exc)
+        if exclusion_result is not None:
+            return exclusion_result
         if not report:
             return f"Codex resume\n\n  暂无快照文件: {report_dir}"
         service = CodexResumeService(
@@ -834,6 +841,30 @@ class TodoCLI:
             thread_id=options["thread_id"],
         )
         return format_codex_resume_result(result)
+
+    def _resolve_codex_resume_option_index(self, options, report, report_dir, store):
+        if options["action"] in {"exclude", "include", "resume"} and _is_index_text(options["thread_id"]):
+            if not report:
+                return f"Codex resume\n\n  暂无快照文件: {report_dir}"
+            resolved, error = self._resolve_codex_resume_index(report, store, options["thread_id"])
+            if error:
+                return error
+            options["thread_id"] = resolved
+        return ""
+
+    def _handle_codex_exclusion_action(self, options, exclusion_service):
+        if options["action"] == "exclude":
+            exclusion = exclusion_service.exclude(options["thread_id"], options["reason"])
+            suffix = f"：{exclusion.reason}" if exclusion.reason else ""
+            return f"已排除自动推进: {exclusion.thread_id}{suffix}"
+        if options["action"] == "include":
+            removed = exclusion_service.include(options["thread_id"])
+            if removed:
+                return f"已解除自动推进排除: {options['thread_id']}"
+            return f"未找到自动推进排除: {options['thread_id']}"
+        if options["action"] == "list":
+            return _format_codex_resume_exclusions(exclusion_service.list_exclusions())
+        return None
 
     def _handle_resume_shortcut(self, subcmd="", args=""):
         raw = " ".join(part for part in [subcmd, args] if part).strip()
@@ -1141,35 +1172,8 @@ class TodoCLI:
         item = self._workflow_repo().get_work_item(work_item_id)
         if not item:
             return f"未知工作项: {work_item_id}"
-        lines = ["工作项详情", "─" * 80]
-        lines.append(f"  标题: {item.title}")
-        lines.append(f"  状态: {item.status} / {item.priority}")
-        lines.append(f"  主来源: {item.source}:{item.source_ref}" if item.source_ref else f"  主来源: {item.source}")
-        if item.source_refs:
-            lines.append("  来源链:")
-            for ref in item.source_refs:
-                label = f" | {ref.get('label')}" if ref.get("label") else ""
-                lines.append(f"    - {ref.get('source')}:{ref.get('source_ref')}{label}")
-        if item.source_identities:
-            lines.append("  稳定身份:")
-            for identity in item.source_identities:
-                lines.append(f"    - {identity}")
-        if item.merge_audit:
-            lines.append("  合并审计:")
-            for audit in item.merge_audit:
-                lines.append(
-                    f"    - {audit.get('id', '-')}: {audit.get('source')}:{audit.get('source_ref')} "
-                    f"{audit.get('reason', '')} {audit.get('merged_at', '')}"
-                )
-        if item.merge_conflicts:
-            lines.append("  冲突:")
-            for conflict in item.merge_conflicts:
-                lines.append(f"    - {conflict}")
         evidence = self._workflow_repo().list_evidence(item.id)
-        if evidence:
-            lines.append("  证据:")
-            for entry in evidence[:10]:
-                lines.append(f"    - [{entry.evidence_type}/{entry.source}] {entry.summary}")
+        lines = _work_item_detail_lines(item, evidence)
         lines.append("─" * 80)
         return "\n".join(lines)
 
@@ -1922,6 +1926,72 @@ def _parse_sync_options(subcmd, args):
         "interval_seconds": interval_seconds,
         "path": " ".join(path_parts).strip(),
     }
+
+
+def _codex_completion_signal_text(item):
+    signals = item.get("completion_signals") or item.get("evidence") or []
+    if isinstance(signals, list):
+        return "；".join(str(signal) for signal in signals[:3])
+    return str(signals)
+
+
+def _work_item_detail_lines(item, evidence):
+    lines = [
+        "工作项详情",
+        "─" * 80,
+        f"  标题: {item.title}",
+        f"  状态: {item.status} / {item.priority}",
+        f"  主来源: {item.source}:{item.source_ref}" if item.source_ref else f"  主来源: {item.source}",
+    ]
+    lines.extend(_work_item_source_ref_lines(item.source_refs))
+    lines.extend(_work_item_identity_lines(item.source_identities))
+    lines.extend(_work_item_merge_audit_lines(item.merge_audit))
+    lines.extend(_work_item_conflict_lines(item.merge_conflicts))
+    lines.extend(_work_item_evidence_lines(evidence))
+    return lines
+
+
+def _work_item_source_ref_lines(source_refs):
+    if not source_refs:
+        return []
+    lines = ["  来源链:"]
+    for ref in source_refs:
+        label = f" | {ref.get('label')}" if ref.get("label") else ""
+        lines.append(f"    - {ref.get('source')}:{ref.get('source_ref')}{label}")
+    return lines
+
+
+def _work_item_identity_lines(identities):
+    if not identities:
+        return []
+    return ["  稳定身份:", *(f"    - {identity}" for identity in identities)]
+
+
+def _work_item_merge_audit_lines(audits):
+    if not audits:
+        return []
+    lines = ["  合并审计:"]
+    for audit in audits:
+        lines.append(
+            f"    - {audit.get('id', '-')}: {audit.get('source')}:{audit.get('source_ref')} "
+            f"{audit.get('reason', '')} {audit.get('merged_at', '')}"
+        )
+    return lines
+
+
+def _work_item_conflict_lines(conflicts):
+    if not conflicts:
+        return []
+    return ["  冲突:", *(f"    - {conflict}" for conflict in conflicts)]
+
+
+def _work_item_evidence_lines(evidence):
+    if not evidence:
+        return []
+    return [
+        "  证据:",
+        *(f"    - [{entry.evidence_type}/{entry.source}] {entry.summary}" for entry in evidence[:10]),
+    ]
 
 
 def _parse_codex_resume_options(args):
