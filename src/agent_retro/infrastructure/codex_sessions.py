@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
@@ -56,6 +56,20 @@ class DiscoveryDiagnostics:
 class _SessionCandidate:
     path: Path
     size: int
+
+
+@dataclass
+class _SessionParseState:
+    session_id: str | None = None
+    project_id: str | None = None
+    completion_state: bool | None = None
+    completed_at: datetime | None = None
+    events: list[NormalizedEvent] = field(default_factory=list)
+    saw_meta: bool = False
+    saw_non_meta: bool = False
+    family_id: str = ""
+    meta_ids: set[str] = field(default_factory=set)
+    previous_meta: dict[str, object] | None = None
 
 
 _SESSION_PATH_PATTERN = re.compile(
@@ -415,16 +429,7 @@ class CodexSessionSource:
 
     def _parse(self, path: Path, deadline: float) -> NormalizedSession:
         digest = hashlib.sha256()
-        session_id: str | None = None
-        project_id: str | None = None
-        completion_state: bool | None = None
-        completed_at: datetime | None = None
-        events: list[NormalizedEvent] = []
-        saw_meta = False
-        saw_non_meta = False
-        family_id = ""
-        meta_ids: set[str] = set()
-        previous_meta: dict[str, object] | None = None
+        state = _SessionParseState()
         try:
             with path.open("rb") as stream:
                 self._check_deadline(deadline)
@@ -437,117 +442,140 @@ class CodexSessionSource:
                     digest.update(raw_line)
                     if not raw_line.strip():
                         continue
-                    try:
-                        record = json.loads(raw_line.decode("utf-8"))
-                    except (UnicodeError, json.JSONDecodeError) as exc:
-                        raise SessionFormatError(
-                            f"无效 JSONL，行 {line_number}: {path}"
-                        ) from exc
-                    if not isinstance(record, dict):
-                        raise SessionFormatError(
-                            f"JSONL 记录必须是对象，行 {line_number}: {path}"
-                        )
+                    record = self._decode_record(raw_line, path, line_number)
                     self._check_deadline(deadline)
-                    version = record.get("version")
-                    if version not in (None, 1, "1"):
-                        raise SessionFormatError(
-                            f"不支持的 Codex 会话版本 {version}: {path}"
-                        )
-                    record_type = record.get("type")
-                    payload = record.get("payload")
-                    if not isinstance(payload, dict):
-                        raise SessionFormatError(
-                            f"缺少事件 payload，行 {line_number}: {path}"
-                        )
-                    if record_type == "session_meta":
-                        if saw_non_meta:
-                            raise SessionFormatError(
-                                f"session_meta 出现在普通事件之后: {path}"
-                            )
-                        current_id = _required_text(payload.get("id"), "session ID")
-                        current_family = str(payload.get("session_id") or "").strip()
-                        if current_id in meta_ids:
-                            raise SessionFormatError(
-                                f"session_meta 链包含重复或循环 ID: {path}"
-                            )
-                        if family_id and current_family and current_family != family_id:
-                            raise SessionFormatError(
-                                f"session_meta 链的 session_id 不一致: {path}"
-                            )
-                        if not family_id and current_family:
-                            family_id = current_family
-                        if previous_meta is not None:
-                            declared_parents = {
-                                str(previous_meta.get(field) or "").strip()
-                                for field in ("forked_from_id", "parent_thread_id")
-                            }
-                            declared_parents.discard("")
-                            if current_id not in declared_parents:
-                                raise SessionFormatError(
-                                    f"session_meta 不是连续的子到父链: {path}"
-                                )
-                        if not saw_meta:
-                            saw_meta = True
-                            session_id = current_id
-                            project_id = _required_text(
-                                payload.get("cwd"), "session source locator"
-                            )
-                            completed_at = _parse_timestamp(record.get("timestamp"))
-                        meta_ids.add(current_id)
-                        previous_meta = payload
-                        continue
-                    saw_non_meta = True
-                    if not saw_meta or session_id is None:
-                        raise SessionFormatError(
-                            f"事件出现在 session_meta 之前，行 {line_number}: {path}"
-                        )
-                    normalized = self._normalize_event(
-                        record_type,
-                        payload,
-                        record.get("timestamp"),
-                        session_id,
-                        path,
-                        line_number,
-                    )
-                    if normalized is _COMPLETION:
-                        completion_state = True
-                        completed_at = _parse_timestamp(record.get("timestamp"))
-                    elif normalized in (_STARTED, _ABORTED):
-                        completion_state = False
-                    elif isinstance(normalized, NormalizedEvent):
-                        events.append(normalized)
+                    self._consume_record(state, record, path, line_number)
         except OSError as exc:
             raise SessionNotFoundError(f"无法读取 Codex 会话: {path}") from exc
+        return self._finish_session(state, digest.hexdigest(), path, deadline)
 
-        if not saw_meta or session_id is None:
+    @staticmethod
+    def _decode_record(
+        raw_line: bytes, path: Path, line_number: int
+    ) -> dict[str, object]:
+        try:
+            record = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise SessionFormatError(f"无效 JSONL，行 {line_number}: {path}") from exc
+        if not isinstance(record, dict):
+            raise SessionFormatError(f"JSONL 记录必须是对象，行 {line_number}: {path}")
+        return record
+
+    def _consume_record(
+        self,
+        state: _SessionParseState,
+        record: dict[str, object],
+        path: Path,
+        line_number: int,
+    ) -> None:
+        version = record.get("version")
+        if version not in (None, 1, "1"):
+            raise SessionFormatError(f"不支持的 Codex 会话版本 {version}: {path}")
+        record_type = record.get("type")
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            raise SessionFormatError(f"缺少事件 payload，行 {line_number}: {path}")
+        if record_type == "session_meta":
+            self._consume_meta(state, payload, record.get("timestamp"), path)
+            return
+        self._consume_event(state, record_type, payload, record, path, line_number)
+
+    @staticmethod
+    def _consume_meta(
+        state: _SessionParseState,
+        payload: dict[str, object],
+        timestamp: object,
+        path: Path,
+    ) -> None:
+        if state.saw_non_meta:
+            raise SessionFormatError(f"session_meta 出现在普通事件之后: {path}")
+        current_id = _required_text(payload.get("id"), "session ID")
+        current_family = str(payload.get("session_id") or "").strip()
+        if current_id in state.meta_ids:
+            raise SessionFormatError(f"session_meta 链包含重复或循环 ID: {path}")
+        if state.family_id and current_family and current_family != state.family_id:
+            raise SessionFormatError(f"session_meta 链的 session_id 不一致: {path}")
+        if not state.family_id and current_family:
+            state.family_id = current_family
+        if state.previous_meta is not None:
+            declared_parents = {
+                str(state.previous_meta.get(field) or "").strip()
+                for field in ("forked_from_id", "parent_thread_id")
+            }
+            declared_parents.discard("")
+            if current_id not in declared_parents:
+                raise SessionFormatError(f"session_meta 不是连续的子到父链: {path}")
+        if not state.saw_meta:
+            state.saw_meta = True
+            state.session_id = current_id
+            state.project_id = _required_text(
+                payload.get("cwd"), "session source locator"
+            )
+            state.completed_at = _parse_timestamp(timestamp)
+        state.meta_ids.add(current_id)
+        state.previous_meta = payload
+
+    def _consume_event(
+        self,
+        state: _SessionParseState,
+        record_type: object,
+        payload: dict[str, object],
+        record: dict[str, object],
+        path: Path,
+        line_number: int,
+    ) -> None:
+        state.saw_non_meta = True
+        if not state.saw_meta or state.session_id is None:
+            raise SessionFormatError(
+                f"事件出现在 session_meta 之前，行 {line_number}: {path}"
+            )
+        timestamp = record.get("timestamp")
+        normalized = self._normalize_event(
+            record_type, payload, timestamp, state.session_id, path, line_number
+        )
+        if normalized is _COMPLETION:
+            state.completion_state = True
+            state.completed_at = _parse_timestamp(timestamp)
+        elif normalized in (_STARTED, _ABORTED):
+            state.completion_state = False
+        elif isinstance(normalized, NormalizedEvent):
+            state.events.append(normalized)
+
+    def _finish_session(
+        self,
+        state: _SessionParseState,
+        source_hash: str,
+        path: Path,
+        deadline: float,
+    ) -> NormalizedSession:
+        if not state.saw_meta or state.session_id is None:
             raise SessionFormatError(f"缺少 session ID: {path}")
-        if project_id is None:
+        if state.project_id is None:
             raise SessionFormatError(f"缺少 session source locator: {path}")
-        if completion_state is None:
-            completion_state = False
+        completion_state = bool(state.completion_state)
+        completed_at = state.completed_at
         if completed_at is None:
             self._check_deadline(deadline)
             stat = path.stat()
             self._check_deadline(deadline)
             completed_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
-        source_hash = digest.hexdigest()
         internal_id = (
             "session-"
-            + hashlib.sha256(f"{session_id}:{source_hash}".encode("utf-8")).hexdigest()[
-                :24
-            ]
+            + hashlib.sha256(
+                f"{state.session_id}:{source_hash}".encode("utf-8")
+            ).hexdigest()[:24]
         )
         source_path = path.resolve()
         self._check_deadline(deadline)
         return NormalizedSession(
             id=internal_id,
-            source_session_id=session_id,
+            source_session_id=state.session_id,
             source_path=source_path,
             source_hash=source_hash,
-            project_id=project_id,
+            project_id=state.project_id,
             completed=completion_state,
             completed_at=completed_at,
-            events=tuple(events),
+            events=tuple(state.events),
         )
 
     def _normalize_event(
