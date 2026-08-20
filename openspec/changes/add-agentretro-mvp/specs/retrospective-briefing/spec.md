@@ -37,12 +37,12 @@ The system SHALL reuse the effective `ai-todo` model configuration through one r
 
 ### Requirement: Briefs use only active accepted knowledge
 
-The system SHALL build a task brief in the fixed category order active project rules, explicitly global rules, current task state, and relevant lessons, and SHALL exclude pending, rejected, conflicting, archived, and expired items.
+The system SHALL build a task brief in the fixed category order active project rules, explicitly global rules, current project or explicitly global task state, and relevant project or explicitly global lessons, and SHALL exclude pending, rejected, conflicting, archived, and expired items.
 
 #### Scenario: [BR-06] Build a project brief
 
 - **WHEN** the user runs `retro brief "<task>" --project <project>`
-- **THEN** the system SHALL select accepted knowledge in active project rule, explicitly global rule, current task-state, and relevant lesson order
+- **THEN** the system SHALL select accepted knowledge in active project rule, explicitly global rule, current project or explicitly global task-state, and relevant project or explicitly global lesson order
 - **AND** it SHALL include evidence references for selected items
 
 #### Scenario: [BR-07] Exclude invalid knowledge

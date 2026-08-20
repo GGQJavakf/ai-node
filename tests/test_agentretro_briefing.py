@@ -148,6 +148,42 @@ def test_brief_selects_only_active_accepted_knowledge_in_fixed_category_order():
     assert omissions["stale"] == "stale"
 
 
+def test_brief_includes_explicitly_global_task_state_and_relevant_lesson():
+    repository = BriefRepository(
+        [
+            _knowledge(
+                "global-task",
+                KnowledgeType.TASK_STATE,
+                "Shared release is blocked on review",
+                project_id="OTHER",
+                scope="global",
+                valid_until=NOW + timedelta(days=1),
+            ),
+            _knowledge(
+                "global-lesson",
+                KnowledgeType.LESSON,
+                "Shared rollback requires a verified backup",
+                project_id="OTHER",
+                scope="global",
+            ),
+            _knowledge(
+                "other-project-lesson",
+                KnowledgeType.LESSON,
+                "Shared rollback without global promotion",
+                project_id="OTHER",
+            ),
+        ]
+    )
+
+    result = _service(repository).build(
+        BriefRequest(task="review shared rollback", project_id="NPKI")
+    )
+
+    assert [item.id for item in result.items] == ["global-task", "global-lesson"]
+    assert [item.category for item in result.items] == ["task_state", "lesson"]
+    assert "other-project-lesson" not in {item.id for item in result.items}
+
+
 def test_brief_uses_nfkc_casefold_latin_and_cjk_fixed_scoring_and_id_tie_break():
     repository = BriefRepository(
         [

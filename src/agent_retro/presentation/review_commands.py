@@ -146,12 +146,18 @@ def run_review_command(
         return 0
     if command == "promote":
         knowledge = lifecycle.promote_global(args.knowledge_id, actor="user")
+        projection = _project(
+            projection_coordinator,
+            "global_promote",
+            knowledge.id,
+            knowledge.project_id,
+        )
         _write_result(
             args.json_output,
             code="RETRO_KNOWLEDGE_PROMOTED",
             message="Knowledge promoted globally.",
             human=f"已提升全局知识 {args.knowledge_id}",
-            data=_knowledge_data(knowledge),
+            data={**_knowledge_data(knowledge), "projection": projection},
         )
         return 0
     if command == "archive":
@@ -198,15 +204,14 @@ def run_review_command(
         else:
             candidates = repository.candidates_for_session(args.retry_session_id)
             cause_entity = args.retry_session_id
-        projects = sorted(
-            {
-                knowledge.project_id
-                for candidate in candidates
-                if (knowledge := repository.knowledge_for_candidate(candidate.id))
-                is not None
-                and knowledge.status == "active"
-            }
-        )
+        active_projects: set[str] = set()
+        for reviewed_candidate in candidates:
+            accepted_knowledge = repository.knowledge_for_candidate(
+                reviewed_candidate.id
+            )
+            if accepted_knowledge is not None and accepted_knowledge.status == "active":
+                active_projects.add(accepted_knowledge.project_id)
+        projects = sorted(active_projects)
         projections = [
             _project(projection_coordinator, "auto_accept", cause_entity, project)
             for project in projects

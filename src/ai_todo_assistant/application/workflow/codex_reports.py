@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -54,7 +54,10 @@ class CodexTaskReportService:
                 reports.append(self._load_report(path))
             except (OSError, json.JSONDecodeError, ValueError):
                 continue
-        return sorted(reports, key=lambda report: (report.generated_at, report.path))
+        return sorted(
+            reports,
+            key=lambda report: (_parse_generated_at(report.generated_at), report.path),
+        )
 
     def _load_report(self, path: str) -> CodexTaskReport:
         with open(path, "r", encoding="utf-8") as handle:
@@ -72,6 +75,7 @@ class CodexTaskReportService:
             total_unfinished = len(unfinished) + len(blocked)
 
         generated_at = str(payload.get("generated_at") or _mtime_iso(path))
+        _parse_generated_at(generated_at)
         summary = str(payload.get("summary") or "")
         summary_path, daily_summary_markdown = _load_paired_markdown(path)
         return CodexTaskReport(
@@ -171,7 +175,19 @@ def _looks_like_manual_action(prompt: str) -> bool:
 
 
 def _mtime_iso(path: str) -> str:
-    return datetime.fromtimestamp(os.path.getmtime(path)).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(
+        os.path.getmtime(path), tz=timezone.utc
+    ).isoformat(timespec="seconds")
+
+
+def _parse_generated_at(value: str) -> datetime:
+    normalized = value.strip()
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _paired_markdown_path(path: str) -> str:

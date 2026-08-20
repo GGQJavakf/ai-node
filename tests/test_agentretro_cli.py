@@ -372,7 +372,24 @@ def test_edit_reject_merge_promote_and_archive_are_no_model_lifecycle_commands(
     def fail_model_builder(*args, **kwargs):
         pytest.fail("manual lifecycle commands must not load model composition")
 
+    projection_calls = []
+
+    def after_commit(cause, entity_id, project_id):
+        projection_calls.append((cause, entity_id, project_id))
+        return SimpleNamespace(
+            event_id=f"event-{len(projection_calls)}",
+            status=ProjectionStatus.SYNCED,
+            warning="",
+            recovery_command="",
+            reason="",
+        )
+
     monkeypatch.setattr(retro_cli, "_build_review_service", fail_model_builder)
+    monkeypatch.setattr(
+        retro_cli,
+        "build_projection_coordinator",
+        lambda *args, **kwargs: SimpleNamespace(after_commit=after_commit),
+    )
 
     assert (
         retro_cli.main(
@@ -441,6 +458,12 @@ def test_edit_reject_merge_promote_and_archive_are_no_model_lifecycle_commands(
     )
     promoted = _json_output(capsys)
     assert promoted["data"]["scope"] == "global"
+    assert promoted["data"]["projection"]["status"] == "synced"
+    assert projection_calls[-1] == (
+        "global_promote",
+        active.id,
+        active.project_id,
+    )
 
     assert (
         retro_cli.main(

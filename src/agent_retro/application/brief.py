@@ -396,17 +396,19 @@ class BriefService:
         if required.estimated_tokens > max_tokens:
             raise BriefBudgetError(required.estimated_tokens, max_tokens)
 
-        for item in optional:
+        for brief_item in optional:
             self._check_deadline(deadline)
             trial_omitted = [
                 omission
                 for omission in current_omitted
-                if not (omission.id == item.id and omission.reason == "budget")
+                if not (
+                    omission.id == brief_item.id and omission.reason == "budget"
+                )
             ]
-            trial = result_for([*selected, item], trial_omitted)
+            trial = result_for([*selected, brief_item], trial_omitted)
             self._check_deadline(deadline)
             if trial.estimated_tokens <= max_tokens:
-                selected.append(item)
+                selected.append(brief_item)
                 current_omitted = trial_omitted
 
         result = result_for(selected, current_omitted)
@@ -430,12 +432,6 @@ class BriefService:
 
     @staticmethod
     def _invalid_reason(item: Knowledge, project_id: str, at: datetime) -> str | None:
-        if (
-            item.scope == "global"
-            and item.knowledge_type is not KnowledgeType.RULE
-            and item.project_id != project_id
-        ):
-            return "other_project"
         if item.scope != "global" and item.project_id != project_id:
             return "other_project"
         if item.status != "active":
@@ -448,7 +444,7 @@ class BriefService:
     def _category(item: Knowledge, project_id: str) -> str | None:
         if item.knowledge_type is KnowledgeType.RULE:
             return "global_rule" if item.scope == "global" else "project_rule"
-        if item.project_id != project_id:
+        if item.scope != "global" and item.project_id != project_id:
             return None
         if item.knowledge_type is KnowledgeType.TASK_STATE:
             return "task_state"

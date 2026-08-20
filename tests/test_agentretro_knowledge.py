@@ -136,6 +136,9 @@ def test_manual_edit_can_change_text_type_scope_and_validity_before_acceptance(
     assert edited.status == CandidateStatus.EDITED
     assert edited.proposed_text == knowledge.text
     assert edited.knowledge_type is KnowledgeType.TASK_STATE
+    assert [
+        item.id for item in repository.list_brief_knowledge("project-2", NOW)
+    ] == [knowledge.id]
     audit = repository.list_audit_entries(
         action="candidate_edited", entity_id=knowledge.id
     )

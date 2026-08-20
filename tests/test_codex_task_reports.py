@@ -116,6 +116,31 @@ class TestCodexTaskReports(unittest.TestCase):
         self.assertEqual(report.path, good_path)
         self.assertEqual(report.total_unfinished, 1)
 
+    def test_latest_report_orders_iso_timestamps_by_instant_and_skips_invalid(self):
+        earlier_path = os.path.join(self.temp_dir.name, "earlier.json")
+        later_path = os.path.join(self.temp_dir.name, "later.json")
+        invalid_path = os.path.join(self.temp_dir.name, "invalid.json")
+        with open(earlier_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"generated_at": "2026-06-19T09:00:00+08:00", "summary": "earlier"},
+                handle,
+            )
+        with open(later_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"generated_at": "2026-06-19T02:00:00Z", "summary": "later"},
+                handle,
+            )
+        with open(invalid_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"generated_at": "not-a-timestamp", "summary": "invalid"},
+                handle,
+            )
+
+        reports = CodexTaskReportService(self.temp_dir.name).list_reports()
+
+        self.assertEqual([report.path for report in reports], [earlier_path, later_path])
+        self.assertEqual(reports[-1].summary, "later")
+
     def test_unfinished_entries_with_next_action_are_normalized_as_resumeable(self):
         report_path = os.path.join(self.temp_dir.name, "2026-06-20.json")
         with open(report_path, "w", encoding="utf-8") as handle:

@@ -1551,8 +1551,7 @@ class SQLiteRetroRepository(RetroRepository):
                 JOIN (
                     SELECT id, MAX(version) AS version FROM knowledge GROUP BY id
                 ) AS latest ON latest.id = item.id AND latest.version = item.version
-                WHERE item.project_id = ?
-                   OR (item.scope = 'global' AND item.knowledge_type = 'RULE')
+                WHERE item.project_id = ? OR item.scope = 'global'
                 ORDER BY item.id""",
                 (project_id,),
             ).fetchall()

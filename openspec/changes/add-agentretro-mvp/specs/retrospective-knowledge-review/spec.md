@@ -113,6 +113,8 @@ The system SHALL default knowledge to project scope, require explicit global pro
 
 - **WHEN** the user explicitly promotes accepted project knowledge to global scope
 - **THEN** the system SHALL create a global-scope version and record the promotion actor
+- **AND** the global version SHALL be available to every project's brief according to its type-specific category and relevance rules
+- **AND** the system SHALL trigger same-command projection of the originating project so the superseded project-scoped entry is removed from its managed aggregate
 
 #### Scenario: [KR-17] Task state expires
 

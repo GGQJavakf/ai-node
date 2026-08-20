@@ -117,7 +117,7 @@ Neither path can use force overwrite in the MVP. Any unexpected external edit in
 
 ### Bounded briefing
 
-`retro brief` selects active project rules, explicitly global rules, current task state, and relevant lessons. Lesson relevance is local and deterministic: Unicode normalization, CJK/Latin token overlap, fixed recency and evidence-quality weights, then stable knowledge ID tie-break. It excludes pending, rejected, conflicting, archived, and expired items, includes evidence references and health warnings, and defaults to approximately 6000 tokens estimated conservatively from UTF-8 bytes. Items are never partially truncated; rules that alone exceed the budget cause a diagnostic failure rather than silent omission.
+`retro brief` selects active project rules, explicitly global rules, current project or explicitly global task state, and relevant project or explicitly global lessons. Lesson relevance is local and deterministic: Unicode normalization, CJK/Latin token overlap, fixed recency and evidence-quality weights, then stable knowledge ID tie-break. It excludes pending, rejected, conflicting, archived, and expired items, includes evidence references and health warnings, and defaults to approximately 6000 tokens estimated conservatively from UTF-8 bytes. Items are never partially truncated; rules that alone exceed the budget cause a diagnostic failure rather than silent omission.
 
 ### Standard-library persistence and Windows-safe output
 
