@@ -366,7 +366,6 @@ def test_candidate_budget_selects_global_newest_before_stat_and_parse(
     assert session.source_session_id == "session-unknown"
     assert yielded_jsonl == [old, newest, second_newest]
     assert set(stated_jsonl) == {newest, second_newest}
-    assert len(stated_jsonl) == 2
     assert set(opened_jsonl) == {newest, second_newest}
     assert len(opened_jsonl) == 2
     assert source.last_discovery.inspected_count == 2

@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import datetime
+from unittest.mock import patch
 
 import _path  # noqa: F401
 from ai_todo_assistant.application.agent import AgentCore
@@ -58,6 +59,16 @@ def text_response(content):
     }
 
 
+class LocaleSensitiveDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 8, 20, 10, 30, tzinfo=tz)
+
+    def strftime(self, format_string):
+        format_string.encode("ascii")
+        return super().strftime(format_string)
+
+
 class TestAgentCoreValidationRetry(unittest.TestCase):
     def setUp(self):
         self.test_file = "test_agent_core_validation_todos.json"
@@ -66,6 +77,17 @@ class TestAgentCoreValidationRetry(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.test_file):
             os.remove(self.test_file)
+
+    def test_system_prompt_formats_chinese_date_without_locale_sensitive_format_string(self):
+        agent = AgentCore(self.manager, {"auth_mode": "openai_api", "api_key": "test"})
+
+        with patch(
+            "ai_todo_assistant.application.agent.core.datetime",
+            LocaleSensitiveDateTime,
+        ):
+            prompt = agent._build_system_prompt()
+
+        self.assertIn("【当前时间】2026年08月20日 10:30，周四", prompt)
 
     def test_retries_when_tool_arguments_fail_local_validation(self):
         agent = AgentCore(self.manager, {

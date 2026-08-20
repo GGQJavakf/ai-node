@@ -31,19 +31,19 @@ def demo():
     next_week = today + timedelta(days=7)
     yesterday = today - timedelta(days=1)
     
-    todo1 = manager.add(
+    manager.add(
         title="完成项目报告",
         description="准备Q1季度项目总结报告,包含数据分析和图表",
         end_time=tomorrow.strftime("%Y-%m-%d")
     )
     
-    todo2 = manager.add(
+    manager.add(
         title="团队会议",
         description="讨论下季度工作计划",
         end_time=today.strftime("%Y-%m-%d")
     )
     
-    todo3 = manager.add(
+    manager.add(
         title="代码审查",
         description="审查新功能的代码实现",
         end_time=next_week.strftime("%Y-%m-%d")
@@ -54,7 +54,7 @@ def demo():
         description="更新API文档和用户手册"
     )
     
-    todo5 = manager.add(
+    manager.add(
         title="修复Bug #123",
         description="修复登录页面的显示问题",
         end_time=yesterday.strftime("%Y-%m-%d")

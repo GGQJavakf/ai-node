@@ -7,7 +7,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
@@ -815,9 +815,19 @@ class SQLiteRetroRepository(RetroRepository):
 
     def save_candidates(self, candidates: Sequence[Candidate]) -> None:
         with self.transaction() as connection:
-            for candidate in candidates:
+            batch_started_at = _datetime(_now_text())
+            latest_created_at = connection.execute(
+                "SELECT MAX(created_at) FROM candidates"
+            ).fetchone()[0]
+            if latest_created_at is not None:
+                latest = _datetime(str(latest_created_at))
+                if batch_started_at <= latest:
+                    batch_started_at = latest + timedelta(microseconds=1)
+            for ordinal, candidate in enumerate(candidates):
                 session_id = self._candidate_session_id(connection, candidate)
-                now = _now_text()
+                now = _datetime_text(
+                    batch_started_at + timedelta(microseconds=ordinal)
+                )
                 connection.execute(
                     """INSERT INTO candidates(
                         id, session_id, knowledge_type, project_id, scope,
