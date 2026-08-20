@@ -413,6 +413,20 @@ class TestCodexThreadResume(unittest.TestCase):
             [("thread-both", "完成版本", "completed bucket entries are not resumeable")],
         )
 
+    def test_denied_thread_only_in_multiple_buckets_is_reported_once(self):
+        report = _report(
+            blocked=[{"thread_id": "thread-both", "title": "阻塞版本"}],
+            completed=[{"thread_id": "thread-both", "title": "完成版本"}],
+        )
+
+        result = CodexResumeService(self.repository, FakeResumeClient()).resume(report, dry_run=True)
+
+        self.assertEqual(result.candidates, [])
+        self.assertEqual(
+            [(skip.thread_id, skip.title, skip.reason) for skip in result.skipped],
+            [("thread-both", "完成版本", "completed bucket entries are not resumeable")],
+        )
+
     def test_client_exception_records_failed_evidence(self):
         client = RaisingResumeClient()
         report = _report(

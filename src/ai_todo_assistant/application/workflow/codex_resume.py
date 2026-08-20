@@ -270,6 +270,7 @@ class CodexResumeService:
     ) -> list[CodexResumeSkip]:
         bucket_skips: list[CodexResumeSkip] = []
         reported = {(skip.thread_id, skip.reason) for skip in skipped}
+        reported_denied = {skip.thread_id for skip in skipped if skip.thread_id in denied}
         for bucket_name in ("blocked", "completed"):
             for entry in list(getattr(report, bucket_name, []) or []):
                 if not isinstance(entry, dict):
@@ -279,8 +280,12 @@ class CodexResumeService:
                     continue
                 if entry_thread_id and entry_thread_id in denied:
                     denied_skip = denied[entry_thread_id]
-                    if (entry_thread_id, denied_skip.reason) in reported:
+                    if entry_thread_id in reported_denied:
                         continue
+                    bucket_skips.append(denied_skip)
+                    reported_denied.add(entry_thread_id)
+                    reported.add((denied_skip.thread_id, denied_skip.reason))
+                    continue
                 bucket_skip = CodexResumeSkip(
                     thread_id=entry_thread_id,
                     title=_title(entry, entry_thread_id),
