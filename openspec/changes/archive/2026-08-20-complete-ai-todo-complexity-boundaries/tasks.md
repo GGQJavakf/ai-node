@@ -26,4 +26,4 @@
 - [x] 5.1 Make the manifest and full `src/ai_todo_assistant` scan pass C901 at 15, plus Ruff, focused mypy, compileall, architecture checks, and `git diff --check` without suppressions.
 - [x] 5.2 Run the full branch-aware pytest and coverage gate, package build/Twine/isolated-wheel smoke, UTF-8/GBK command smoke, and strict validation for this change and all OpenSpec artifacts.
 - [x] 5.3 Run OCR delegate preview/rule over the exact diff and a fresh compatibility review of routing, rendering, persistence, triage precedence, resume exclusions, and skip ordering; resolve every material finding and account for exclusions.
-- [ ] 5.4 Publish responsibility-sized commits to a Draft PR with exact evidence, verify remote CI on the immutable head, then perform authorized Ready/merge and archive readback.
+- [x] 5.4 Publish responsibility-sized commits to a Draft PR with exact evidence, verify remote CI on the immutable head, then perform authorized Ready/merge and archive readback.
