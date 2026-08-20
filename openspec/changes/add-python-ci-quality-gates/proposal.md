@@ -10,7 +10,7 @@ The repository currently has no automated pull-request checks, so the locally ve
 - Build distributable artifacts, validate their metadata and contents, install the wheel into an isolated environment, and smoke both installed console commands.
 - Upload only non-sensitive distribution artifacts and keep job permissions, timeouts, concurrency, and dependency/action versions explicit.
 - Remove the four existing unused example assignments that prevent a truthful repository-wide Ruff gate.
-- Correct the reproduced cross-runtime baseline defects in Windows shim path resolution, invalid `/sync` project-path handling, and a Python-version-sensitive candidate-budget assertion without weakening their intended safety guarantees.
+- Correct the reproduced cross-runtime baseline defects in Windows shim path resolution, invalid `/sync` project-path handling, Python-version-sensitive candidate-budget assertions, and localized timestamp formatting without weakening their intended safety guarantees.
 
 ## Capabilities
 
