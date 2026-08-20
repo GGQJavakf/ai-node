@@ -209,6 +209,33 @@ class CodexResumeService:
                 )
             ]
 
+        candidates, skipped = self._select_unfinished_entries(
+            report,
+            target,
+            denied,
+            exclusions,
+        )
+        skipped.extend(
+            self._select_bucket_skips(
+                report,
+                target,
+                denied,
+                skipped,
+            )
+        )
+        if target and not candidates and not skipped:
+            skipped.append(CodexResumeSkip(thread_id=target, title=target, reason="thread not found in latest report"))
+        return candidates, skipped
+
+    def _select_unfinished_entries(
+        self,
+        report,
+        target: str,
+        denied: dict[str, CodexResumeSkip],
+        exclusions: dict[str, CodexResumeExclusion],
+    ) -> tuple[list[CodexResumeCandidate], list[CodexResumeSkip]]:
+        candidates: list[CodexResumeCandidate] = []
+        skipped: list[CodexResumeSkip] = []
         for entry in list(getattr(report, "unfinished", []) or []):
             if not isinstance(entry, dict):
                 continue
@@ -232,7 +259,18 @@ class CodexResumeService:
                 candidates.append(candidate)
             elif skip:
                 skipped.append(skip)
+        return candidates, skipped
 
+    def _select_bucket_skips(
+        self,
+        report,
+        target: str,
+        denied: dict[str, CodexResumeSkip],
+        skipped: list[CodexResumeSkip],
+    ) -> list[CodexResumeSkip]:
+        bucket_skips: list[CodexResumeSkip] = []
+        reported = {(skip.thread_id, skip.reason) for skip in skipped}
+        reported_denied = {skip.thread_id for skip in skipped if skip.thread_id in denied}
         for bucket_name in ("blocked", "completed"):
             for entry in list(getattr(report, bucket_name, []) or []):
                 if not isinstance(entry, dict):
@@ -241,23 +279,21 @@ class CodexResumeService:
                 if target and entry_thread_id != target:
                     continue
                 if entry_thread_id and entry_thread_id in denied:
-                    already_reported = any(
-                        skip.thread_id == entry_thread_id and skip.reason == denied[entry_thread_id].reason
-                        for skip in skipped
-                    )
-                    if already_reported:
+                    denied_skip = denied[entry_thread_id]
+                    if entry_thread_id in reported_denied:
                         continue
-                skipped.append(
-                    CodexResumeSkip(
-                        thread_id=entry_thread_id,
-                        title=_title(entry, entry_thread_id),
-                        reason=f"{bucket_name} bucket entries are not resumeable",
-                    )
+                    bucket_skips.append(denied_skip)
+                    reported_denied.add(entry_thread_id)
+                    reported.add((denied_skip.thread_id, denied_skip.reason))
+                    continue
+                bucket_skip = CodexResumeSkip(
+                    thread_id=entry_thread_id,
+                    title=_title(entry, entry_thread_id),
+                    reason=f"{bucket_name} bucket entries are not resumeable",
                 )
-
-        if target and not candidates and not skipped:
-            skipped.append(CodexResumeSkip(thread_id=target, title=target, reason="thread not found in latest report"))
-        return candidates, skipped
+                bucket_skips.append(bucket_skip)
+                reported.add((bucket_skip.thread_id, bucket_skip.reason))
+        return bucket_skips
 
     def _manual_exclusions(self) -> tuple[dict[str, CodexResumeExclusion], str]:
         if not self.exclusion_store:

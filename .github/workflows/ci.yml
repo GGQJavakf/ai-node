@@ -47,6 +47,9 @@ jobs:
       - name: Check AgentRetro complexity boundaries
         run: python scripts/check_agentretro_complexity.py
 
+      - name: Check ai-todo complexity boundaries
+        run: python scripts/check_ai_todo_complexity.py
+
       - name: Compile source modules
         run: python -m compileall -q src
 

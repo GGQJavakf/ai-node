@@ -70,6 +70,45 @@ from ai_todo_assistant.infrastructure.config import load_settings
 PROMPT_TEXT = "TodoAgent"
 PROMPT_ANSI = "\033[36mTodoAgent\033[90m > \033[0m"
 
+_SLASH_COMMAND_ROUTES = {
+    "/list": ("_handle_list_command", "pair"),
+    "/today": ("_handle_today_command", "none"),
+    "/plan": ("_handle_plan_command", "subcmd"),
+    "/add": ("_handle_add_command", "pair"),
+    "/search": ("_handle_search_command", "joined"),
+    "/toggle": ("_handle_toggle_command", "subcmd"),
+    "/update": ("_handle_update_command", "pair"),
+    "/delete": ("_handle_delete_command", "subcmd"),
+    "/stats": ("_handle_stats_command", "none"),
+    "/clear": ("_handle_clear_command", "none"),
+    "/preferences": ("_handle_preferences_command", "none"),
+    "/remember": ("_handle_remember_command", "pair"),
+    "/forget": ("_handle_forget_command", "subcmd"),
+    "/codex": ("_handle_codex_command", "pair"),
+    "/r": ("_handle_resume_shortcut", "pair"),
+    "/resume": ("_handle_resume_shortcut", "pair"),
+    "/work": ("_handle_work_command", "pair"),
+    "/sync": ("_handle_sync_command", "pair"),
+    "/system": ("_handle_system_command", "pair"),
+    "/next": ("_handle_continue_command", "none"),
+    "/continue": ("_handle_continue_command", "none"),
+    "/start": ("_handle_start_command", "subcmd"),
+    "/review": ("_handle_review_command", "subcmd"),
+    "/help": ("_handle_help_command", "subcmd"),
+    "/history": ("_handle_history_command", "none"),
+}
+
+_WORK_COMMAND_HANDLERS = {
+    "add": "_handle_work_add",
+    "status": "_handle_work_status",
+    "conflicts": "_handle_work_conflicts",
+    "show": "_handle_work_show",
+    "rollback": "_handle_work_rollback",
+    "import": "_handle_work_import",
+    "split": "_handle_work_split",
+    "evidence": "_handle_work_evidence",
+}
+
 
 # ─────────────────────────────────────────────────────────────────
 # 【学习重点：终端颜色配置】
@@ -288,58 +327,23 @@ class TodoCLI:
         subcmd = parts[1] if len(parts) > 1 else ""
         args = parts[2] if len(parts) > 2 else ""
 
-        if cmd == "/list":
-            return self._handle_list_command(subcmd, args)
-        elif cmd == "/today":
-            return self._handle_today_command()
-        elif cmd == "/plan":
-            return self._handle_plan_command(subcmd)
-        elif cmd == "/add":
-            return self._handle_add_command(subcmd, args)
-        elif cmd == "/search":
-            return self._handle_search_command(" ".join(part for part in [subcmd, args] if part).strip())
-        elif cmd == "/toggle":
-            return self._handle_toggle_command(subcmd)
-        elif cmd == "/update":
-            return self._handle_update_command(subcmd, args)
-        elif cmd == "/delete":
-            return self._handle_delete_command(subcmd)
-        elif cmd == "/stats":
-            return self._handle_stats_command()
-        elif cmd == "/clear":
-            return self._handle_clear_command()
-        elif cmd == "/preferences":
-            return self._handle_preferences_command()
-        elif cmd == "/remember":
-            return self._handle_remember_command(subcmd, args)
-        elif cmd == "/forget":
-            return self._handle_forget_command(subcmd)
-        elif cmd == "/codex":
-            return self._handle_codex_command(subcmd, args)
-        elif cmd in {"/r", "/resume"}:
-            return self._handle_resume_shortcut(subcmd, args)
-        elif cmd == "/work":
-            return self._handle_work_command(subcmd, args)
-        elif cmd == "/sync":
-            return self._handle_sync_command(subcmd, args)
-        elif cmd == "/system":
-            return self._handle_system_command(subcmd, args)
-        elif cmd == "/next":
-            return self._handle_continue_command()
-        elif cmd == "/continue":
-            return self._handle_continue_command()
-        elif cmd == "/start":
-            return self._handle_start_command(subcmd)
-        elif cmd == "/review":
-            return self._handle_review_command(subcmd)
-        elif cmd == "/help":
-            return self._handle_help_command(subcmd)
-        elif cmd == "/exit" or cmd == "/quit":
+        if cmd in {"/exit", "/quit"}:
             return "exit"
-        elif cmd == "/history":
-            return self._handle_history_command()
-        else:
+        route = self._slash_handler_name(cmd)
+        if route is None:
             return f"未知命令: {cmd}"
+        handler_name, argument_mode = route
+        handler = getattr(self, handler_name)
+        if argument_mode == "none":
+            return handler()
+        if argument_mode == "subcmd":
+            return handler(subcmd)
+        if argument_mode == "joined":
+            return handler(" ".join(part for part in [subcmd, args] if part).strip())
+        return handler(subcmd, args)
+
+    def _slash_handler_name(self, cmd):
+        return _SLASH_COMMAND_ROUTES.get(cmd)
 
     def _handle_list_command(self, subcmd="", args=""):
         """处理 /list 命令，支持多种过滤条件"""
@@ -347,48 +351,36 @@ class TodoCLI:
         source_filter = _parse_source_filter(raw_args)
         if subcmd == "--source":
             subcmd = ""
-        # 根据子命令决定筛选条件
         if subcmd == "":
             return self._handle_daily_triage_list(source_filter)
-        elif subcmd == "today":
-            todos = self.manager.get_today()
-            title = "📅 今天的待办事项"
-        elif subcmd == "week":
-            todos = self.manager.get_this_week()
-            title = "📆 本周的待办事项"
-        elif subcmd == "month":
-            todos = self.manager.get_this_month()
-            title = "📋 本月的待办事项"
-        elif subcmd == "pending":
-            todos = self.manager.get_by_status(False)
-            title = "🔘 未完成任务"
-        elif subcmd == "completed":
-            todos = self.manager.get_by_status(True)
-            title = "✅ 已完成任务"
-        elif subcmd == "all":
-            todos = self.manager.get_all()
-            title = "📋 所有任务"
-        elif subcmd == "overdue":
-            todos = self.manager.get_overdue()
-            title = "🔴 已过期的待办事项"
-        elif subcmd == "upcoming":
-            todos = self.manager.get_upcoming()
-            title = "🟠 即将到期的待办事项"
-        elif subcmd in {"high", "medium", "low"}:
-            todos = self.manager.get_by_priority(subcmd)
-            priority_name = {"high": "高", "medium": "中", "low": "低"}[subcmd]
-            title = f"{self._get_priority_marker(subcmd)} {priority_name}优先级待办事项"
-        else:
-            todos = self.manager.get_all()
-            title = "📋 统一任务视图"
-
+        todos, title = self._select_list_todos(subcmd)
         if source_filter and source_filter != "todo":
             todos = []
         work_items = self._work_items_for_list(subcmd, source_filter)
         if not todos and not work_items:
             return f"{title}\n\n  暂无任务"
 
-        # 使用 Rich Table 显示
+        return self._render_list_table(title, self._build_list_rows(todos, work_items))
+
+    def _select_list_todos(self, subcmd):
+        selectors = {
+            "today": ("get_today", (), "📅 今天的待办事项"),
+            "week": ("get_this_week", (), "📆 本周的待办事项"),
+            "month": ("get_this_month", (), "📋 本月的待办事项"),
+            "pending": ("get_by_status", (False,), "🔘 未完成任务"),
+            "completed": ("get_by_status", (True,), "✅ 已完成任务"),
+            "all": ("get_all", (), "📋 所有任务"),
+            "overdue": ("get_overdue", (), "🔴 已过期的待办事项"),
+            "upcoming": ("get_upcoming", (), "🟠 即将到期的待办事项"),
+        }
+        if subcmd in {"high", "medium", "low"}:
+            priority_name = {"high": "高", "medium": "中", "low": "低"}[subcmd]
+            title = f"{self._get_priority_marker(subcmd)} {priority_name}优先级待办事项"
+            return self.manager.get_by_priority(subcmd), title
+        method_name, arguments, title = selectors.get(subcmd, ("get_all", (), "📋 统一任务视图"))
+        return getattr(self.manager, method_name)(*arguments), title
+
+    def _build_list_rows(self, todos, work_items):
         rows = []
         for index, todo in enumerate(todos):
             rows.append(
@@ -415,9 +407,10 @@ class TodoCLI:
                     "next": item.next_action or item.sync_summary or "-",
                 }
             )
-
         rows.sort(key=lambda row: (_list_category_rank(row["category"]), row["order"]))
+        return rows
 
+    def _render_list_table(self, title, rows):
         table = Table(title=title, show_lines=True)
         table.add_column("ID", style="dim", width=8)
         table.add_column("分类", width=10)
@@ -435,7 +428,6 @@ class TodoCLI:
                 row["status"],
                 row["next"],
             )
-
         return table
 
     def _handle_daily_triage_list(self, source_filter=""):
@@ -921,53 +913,67 @@ class TodoCLI:
     def _handle_work_command(self, subcmd, args):
         repo = self._workflow_repo()
         service = WorkItemService(repo)
-        if subcmd == "add":
-            title = args.strip()
-            if not title:
-                return "用法: /work add <title>"
-            item = service.create_manual(title, project_path=os.getcwd())
-            return f"已创建工作项: {item.title} ID:{item.id}"
-        if subcmd == "status":
-            return service.status_summary()
-        if subcmd == "conflicts":
-            return service.conflict_summary()
-        if subcmd == "show":
-            work_item_id = args.strip()
-            if not work_item_id:
-                return "用法: /work show <work-id>"
-            return self._show_work_item(work_item_id)
-        if subcmd == "rollback":
-            parts = args.split()
-            if len(parts) < 2:
-                return "用法: /work rollback <work-id> <audit-id>"
-            try:
-                item = service.rollback_merge(parts[0], parts[1])
-            except ValueError as exc:
-                return str(exc)
-            return f"已回滚合并: {item.title} | {item.source}:{item.source_ref} ID:{item.id}"
-        if subcmd == "import":
-            parts = args.split()
-            if len(parts) >= 2 and parts[0] == "redmine":
-                try:
-                    item = WorkflowSyncService(repo).import_redmine(os.getcwd(), parts[1])
-                except RuntimeError as exc:
-                    return f"Redmine 工作项导入失败: {exc}"
-                return f"已导入 Redmine 工作项: {item.title} ID:{item.id}"
+        handler_name = self._work_handler_name(subcmd)
+        if handler_name is None:
+            return "用法: /work [add|import|split|rollback|show|status|evidence]"
+        return getattr(self, handler_name)(service, repo, args)
+
+    def _work_handler_name(self, subcmd):
+        return _WORK_COMMAND_HANDLERS.get(subcmd)
+
+    def _handle_work_add(self, service, _repo, args):
+        title = args.strip()
+        if not title:
+            return "用法: /work add <title>"
+        item = service.create_manual(title, project_path=os.getcwd())
+        return f"已创建工作项: {item.title} ID:{item.id}"
+
+    def _handle_work_status(self, service, _repo, _args):
+        return service.status_summary()
+
+    def _handle_work_conflicts(self, service, _repo, _args):
+        return service.conflict_summary()
+
+    def _handle_work_show(self, _service, _repo, args):
+        work_item_id = args.strip()
+        if not work_item_id:
+            return "用法: /work show <work-id>"
+        return self._show_work_item(work_item_id)
+
+    def _handle_work_rollback(self, service, _repo, args):
+        parts = args.split()
+        if len(parts) < 2:
+            return "用法: /work rollback <work-id> <audit-id>"
+        try:
+            item = service.rollback_merge(parts[0], parts[1])
+        except ValueError as exc:
+            return str(exc)
+        return f"已回滚合并: {item.title} | {item.source}:{item.source_ref} ID:{item.id}"
+
+    def _handle_work_import(self, _service, repo, args):
+        parts = args.split()
+        if len(parts) < 2 or parts[0] != "redmine":
             return "用法: /work import redmine <id>"
-        if subcmd == "split":
-            parts = args.split(" ", 3)
-            if len(parts) < 3:
-                return "用法: /work split <work-id> <source> <source-ref> [title]"
-            work_item_id, source, source_ref = parts[0], parts[1], parts[2]
-            title = parts[3] if len(parts) > 3 else ""
-            try:
-                item = service.split_source_ref(work_item_id, source, source_ref, title=title)
-            except ValueError as exc:
-                return str(exc)
-            return f"已拆分工作项: {item.title} | {item.source}:{item.source_ref} ID:{item.id}"
-        if subcmd == "evidence":
-            return self._handle_work_evidence_command(args)
-        return "用法: /work [add|import|split|rollback|show|status|evidence]"
+        try:
+            item = WorkflowSyncService(repo).import_redmine(os.getcwd(), parts[1])
+        except RuntimeError as exc:
+            return f"Redmine 工作项导入失败: {exc}"
+        return f"已导入 Redmine 工作项: {item.title} ID:{item.id}"
+
+    def _handle_work_split(self, service, _repo, args):
+        parts = args.split(" ", 3)
+        if len(parts) < 3:
+            return "用法: /work split <work-id> <source> <source-ref> [title]"
+        work_item_id, source, source_ref = parts[0], parts[1], parts[2]
+        title = parts[3] if len(parts) > 3 else ""
+        try:
+            item = service.split_source_ref(work_item_id, source, source_ref, title=title)
+        except ValueError as exc:
+            return str(exc)
+        return f"已拆分工作项: {item.title} | {item.source}:{item.source_ref} ID:{item.id}"
+
+    def _handle_work_evidence(self, _service, _repo, args):
+        return self._handle_work_evidence_command(args)
 
     def _handle_work_evidence_command(self, args):
         parts = args.split(" ", 2)
@@ -1696,12 +1702,28 @@ def _work_item_triage_reason(item, evidence=None):
     text = _work_item_context_text(item, evidence)
     if item.merge_conflicts:
         return "merge conflict needs manual resolution"
-    if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "redmine"):
+    blocked_reason = _work_item_blocked_reason(item, text)
+    if blocked_reason:
+        return blocked_reason
+    closeout_reason = _work_item_closeout_reason(text)
+    if closeout_reason:
+        return closeout_reason
+    return _work_item_activity_reason(item, text)
+
+
+def _work_item_blocked_reason(item, text):
+    if item.status != WorkItemStatus.BLOCKED.value:
+        return ""
+    if _mentions(text, "redmine"):
         return "blocked by Redmine"
-    if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "mr", "gitlab", "merge_request"):
+    if _mentions(text, "mr", "gitlab", "merge_request"):
         return "blocked by MR"
-    if item.status == WorkItemStatus.BLOCKED.value and _mentions(text, "openspec"):
+    if _mentions(text, "openspec"):
         return "blocked by OpenSpec"
+    return ""
+
+
+def _work_item_closeout_reason(text):
     if _mentions(text, "mr merged but redmine not closed", "mr merged redmine not closed"):
         return "MR merged but Redmine not closed"
     if (
@@ -1734,11 +1756,17 @@ def _work_item_triage_reason(item, evidence=None):
         return "Redmine closeout missing"
     if _mentions(text, "openspec") and _mentions(text, "archive", "validate", "tasks", "closeout", "missing"):
         return "OpenSpec closeout missing"
+    return ""
+
+
+def _work_item_activity_reason(item, text):
     if _mentions(text, "validation", "validate", "verify", "test", "unittest", "review", "acceptance"):
         return "needs validation"
-    if item.source == "codex" or any(identity.startswith("codex-thread:") for identity in item.source_identities):
-        if item.status == WorkItemStatus.ACTIVE.value:
-            return "Codex thread still active"
+    is_codex = item.source == "codex" or any(
+        identity.startswith("codex-thread:") for identity in item.source_identities
+    )
+    if is_codex and item.status == WorkItemStatus.ACTIVE.value:
+        return "Codex thread still active"
     if _is_work_item_stale_today(item):
         return "sync stale"
     return "blocked" if item.status == WorkItemStatus.BLOCKED.value else "needs action"

@@ -56,6 +56,43 @@ class TestWorkflowServicesAndCli(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_work_command_usage_errors_remain_exact_and_write_nothing(self):
+        before = self.repository.list_work_items(include_closed=True)
+
+        results = [
+            self.cli._handle_slash_command("/work"),
+            self.cli._handle_slash_command("/work add"),
+            self.cli._handle_slash_command("/work show"),
+            self.cli._handle_slash_command("/work rollback only-one-id"),
+            self.cli._handle_slash_command("/work import git issue-1"),
+            self.cli._handle_slash_command("/work split only-two fields"),
+        ]
+
+        self.assertEqual(
+            results,
+            [
+                "用法: /work [add|import|split|rollback|show|status|evidence]",
+                "用法: /work add <title>",
+                "用法: /work show <work-id>",
+                "用法: /work rollback <work-id> <audit-id>",
+                "用法: /work import redmine <id>",
+                "用法: /work split <work-id> <source> <source-ref> [title]",
+            ],
+        )
+        self.assertEqual(self.repository.list_work_items(include_closed=True), before)
+
+    def test_list_source_filter_keeps_todo_and_work_item_views_separate(self):
+        self.cli._handle_slash_command("/add 本地待办")
+        self.cli._handle_slash_command("/work add 手工工作项")
+
+        todo_only = _render_table(self.cli._handle_slash_command("/list all --source todo"))
+        work_only = _render_table(self.cli._handle_slash_command("/list all --source manual"))
+
+        self.assertIn("本地待办", todo_only)
+        self.assertNotIn("手工工作项", todo_only)
+        self.assertIn("手工工作项", work_only)
+        self.assertNotIn("本地待办", work_only)
+
     def test_cli_can_create_status_and_record_evidence(self):
         created = self.cli._handle_slash_command("/work add 实现工作助手")
         work_id = created.split("ID:")[1]
