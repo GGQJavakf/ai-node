@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import difflib
 import hashlib
 import json
@@ -12,6 +11,21 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Mapping, Sequence
 
+from agent_retro.application._merge_operations import (
+    ReconciliationInputs,
+    all_plan_paths,
+    changed_managed_entry,
+    decode_bytes,
+    deserialize_merge_plan,
+    diagnostic_reason,
+    encode_bytes,
+    json_text,
+    parse_reconciliation_payload,
+    reconciliation_inputs,
+    required_operation_ids,
+    serialize_merge_plan,
+    vault_candidate_id,
+)
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.purge import require_no_active_purge
 from agent_retro.application.sync import ProjectionPersistenceError, SyncService
@@ -517,107 +531,108 @@ class MergeService:
     ) -> ReconciliationResult:
         if actor != "user":
             raise ValueError("reconciliation_actor_must_be_user")
-        for diagnostic in (
-            "managed_snapshot_unavailable",
-            "managed_snapshot_invalid",
-            "managed_snapshot_sensitive",
-            "managed_boundary_invalid",
-        ):
-            if conflict_id.startswith(f"reconcile-diagnostic-{diagnostic}-"):
-                raise ValueError(diagnostic)
+        diagnostic = diagnostic_reason(conflict_id)
+        if diagnostic:
+            raise ValueError(diagnostic)
         job = self._get_job(conflict_id)
         if job is None:
             raise KeyError("reconciliation_conflict_not_found")
         try:
-            payload = json.loads(job.plan_json)
-        except (json.JSONDecodeError, TypeError) as exc:
+            payload = parse_reconciliation_payload(job.plan_json, conflict_id)
+        except ValueError as exc:
             raise MergeIntegrityError("reconciliation_plan_invalid") from exc
-        if (
-            not isinstance(payload, dict)
-            or payload.get("kind") != "reconciliation"
-            or payload.get("id") != conflict_id
-            or _json(payload) != job.plan_json
-        ):
-            raise MergeIntegrityError("reconciliation_plan_invalid")
         project_id = str(payload["project_id"])
         require_no_active_purge(self.repository, project_id=project_id)
-        relative = self._safe_relative(project_id, Path(payload["path"]))
-        target = self.vault_root / relative
-        vault_owned_bytes = _unb64(payload["vault_base64"])
-        database_bytes = _unb64(payload["database_base64"])
-        snapshot_kind = str(payload["snapshot_kind"])
-        vault_full_hash = str(payload["vault_full_hash"])
-        vault_owned_hash = str(payload["vault_owned_hash"])
+        inputs = reconciliation_inputs(
+            payload, safe_relative=self._safe_relative, vault_root=self.vault_root
+        )
         if (
             _reconciliation_id(
-                project_id,
-                relative,
-                str(payload["recorded_hash"]),
-                str(payload["vault_hash"]),
-                str(payload["authority_hash"]),
-                database_bytes,
-                snapshot_kind,
-                vault_full_hash,
-                vault_owned_hash,
+                inputs.project_id,
+                inputs.relative,
+                inputs.recorded_hash,
+                inputs.vault_hash,
+                inputs.authority_hash,
+                inputs.database_bytes,
+                inputs.snapshot_kind,
+                inputs.vault_full_hash,
+                inputs.vault_owned_hash,
             )
             != conflict_id
         ):
             raise MergeIntegrityError("reconciliation_plan_integrity_mismatch")
+        current_full = self._validate_reconciliation_state(inputs)
+        return self._apply_reconciliation_action(
+            conflict_id, action, inputs, current_full
+        )
+
+    def _validate_reconciliation_state(self, inputs: ReconciliationInputs) -> bytes:
         if projection_input_hash(
-            self.repository.list_project_knowledge(project_id)
-        ) != str(payload["authority_hash"]):
+            self.repository.list_project_knowledge(inputs.project_id)
+        ) != inputs.authority_hash:
             raise StalePlanError("reconciliation_authority_changed")
-        if not target.is_file():
+        if not inputs.target.is_file():
             raise StalePlanError("reconciliation_target_changed")
-        current_full = target.read_bytes()
+        current_full = inputs.target.read_bytes()
         try:
             current_owned = (
                 managed_block_bytes(current_full)
-                if snapshot_kind == "managed_block"
+                if inputs.snapshot_kind == "managed_block"
                 else current_full
             )
         except BoundaryError as exc:
             raise StalePlanError("reconciliation_target_changed") from exc
         if (
-            sha256_bytes(current_owned) != vault_owned_hash
-            or sha256_bytes(current_full) != vault_full_hash
+            sha256_bytes(current_owned) != inputs.vault_owned_hash
+            or sha256_bytes(current_full) != inputs.vault_full_hash
         ):
             raise StalePlanError("reconciliation_target_changed")
+        return current_full
+
+    def _apply_reconciliation_action(
+        self,
+        conflict_id: str,
+        action: str,
+        inputs: ReconciliationInputs,
+        current_full: bytes,
+    ) -> ReconciliationResult:
         if action == "manual_edit":
             self.repository.finish_sync(conflict_id, "awaiting_user_input")
             return ReconciliationResult(conflict_id, "awaiting_user_input")
         if action == "keep_database":
             replacement = (
-                replace_managed_block_bytes(current_full, project_id, database_bytes)
-                if snapshot_kind == "managed_block"
-                else database_bytes
+                replace_managed_block_bytes(
+                    current_full, inputs.project_id, inputs.database_bytes
+                )
+                if inputs.snapshot_kind == "managed_block"
+                else inputs.database_bytes
             )
-            plan = self.create_plan(project_id, replacements={relative: replacement})
+            plan = self.create_plan(
+                inputs.project_id, replacements={inputs.relative: replacement}
+            )
             return ReconciliationResult(
                 conflict_id, "preview_required", plan_id=plan.id
             )
         if action != "adopt_vault":
             raise ValueError("unsupported_reconciliation_action")
-        if snapshot_kind != "full" or relative.name not in {
+        return self._adopt_reconciliation_vault(conflict_id, inputs)
+
+    def _adopt_reconciliation_vault(
+        self, conflict_id: str, inputs: ReconciliationInputs
+    ) -> ReconciliationResult:
+        if inputs.snapshot_kind != "full" or inputs.relative.name not in {
             "规则.md",
             "经验.md",
             "任务状态.md",
         }:
             raise ValueError("vault_adoption_unsupported_target")
-        database_entries = parse_aggregate_entries(database_bytes)
-        vault_entries = parse_aggregate_entries(vault_owned_bytes)
-        changed = [
-            identifier
-            for identifier in sorted(set(database_entries) | set(vault_entries))
-            if database_entries.get(identifier) != vault_entries.get(identifier)
-        ]
-        if len(changed) != 1 or changed[0] not in vault_entries:
-            raise ValueError("vault_edit_requires_one_changed_managed_entry")
-        identifier = changed[0]
-        kind = _kind_from_name(relative.name)
+        database_entries = parse_aggregate_entries(inputs.database_bytes)
+        vault_entries = parse_aggregate_entries(inputs.vault_owned_bytes)
+        identifier = changed_managed_entry(database_entries, vault_entries)
+        kind = _kind_from_name(inputs.relative.name)
         active_by_id = {
             item.id: item
-            for item in self.repository.list_project_knowledge(project_id)
+            for item in self.repository.list_project_knowledge(inputs.project_id)
             if item.status == "active"
         }
         original = active_by_id.get(identifier)
@@ -627,19 +642,13 @@ class MergeService:
             or original.text != database_entries.get(identifier)
         ):
             raise StalePlanError("vault_adoption_identity_changed")
-        identity = [
-            conflict_id,
-            identifier,
-            sha256_bytes(vault_entries[identifier].encode("utf-8")),
-        ]
-        candidate_id = (
-            "candidate-vault-"
-            + hashlib.sha256(_json(identity).encode("utf-8")).hexdigest()[:24]
+        candidate_id = vault_candidate_id(
+            conflict_id, identifier, vault_entries[identifier]
         )
         candidate = Candidate(
             id=candidate_id,
             knowledge_type=kind,
-            project_id=project_id,
+            project_id=inputs.project_id,
             scope="project",
             proposed_text=vault_entries[identifier],
             evidence_ids=(),
@@ -648,19 +657,19 @@ class MergeService:
         )
         self.repository.save_manual_edit_candidate(
             candidate,
-            relative_path=relative,
-            content_hash=vault_full_hash,
+            relative_path=inputs.relative,
+            content_hash=inputs.vault_full_hash,
             adoption=VaultAdoption(
                 candidate_id=candidate.id,
-                project_id=project_id,
+                project_id=inputs.project_id,
                 knowledge_id=original.id,
                 original_version=original.version,
                 original_text_hash=sha256_bytes(original.text.encode("utf-8")),
-                relative_path=relative,
-                vault_managed_hash=vault_owned_hash,
-                vault_full_hash=vault_full_hash,
-                authority_hash=str(payload["authority_hash"]),
-                blocker=str(payload.get("sensitive_blocker", "")),
+                relative_path=inputs.relative,
+                vault_managed_hash=inputs.vault_owned_hash,
+                vault_full_hash=inputs.vault_full_hash,
+                authority_hash=inputs.authority_hash,
+                blocker=inputs.sensitive_blocker,
             ),
         )
         self.repository.finish_sync(conflict_id, "pending_review")
@@ -971,128 +980,26 @@ def _diagnostic_id(project_id: str, relative: Path, status: str) -> str:
 
 
 def _all_plan_paths(plan: MergePlan) -> tuple[Path, ...]:
-    values = [target.path for target in plan.targets]
-    values.extend(item.path for item in plan.deletes)
-    for item in plan.renames:
-        values.extend((item.source, item.target))
-    return tuple(values)
+    return all_plan_paths(plan)
 
 
 def _plan_json(plan: MergePlan) -> str:
-    return _json(
-        {
-            "id": plan.id,
-            "kind": "merge",
-            "project_id": plan.project_id,
-            "authority_hash": plan.authority_hash,
-            "targets": [
-                {
-                    "path": item.path.as_posix(),
-                    "path_identity": item.path_identity,
-                    "input_exists": item.input_exists,
-                    "input_kind": item.input_kind,
-                    "input_hash": item.input_hash,
-                    "output_base64": _b64(item.output_bytes),
-                    "unified_diff": item.unified_diff,
-                }
-                for item in plan.targets
-            ],
-            "deletes": [
-                {
-                    "operation_id": item.operation_id,
-                    "path": item.path.as_posix(),
-                    "path_identity": item.path_identity,
-                    "input_exists": item.input_exists,
-                    "input_kind": item.input_kind,
-                    "input_hash": item.input_hash,
-                }
-                for item in plan.deletes
-            ],
-            "renames": [
-                {
-                    "operation_id": item.operation_id,
-                    "source": item.source.as_posix(),
-                    "target": item.target.as_posix(),
-                    "source_identity": item.source_identity,
-                    "target_identity": item.target_identity,
-                    "source_exists": item.source_exists,
-                    "source_kind": item.source_kind,
-                    "target_exists": item.target_exists,
-                    "target_kind": item.target_kind,
-                    "source_hash": item.source_hash,
-                    "target_hash": item.target_hash,
-                }
-                for item in plan.renames
-            ],
-            "conflicts": [
-                {
-                    "operation_id": item.operation_id,
-                    "description": item.description,
-                }
-                for item in plan.conflicts
-            ],
-        }
-    )
+    return serialize_merge_plan(plan)
 
 
 def _plan_from_data(data: object) -> MergePlan:
-    if not isinstance(data, dict) or data.get("kind") != "merge":
-        raise ValueError("not a merge plan")
-    return MergePlan(
-        id=str(data["id"]),
-        project_id=str(data["project_id"]),
-        authority_hash=str(data["authority_hash"]),
-        targets=tuple(
-            MergeTarget(
-                Path(item["path"]),
-                str(item["path_identity"]),
-                bool(item["input_exists"]),
-                str(item["input_kind"]),
-                str(item["input_hash"]),
-                _unb64(item["output_base64"]),
-                str(item["unified_diff"]),
-            )
-            for item in data["targets"]
-        ),
-        deletes=tuple(
-            MergeDelete(
-                str(item["operation_id"]),
-                Path(item["path"]),
-                str(item["path_identity"]),
-                bool(item["input_exists"]),
-                str(item["input_kind"]),
-                str(item["input_hash"]),
-            )
-            for item in data["deletes"]
-        ),
-        renames=tuple(
-            MergeRename(
-                str(item["operation_id"]),
-                Path(item["source"]),
-                Path(item["target"]),
-                str(item["source_identity"]),
-                str(item["target_identity"]),
-                bool(item["source_exists"]),
-                str(item["source_kind"]),
-                bool(item["target_exists"]),
-                str(item["target_kind"]),
-                str(item["source_hash"]),
-                str(item["target_hash"]),
-            )
-            for item in data["renames"]
-        ),
-        conflicts=tuple(
-            MergeConflict(str(item["operation_id"]), str(item["description"]))
-            for item in data["conflicts"]
-        ),
+    return deserialize_merge_plan(
+        data,
+        plan_factory=MergePlan,
+        target_factory=MergeTarget,
+        delete_factory=MergeDelete,
+        rename_factory=MergeRename,
+        conflict_factory=MergeConflict,
     )
 
 
 def required_merge_operation_ids(plan: MergePlan) -> frozenset[str]:
-    required = {item.operation_id for item in plan.deletes}
-    required.update(item.operation_id for item in plan.renames)
-    required.update(item.operation_id for item in plan.conflicts)
-    return frozenset(required)
+    return required_operation_ids(plan)
 
 
 def load_persisted_merge_plan(job: SyncJob, plan_id: str) -> MergePlan:
@@ -1165,19 +1072,12 @@ def load_persisted_merge_plan(job: SyncJob, plan_id: str) -> MergePlan:
 
 
 def _json(value: object) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return json_text(value)
 
 
 def _b64(value: bytes) -> str:
-    return base64.b64encode(value).decode("ascii")
+    return encode_bytes(value)
 
 
 def _unb64(value: object) -> bytes:
-    if not isinstance(value, str):
-        raise ValueError("invalid base64 value")
-    return base64.b64decode(value.encode("ascii"), validate=True)
+    return decode_bytes(value)
