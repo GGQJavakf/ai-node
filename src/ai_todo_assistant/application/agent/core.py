@@ -73,10 +73,14 @@ class AgentCore:
             preference_summary = "\n".join(f"  - {key}: {value}" for key, value in preferences.items())
         else:
             preference_summary = "  （暂无长期偏好）"
+        current_time = (
+            f"{now.year:04d}年{now.month:02d}月{now.day:02d}日 "
+            f"{now.hour:02d}:{now.minute:02d}"
+        )
 
         return f"""你是一个智能、得力的 AI 待办管家助手。
 
-【当前时间】{now.strftime("%Y年%m月%d日 %H:%M")}，{weekday_str}
+【当前时间】{current_time}，{weekday_str}
 【当前待办事项】
 {todo_summary}
 【长期偏好】

@@ -1,5 +1,5 @@
 import sqlite3
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import get_type_hints
@@ -114,6 +114,28 @@ def _repository_with_candidate(tmp_path):
     repo.save_capture(_session(), [_evidence()])
     repo.save_candidates([_candidate()])
     return repo
+
+
+def test_candidate_creation_order_survives_a_non_advancing_clock(tmp_path, monkeypatch):
+    repo = SQLiteRetroRepository(tmp_path / "retro.db", tmp_path / "backups")
+    repo.migrate()
+    repo.save_capture(_session(), [_evidence()])
+    monkeypatch.setattr(
+        sqlite_repository_module,
+        "_now_text",
+        lambda: NOW.isoformat(),
+    )
+    first = replace(_candidate(), id="candidate-z", proposed_text="First")
+    second = replace(_candidate(), id="candidate-m", proposed_text="Second")
+    third = replace(_candidate(), id="candidate-a", proposed_text="Third")
+
+    repo.save_candidates([first, second])
+    repo.save_candidates([third])
+
+    assert [
+        candidate.id
+        for candidate in repo.list_candidates(CandidateStatus.PENDING_REVIEW)
+    ] == ["candidate-z", "candidate-m", "candidate-a"]
 
 
 def test_domain_contracts_are_not_polluted_by_sqlite_columns():

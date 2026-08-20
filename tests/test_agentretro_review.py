@@ -1325,8 +1325,12 @@ def test_pending_review_wraps_finish_failure_with_exact_candidate_ids(
 
 
 def test_retry_session_only_calls_model_for_pending_model_dependent_candidates(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
+    monkeypatch.setattr(
+        "agent_retro.infrastructure.sqlite_repository._now_text",
+        lambda: NOW.isoformat(),
+    )
     repository, _ = _repository_with_evidence(tmp_path)
     low = replace(_review(), confidence=0.969)
     reviewer = _SequenceReviewer([RuntimeError("temporary"), low, _review()])

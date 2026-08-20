@@ -557,6 +557,8 @@ class WorkflowSyncService:
         self.playbook = playbook or PlaybookConnector()
 
     def sync_project(self, project_path: str, openspec_change: str | None = None) -> list:
+        if not os.path.isdir(project_path):
+            raise RuntimeError(f"project path is not a directory: {project_path}")
         snapshots = [
             self.git.snapshot(project_path),
             self.openspec.list_changes(project_path),
