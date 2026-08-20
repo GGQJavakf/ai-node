@@ -43,6 +43,7 @@ hook、watcher 或常驻服务。
 | `AGENTRETRO_DB_PATH` | 状态根内的 SQLite 数据库 |
 | `AGENTRETRO_BACKUP_DIR` | 状态根内的同步和迁移备份 |
 | `AGENTRETRO_OBSIDIAN_ROOT` | 明确选定的 Obsidian vault 根目录 |
+| `AGENTRETRO_RECENT_CAPTURE_MAX` | 最近会话批量预览/捕获上限，默认 `20` |
 | `CODEX_HOME` | 明确选定的本地 Codex 会话源 |
 
 ### 首次使用快速流程
@@ -81,13 +82,31 @@ retro project list
 并为 warning 或 error 给出恢复命令。若尚未执行任何状态命令，可先运行 doctor
 查看配置，但新数据库和项目映射会显示为尚未就绪。
 
-显式捕获一个已完成会话后，从 JSON 结果读取 `<session-id>`，再执行模型审核：
+首次处理历史会话时，先做零写入预览，再把返回的 `plan_id` 原样用于显式应用。
+计划绑定会话内容、顺序、项目映射和当前复用状态；任一项变化都会要求重新预览：
+
+```powershell
+retro --json capture --recent 5 --dry-run
+retro --json capture --recent 5 --apply '<plan-id>'
+```
+
+也可以只显式捕获一个已完成会话。从 JSON 结果读取 `<session-id>` 后执行模型审核：
 
 ```powershell
 retro --json capture --last
 retro --json review run --session '<session-id>'
 retro --json review list --status pending_review
 retro --json review show '<candidate-id>'
+```
+
+日常先看只读 inbox。无参数按 canonical project 汇总；`--project` 接受 canonical ID、
+已映射仓库/工作区路径、Git worktree 路径或规范化无凭据 remote；无法唯一解析时会
+fail closed。待路由会话单独列出，不返回源路径、remote、候选正文或模型错误：
+
+```powershell
+retro --json review inbox
+retro --json review inbox --project '<project-reference>' --limit 20
+retro --json review inbox --awaiting --limit 20
 ```
 
 `review run` 会调用已配置的模型；达到阈值且通过确定性门禁的候选可能自动接受，
@@ -108,6 +127,10 @@ retro brief '<current-task>' --project '<project-name>' --markdown
 retro integrate codex
 ```
 
+`retro brief` 使用与 inbox 相同的项目引用解析。如果没有选中知识，它仍返回 canonical
+project、已捕获会话/待审核/可用知识/过期任务状态四个计数，以及准确的 inbox 与
+最近会话预览命令；brief 和 inbox 都只读，不会为了标记过期而修改 SQLite 或 vault。
+
 最后一条命令只输出 `<codex-home>/AGENTS.md` 的完整预览；只有显式执行
 `retro integrate codex --apply` 才会备份并写入托管块。AgentRetro 的任何命令
 都不会写入 Codex 原生 memory。
@@ -121,13 +144,16 @@ timeout；凭据、token 和完整原始配置不会写入 AgentRetro。`retro b
 | 命令 | 行为 |
 | --- | --- |
 | `retro capture --last` / `--session <id>` | 显式捕获一个已完成的 Codex 会话 |
+| `retro capture --recent <n> --dry-run` | 零写入预览最新已完成会话并生成身份绑定计划 |
+| `retro capture --recent <n> --apply <plan-id>` | 显式应用仍完全匹配的当前批量计划 |
 | `retro review run --session <id>` | 执行确定性门禁和独立模型审核 |
 | `retro review list/show/accept/edit/reject` | 查看证据并人工决定知识生命周期 |
+| `retro review inbox [--project <ref> \| --awaiting]` | 只读查看有界审核或待路由工作摘要 |
 | `retro sync conflicts/reconcile/retry` | 检查、处理或恢复 Obsidian 投影 |
 | `retro merge plan/apply` | 预览受控深度整理，并仅应用当前且已精确确认的计划 |
 | `retro kb purge <id> --plan` | 零写入列出敏感清除的全部已知副本与操作 ID |
 | `retro kb purge <id> --apply-plan ...` | 仅在逐项确认当前计划的全部操作 ID 后清除并验证残留 |
-| `retro brief <task> --project <id>` | 按任务与项目生成有证据引用的本地摘要 |
+| `retro brief <task> --project <ref>` | 按任务与解析后的 canonical 项目生成本地摘要 |
 | `retro doctor` | 只读检查数据库、路径、恢复和编码状态 |
 | `retro integrate codex` | 零写入预览 canonical `<codex-home>/AGENTS.md` 变更 |
 | `retro integrate codex --apply` / `--remove` | 显式应用或移除唯一托管块，并校验备份和回读 |

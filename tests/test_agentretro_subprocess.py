@@ -96,10 +96,25 @@ def _run_retro(
 def test_retro_subprocess_smoke_has_defined_exits_and_strict_console_output(
     tmp_path: Path, encoding: str
 ) -> None:
+    mapped = _run_retro(
+        tmp_path,
+        encoding,
+        "--json",
+        "project",
+        "map-workspace",
+        "--root",
+        str(tmp_path),
+        "--vault-project",
+        "project-1",
+    )
+    assert mapped.returncode == 0, (mapped.stdout + mapped.stderr).decode(
+        encoding, errors="replace"
+    )
     flows = (
         (("--help",), 0, "capture"),
         (("--json", "capture", "--last"), 2, "RETRO_COMMAND_FAILED"),
         (("--json", "review", "list"), 0, "RETRO_REVIEW_LISTED"),
+        (("--json", "review", "inbox"), 0, "RETRO_REVIEW_INBOX"),
         (
             ("--json", "brief", "empty task", "--project", "project-1"),
             0,

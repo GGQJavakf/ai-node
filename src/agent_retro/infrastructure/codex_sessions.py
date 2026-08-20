@@ -134,6 +134,47 @@ class CodexSessionSource:
         self._finish_discovery()
         raise SessionNotFoundError("未找到已完成的 Codex 会话")
 
+    def recent_completed(self, count: int) -> tuple[NormalizedSession, ...]:
+        """Return a bounded newest-first set of unique completed sessions."""
+
+        if count <= 0:
+            raise ValueError("recent session count must be positive")
+        self._begin_discovery()
+        deadline = self.monotonic() + self.discovery_timeout_seconds
+        sessions: list[NormalizedSession] = []
+        seen_ids: set[str] = set()
+        try:
+            self._require_home(deadline)
+            candidates = self._session_candidates_newest_first(deadline)
+            for candidate in candidates:
+                self._check_deadline(deadline)
+                try:
+                    session = self._parse_bounded(candidate, deadline)
+                except SessionDiscoveryTimeout:
+                    raise
+                except CodexSessionError as exc:
+                    self._diagnostics.append(f"跳过 {candidate.path}: {exc}")
+                    continue
+                if not session.completed:
+                    self._diagnostics.append(
+                        f"跳过未完成会话 {session.source_session_id}: {candidate.path}"
+                    )
+                    continue
+                if session.source_session_id in seen_ids:
+                    self._diagnostics.append(
+                        f"跳过重复会话 ID: {session.source_session_id}"
+                    )
+                    continue
+                seen_ids.add(session.source_session_id)
+                sessions.append(session)
+                if len(sessions) == count:
+                    break
+        except BaseException:
+            self._finish_discovery()
+            raise
+        self._finish_discovery()
+        return tuple(sessions)
+
     def load(self, session_id: str) -> NormalizedSession:
         if not session_id or not session_id.strip():
             raise SessionNotFoundError("Codex 会话 ID 不能为空")

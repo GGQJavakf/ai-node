@@ -48,7 +48,15 @@ from agent_retro.application.purge import (
     UnknownPurgePlan,
 )
 from agent_retro.application.sync import ProjectionPersistenceError
-from agent_retro.application.capture import CaptureResult, CaptureService
+from agent_retro.application.capture import (
+    CapturePlanChangedError,
+    CaptureResult,
+    CaptureService,
+    RecentCaptureBoundsError,
+    RecentCapturePlan,
+    RecentCaptureResult,
+)
+from agent_retro.application.inbox import InboxLimitError
 from agent_retro.application.review import ReviewService, ReviewUnavailableError
 from agent_retro.domain.models import (
     CandidateStatus,
@@ -78,6 +86,8 @@ from agent_retro.infrastructure.llm_merge import (
 )
 from agent_retro.infrastructure.project_mapping import (
     ProjectMappingService,
+    ProjectReferenceError,
+    ProjectReferenceResolver,
     ProjectResolver,
 )
 from agent_retro.infrastructure.redaction import Redactor
@@ -117,6 +127,10 @@ def build_parser() -> argparse.ArgumentParser:
     selector = capture.add_mutually_exclusive_group(required=True)
     selector.add_argument("--last", action="store_true", dest="capture_last")
     selector.add_argument("--session", dest="session_id")
+    selector.add_argument("--recent", type=int, dest="recent_count")
+    capture_mode = capture.add_mutually_exclusive_group()
+    capture_mode.add_argument("--dry-run", action="store_true", dest="capture_dry_run")
+    capture_mode.add_argument("--apply", dest="capture_plan_id")
 
     project = commands.add_parser("project", help="管理项目映射")
     project_commands = project.add_subparsers(dest="project_command", required=True)
@@ -167,6 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     retry_selector = retry.add_mutually_exclusive_group(required=True)
     retry_selector.add_argument("--candidate", dest="retry_candidate_id")
     retry_selector.add_argument("--session", dest="retry_session_id")
+    inbox = review_commands.add_parser("inbox", help="查看只读审核工作摘要")
+    inbox_selector = inbox.add_mutually_exclusive_group()
+    inbox_selector.add_argument("--project", dest="inbox_project")
+    inbox_selector.add_argument("--awaiting", action="store_true", dest="inbox_awaiting")
+    inbox.add_argument("--limit", type=int, default=20, dest="inbox_limit")
     merge = review_commands.add_parser("merge", help="合并知识冲突")
     merge.add_argument("conflict_id")
     merge.add_argument("--text", required=True)
@@ -288,6 +307,83 @@ def main(
                 )
             else:
                 sys.stderr.write(safe_text(str(exc)) + "\n")
+            return 2
+        except ProjectReferenceError as exc:
+            code = (
+                "RETRO_AMBIGUOUS_PROJECT_REFERENCE"
+                if exc.status == "ambiguous"
+                else "RETRO_UNKNOWN_PROJECT_REFERENCE"
+            )
+            data = {
+                "reason": exc.reason,
+                "mapping_ids": list(exc.mapping_ids),
+                "recovery_command": exc.recovery_command,
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": code,
+                        "message": "Project reference could not be resolved safely.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
+            return 2
+        except RecentCaptureBoundsError as exc:
+            data = {
+                "reason": exc.reason,
+                "requested_count": exc.count,
+                "recent_capture_max": exc.maximum,
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_RECENT_CAPTURE_COUNT_OUT_OF_BOUNDS",
+                        "message": "Recent capture count is outside the safe bound.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
+            return 2
+        except InboxLimitError as exc:
+            data = {
+                "reason": exc.reason,
+                "limit": exc.limit,
+                "minimum": 1,
+                "maximum": 50,
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_REVIEW_INBOX_LIMIT_OUT_OF_BOUNDS",
+                        "message": "Review inbox limit is outside the safe bound.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
+            return 2
+        except CapturePlanChangedError as exc:
+            data = {
+                "reason": exc.reason,
+                "recovery_command": exc.recovery_command,
+            }
+            if args.json_output:
+                write_json(
+                    {
+                        "status": "error",
+                        "code": "RETRO_CAPTURE_PLAN_CHANGED",
+                        "message": "Recent capture plan changed before apply.",
+                        "data": data,
+                    }
+                )
+            else:
+                sys.stderr.write(safe_text(json_text(data)) + "\n")
             return 2
         except GuidanceError as exc:
             if args.json_output:
@@ -557,14 +653,20 @@ def _run_command(
 
     repository = build_retro_repository(settings)
     if args.command == "brief":
+        project_resolution = ProjectReferenceResolver(
+            repository.list_project_mappings()
+        ).resolve(args.project_id)
+        if project_resolution.status != "resolved":
+            raise ProjectReferenceError(project_resolution)
         brief_result = BriefService(
             repository,
             timeout_seconds=settings.brief_timeout_seconds,
             default_max_tokens=settings.brief_max_tokens,
+            recent_capture_max=settings.recent_capture_max,
         ).build(
             BriefRequest(
                 task=args.task,
-                project_id=args.project_id,
+                project_id=project_resolution.project_id,
                 max_tokens=args.max_tokens,
             )
         )
@@ -758,6 +860,24 @@ def _run_command(
             max_session_bytes=settings.session_max_bytes,
         )
         capture_service = CaptureService(source, repository, Redactor(), resolver)
+        if args.recent_count is not None:
+            if not args.capture_dry_run and not args.capture_plan_id:
+                raise ValueError("recent capture requires --dry-run or --apply <plan-id>")
+            if args.capture_dry_run:
+                capture_plan = capture_service.preview_recent(
+                    args.recent_count, settings.recent_capture_max
+                )
+                _write_recent_capture_plan(capture_plan, args.json_output)
+                return 0
+            capture_batch = capture_service.apply_recent(
+                args.recent_count,
+                settings.recent_capture_max,
+                args.capture_plan_id,
+            )
+            _write_recent_capture_result(capture_batch, args.json_output)
+            return 2 if capture_batch.failed else 0
+        if args.capture_dry_run or args.capture_plan_id:
+            raise ValueError("--dry-run and --apply require --recent <count>")
         capture_result = (
             capture_service.capture_last()
             if args.capture_last
@@ -932,7 +1052,8 @@ def _write_capture_result(result: CaptureResult, json_output: bool) -> None:
                 "data": data,
             }
         )
-    else:
+
+    if not json_output:
         action = "已复用" if result.reused else "已捕获"
         sys.stdout.write(
             safe_text(
@@ -941,6 +1062,78 @@ def _write_capture_result(result: CaptureResult, json_output: bool) -> None:
             )
             + "\n"
         )
+
+
+def _write_recent_capture_plan(result: RecentCapturePlan, json_output: bool) -> None:
+    data = {
+        "plan_id": result.plan_id,
+        "schema_version": result.schema_version,
+        "requested_count": result.requested_count,
+        "recent_capture_max": result.recent_capture_max,
+        "items": [
+            {
+                "session_id": item.session_id,
+                "source_hash": item.source_hash,
+                "resolution_status": item.resolution_status,
+                "canonical_project_id": item.canonical_project_id,
+                "mapping_id": item.mapping_id,
+                "reuse_status": item.reuse_status,
+            }
+            for item in result.items
+        ],
+        "warnings": list(result.warnings),
+    }
+    if json_output:
+        write_json(
+            {
+                "status": "ok",
+                "code": "RETRO_CAPTURE_RECENT_PREVIEW",
+                "message": "Recent capture plan previewed without writes.",
+                "data": data,
+            }
+        )
+    if not json_output:
+        sys.stdout.write(safe_text(json_text(data)) + "\n")
+
+
+def _write_recent_capture_result(
+    result: RecentCaptureResult, json_output: bool
+) -> None:
+    def items(values):
+        return [
+            {"session_id": item.session_id, "reason": item.reason} for item in values
+        ]
+
+    data = {
+        "plan_id": result.plan_id,
+        "requested_count": result.requested_count,
+        "captured": items(result.captured),
+        "reused": items(result.reused),
+        "failed": items(result.failed),
+        "skipped": items(result.skipped),
+        "recovery_command": result.recovery_command,
+    }
+    failed = bool(result.failed)
+    if json_output:
+        write_json(
+            {
+                "status": "error" if failed else "ok",
+                "code": (
+                    "RETRO_CAPTURE_RECENT_PARTIAL"
+                    if failed
+                    else "RETRO_CAPTURE_RECENT_APPLIED"
+                ),
+                "message": (
+                    "Recent capture stopped after a per-session failure."
+                    if failed
+                    else "Recent capture plan applied."
+                ),
+                "data": data,
+            }
+        )
+    else:
+        stream = sys.stderr if failed else sys.stdout
+        stream.write(safe_text(json_text(data)) + "\n")
 
 
 def _build_review_service(settings, repository):

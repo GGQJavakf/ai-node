@@ -1,20 +1,36 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
 from _path import ROOT  # noqa: F401
 from agent_retro.application.brief import BriefTimeoutError
+from agent_retro.domain.models import BriefHealthCounts, ProjectMapping
 from agent_retro.presentation import cli as retro_cli
 
 
 class _EmptyBriefRepository:
+    def list_project_mappings(self):
+        return [
+            ProjectMapping(
+                "mapping-project-1",
+                Path.cwd(),
+                "",
+                "project-1",
+                mapping_kind="workspace",
+            )
+        ]
+
     def expire_task_states(self, at):
         return []
 
     def list_brief_knowledge(self, project_id, at):
         return []
+
+    def brief_health_counts(self, project_id, at):
+        return BriefHealthCounts(0, 0, 0, 0, 0)
 
     def list_open_conflicts(self, project_id):
         return []
@@ -87,6 +103,66 @@ def test_cli_brief_uses_sqlite_service_and_emits_stable_path_free_json(
     serialized = json.dumps(payload)
     assert str(tmp_path) not in serialized
     assert "\x1b" not in serialized
+
+
+def test_cli_brief_unknown_and_ambiguous_references_fail_before_knowledge_read(
+    tmp_path, capsys, monkeypatch
+):
+    root = (tmp_path / "workspace").resolve()
+    root.mkdir()
+
+    class MappingOnlyRepository:
+        def __init__(self, mappings):
+            self.mappings = mappings
+
+        def list_project_mappings(self):
+            return self.mappings
+
+    monkeypatch.setattr(
+        retro_cli,
+        "BriefService",
+        lambda *args, **kwargs: pytest.fail("unresolved project must not read knowledge"),
+    )
+    repository = MappingOnlyRepository([])
+    monkeypatch.setattr(retro_cli, "build_retro_repository", lambda settings: repository)
+
+    assert (
+        retro_cli.main(
+            ["--json", "brief", "safe", "--project", "missing"],
+            home=tmp_path,
+            env=_env(tmp_path),
+        )
+        == 2
+    )
+    unknown = _json(capsys)
+    assert unknown["code"] == "RETRO_UNKNOWN_PROJECT_REFERENCE"
+    assert unknown["data"] == {
+        "mapping_ids": [],
+        "reason": "unknown_project_reference",
+        "recovery_command": "retro project list",
+    }
+
+    repository.mappings = [
+        ProjectMapping("mapping-a", root, "", "A", mapping_kind="workspace"),
+        ProjectMapping("mapping-b", root, "", "B", mapping_kind="workspace"),
+    ]
+    assert (
+        retro_cli.main(
+            ["brief", "safe", "--project", str(root)],
+            home=tmp_path,
+            env=_env(tmp_path),
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    ambiguous = json.loads(captured.err)
+    assert ambiguous == {
+        "mapping_ids": ["mapping-a", "mapping-b"],
+        "reason": "multiple_mapping_matches",
+        "recovery_command": "retro project list",
+    }
+    assert str(root) not in captured.err
 
 
 def test_cli_doctor_json_keeps_fixed_order_and_redacts_absolute_paths(

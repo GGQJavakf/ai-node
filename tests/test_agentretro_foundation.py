@@ -34,6 +34,7 @@ def test_settings_use_the_supplied_home(tmp_path):
     assert settings.discovery_max_files == 1000
     assert settings.discovery_timeout_seconds == 10.0
     assert settings.session_max_bytes == 128 * 1024 * 1024
+    assert settings.recent_capture_max == 20
     assert settings.model_timeout_seconds is None
     assert settings.brief_timeout_seconds == 5.0
     assert settings.thresholds == {
@@ -66,6 +67,7 @@ def test_settings_reject_state_children_outside_root(tmp_path, child_key):
         "AGENTRETRO_DISCOVERY_MAX_FILES",
         "AGENTRETRO_DISCOVERY_TIMEOUT_SECONDS",
         "AGENTRETRO_SESSION_MAX_BYTES",
+        "AGENTRETRO_RECENT_CAPTURE_MAX",
         "AGENTRETRO_MODEL_TIMEOUT_SECONDS",
         "AGENTRETRO_BRIEF_TIMEOUT_SECONDS",
     ],
@@ -88,6 +90,7 @@ def test_settings_honor_environment_overrides(tmp_path):
             "AGENTRETRO_DISCOVERY_MAX_FILES": "12",
             "AGENTRETRO_DISCOVERY_TIMEOUT_SECONDS": "1.5",
             "AGENTRETRO_SESSION_MAX_BYTES": "4096",
+            "AGENTRETRO_RECENT_CAPTURE_MAX": "7",
             "AGENTRETRO_MODEL_TIMEOUT_SECONDS": "30",
             "AGENTRETRO_BRIEF_TIMEOUT_SECONDS": "2.5",
         },
@@ -101,6 +104,7 @@ def test_settings_honor_environment_overrides(tmp_path):
     assert settings.discovery_max_files == 12
     assert settings.discovery_timeout_seconds == 1.5
     assert settings.session_max_bytes == 4096
+    assert settings.recent_capture_max == 7
     assert settings.model_timeout_seconds == 30
     assert settings.brief_timeout_seconds == 2.5
 

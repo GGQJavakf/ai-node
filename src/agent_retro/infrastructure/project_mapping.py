@@ -32,12 +32,23 @@ class GitProjectError(ProjectMappingError):
     pass
 
 
+class ProjectReferenceError(ProjectMappingError):
+    def __init__(self, resolution: "ProjectResolution") -> None:
+        super().__init__(resolution.reason or f"{resolution.status}_project_reference")
+        self.status = resolution.status
+        self.reason = resolution.reason or f"{resolution.status}_project_reference"
+        self.mapping_ids = resolution.mapping_ids
+        self.recovery_command = "retro project list"
+
+
 @dataclass(frozen=True)
 class ProjectResolution:
     status: str
     project_id: str = ""
     mapping_id: str = ""
     diagnostic: str = ""
+    reason: str = ""
+    mapping_ids: tuple[str, ...] = ()
 
 
 def normalize_git_remote(remote: str) -> str:
@@ -85,13 +96,16 @@ def resolve_git_identity(path: Path) -> tuple[Path, str]:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         raise GitProjectError(f"不是可用的 Git 工作树: {supplied}") from exc
     root = Path(root_result.stdout.strip()).resolve()
-    remote_result = subprocess.run(
-        ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    try:
+        remote_result = subprocess.run(
+            ["git", "-C", str(root), "config", "--get", "remote.origin.url"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitProjectError("无法安全解析 Git remote") from exc
     remote = (
         normalize_git_remote(remote_result.stdout)
         if remote_result.returncode == 0
@@ -122,13 +136,32 @@ class ProjectResolver:
                 if item.diagnostic
             )
             return ProjectResolution(
-                status="ambiguous", diagnostic="；".join(diagnostics)
+                status="ambiguous",
+                diagnostic="；".join(diagnostics),
+                reason="multiple_mapping_matches",
+                mapping_ids=tuple(
+                    sorted(
+                        {
+                            *git_resolution.mapping_ids,
+                            *workspace_resolution.mapping_ids,
+                        }
+                    )
+                ),
             )
         if git_resolution.status == workspace_resolution.status == "resolved":
             if git_resolution.project_id != workspace_resolution.project_id:
                 return ProjectResolution(
                     status="ambiguous",
                     diagnostic="Git 映射与工作区映射指向不同项目",
+                    reason="mapping_identity_conflict",
+                    mapping_ids=tuple(
+                        sorted(
+                            {
+                                git_resolution.mapping_id,
+                                workspace_resolution.mapping_id,
+                            }
+                        )
+                    ),
                 )
             return git_resolution
         if git_resolution.status == "resolved":
@@ -196,16 +229,104 @@ class ProjectResolver:
     ) -> ProjectResolution | None:
         if not candidates:
             return None
-        target_ids = {(item.id, item.obsidian_project) for item in candidates}
-        if len(target_ids) != 1:
+        project_ids = {item.obsidian_project for item in candidates}
+        if len(project_ids) != 1:
             return ProjectResolution(
-                status="ambiguous", diagnostic=f"{source} 匹配多个项目映射"
+                status="ambiguous",
+                diagnostic=f"{source} 匹配多个项目映射",
+                reason="multiple_mapping_matches",
+                mapping_ids=tuple(sorted(item.id for item in candidates)),
             )
-        mapping = candidates[0]
+        mapping = min(candidates, key=lambda item: item.id)
         return ProjectResolution(
             status="resolved",
             project_id=mapping.obsidian_project,
             mapping_id=mapping.id,
+        )
+
+
+ResolveGitReference = Callable[[Path], tuple[Path, str] | None]
+
+
+class ProjectReferenceResolver:
+    """Resolve a user project reference without echoing paths or remotes."""
+
+    def __init__(
+        self,
+        mappings: Sequence[ProjectMapping],
+        *,
+        resolve_git: ResolveGitReference | None = None,
+    ) -> None:
+        self.mappings = tuple(mapping for mapping in mappings if mapping.active)
+        self.project_resolver = ProjectResolver(self.mappings)
+        self.resolve_git = resolve_git or self._resolve_git_reference
+
+    def resolve(self, reference: str) -> ProjectResolution:
+        value = reference.strip()
+        if not value:
+            return self._unknown()
+
+        canonical_projects = {
+            mapping.obsidian_project
+            for mapping in self.mappings
+            if mapping.obsidian_project == value
+        }
+        if canonical_projects:
+            mapping_ids = sorted(
+                mapping.id
+                for mapping in self.mappings
+                if mapping.obsidian_project == value
+            )
+            return ProjectResolution(
+                status="resolved",
+                project_id=value,
+                mapping_id=mapping_ids[0],
+            )
+
+        supplied = Path(value).expanduser()
+        if supplied.exists():
+            target = supplied.resolve()
+            git_root = target if target.is_dir() else target.parent
+            remote_identity = ""
+            try:
+                identity = self.resolve_git(git_root)
+            except ProjectMappingError:
+                identity = None
+            if identity is not None:
+                git_root, remote_identity = identity
+            resolution = self.project_resolver.resolve(
+                git_root,
+                remote_identity,
+                source_path=target,
+            )
+            return self._unknown() if resolution.status == "unknown" else resolution
+
+        try:
+            remote_identity = normalize_git_remote(value)
+        except ProjectMappingError:
+            return self._unknown()
+        candidates = [
+            mapping
+            for mapping in self.mappings
+            if mapping.mapping_kind == "git"
+            and mapping.remote_identity == remote_identity
+        ]
+        remote_resolution = ProjectResolver._from_candidates(candidates, "Git remote")
+        return remote_resolution if remote_resolution is not None else self._unknown()
+
+    @staticmethod
+    def _resolve_git_reference(path: Path) -> tuple[Path, str] | None:
+        try:
+            return resolve_git_identity(path)
+        except ProjectMappingError:
+            return None
+
+    @staticmethod
+    def _unknown() -> ProjectResolution:
+        return ProjectResolution(
+            status="unknown",
+            diagnostic="没有匹配的项目映射",
+            reason="unknown_project_reference",
         )
 
 

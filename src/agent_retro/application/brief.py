@@ -14,7 +14,12 @@ from typing import Callable
 
 from agent_retro.application.ports import RetroRepository
 from agent_retro.application.purge import require_no_active_purge
-from agent_retro.domain.models import Knowledge, KnowledgeType, ProjectionStatus
+from agent_retro.domain.models import (
+    BriefHealthCounts,
+    Knowledge,
+    KnowledgeType,
+    ProjectionStatus,
+)
 
 
 DEFAULT_RELEVANCE_WEIGHTS = MappingProxyType(
@@ -78,6 +83,9 @@ class BriefResult:
     stale_ids: tuple[str, ...]
     conflict_ids: tuple[str, ...]
     warnings: tuple[str, ...]
+    health: BriefHealthCounts | None = None
+    review_inbox_command: str = ""
+    recent_capture_command: str = ""
 
     @property
     def omitted_count(self) -> int:
@@ -102,7 +110,7 @@ def estimate_tokens(value: str) -> int:
 def brief_json_data(result: BriefResult) -> dict[str, object]:
     """Return the canonical stable JSON view used for output and budgeting."""
 
-    return {
+    data: dict[str, object] = {
         "conflict_ids": list(result.conflict_ids),
         "estimated_tokens": result.estimated_tokens,
         "generated_at": result.generated_at.isoformat(),
@@ -115,6 +123,18 @@ def brief_json_data(result: BriefResult) -> dict[str, object]:
         "task": result.task,
         "warnings": list(result.warnings),
     }
+    if result.health is not None:
+        data.update(
+            {
+                "eligible_knowledge_count": result.health.eligible_knowledge_count,
+                "expired_task_state_count": result.health.expired_task_state_count,
+                "pending_review_count": result.health.pending_review_count,
+                "captured_session_count": result.health.captured_session_count,
+                "review_inbox_command": result.review_inbox_command,
+                "recent_capture_command": result.recent_capture_command,
+            }
+        )
+    return data
 
 
 def render_brief_markdown(result: BriefResult) -> str:
@@ -156,6 +176,18 @@ def render_brief_terminal(result: BriefResult) -> str:
         )
     if result.warnings:
         lines.append("Warnings: " + ", ".join(result.warnings))
+    if result.health is not None:
+        lines.extend(
+            [
+                "Health: "
+                f"eligible={result.health.eligible_knowledge_count}, "
+                f"expired_task_state={result.health.expired_task_state_count}, "
+                f"pending_review={result.health.pending_review_count}, "
+                f"captured_session={result.health.captured_session_count}",
+                f"Review: {result.review_inbox_command}",
+                f"Capture: {result.recent_capture_command}",
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -190,6 +222,20 @@ def _brief_item_data(item: BriefItem) -> dict[str, object]:
 
 
 def _append_brief_health(lines: list[str], result: BriefResult) -> None:
+    if result.health is not None:
+        lines.extend(
+            [
+                "## Health",
+                "",
+                f"- Eligible knowledge: {result.health.eligible_knowledge_count}",
+                f"- Expired task state: {result.health.expired_task_state_count}",
+                f"- Pending review: {result.health.pending_review_count}",
+                f"- Captured sessions: {result.health.captured_session_count}",
+                f"- Review: `{result.review_inbox_command}`",
+                f"- Capture: `{result.recent_capture_command}`",
+                "",
+            ]
+        )
     if result.omitted:
         lines.extend(
             [
@@ -270,16 +316,20 @@ class BriefService:
         monotonic: Callable[[], float] = time.monotonic,
         timeout_seconds: float = 5.0,
         default_max_tokens: int = 6000,
+        recent_capture_max: int = 20,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be greater than zero")
         if default_max_tokens <= 0:
             raise ValueError("default_max_tokens must be greater than zero")
+        if recent_capture_max <= 0:
+            raise ValueError("recent_capture_max must be greater than zero")
         self.repository = repository
         self.now = now
         self.monotonic = monotonic
         self.timeout_seconds = timeout_seconds
         self.default_max_tokens = default_max_tokens
+        self.recent_capture_max = recent_capture_max
 
     def build(self, request: BriefRequest) -> BriefResult:
         task = request.task.strip()
@@ -412,6 +462,22 @@ class BriefService:
                 current_omitted = trial_omitted
 
         result = result_for(selected, current_omitted)
+        if not result.items:
+            result = _with_result_cost(
+                replace(
+                    result,
+                    health=self.repository.brief_health_counts(project_id, at),
+                    review_inbox_command=(
+                        f"retro review inbox --project {project_id}"
+                    ),
+                    recent_capture_command=(
+                        "retro capture --recent "
+                        f"{min(5, self.recent_capture_max)} --dry-run"
+                    ),
+                )
+            )
+            if result.estimated_tokens > max_tokens:
+                raise BriefBudgetError(result.estimated_tokens, max_tokens)
         self._check_deadline(deadline)
         return result
 

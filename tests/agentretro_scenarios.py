@@ -4,13 +4,19 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     # Codex session retrospective
     "CR-01": (
         "tests/test_agentretro_capture.py::test_cli_capture_last_then_named_session_uses_only_injected_paths",
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_completed_is_newest_first_unique_and_skips_invalid_or_active",
     ),
     "CR-02": (
         "tests/test_agentretro_capture.py::test_cli_capture_last_then_named_session_uses_only_injected_paths",
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_completed_is_newest_first_unique_and_skips_invalid_or_active",
     ),
-    "CR-03": ("tests/test_agentretro_capture.py::test_active_session_is_rejected",),
+    "CR-03": (
+        "tests/test_agentretro_capture.py::test_active_session_is_rejected",
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_completed_is_newest_first_unique_and_skips_invalid_or_active",
+    ),
     "CR-04": (
         "tests/test_agentretro_capture.py::test_completed_capture_starts_no_hook_watcher_daemon_or_background_work",
+        "tests/test_agentretro_cli.py::test_cli_recent_capture_preview_apply_and_reuse_are_explicit",
     ),
     "CR-05": (
         "tests/test_agentretro_capture.py::test_effective_codex_home_prefers_explicit_environment",
@@ -70,6 +76,27 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     ),
     "CR-22": (
         "tests/test_agentretro_capture.py::test_discovery_timeout_has_an_explicit_diagnostic",
+    ),
+    "CR-23": (
+        "tests/test_agentretro_cli.py::test_cli_recent_capture_preview_apply_and_reuse_are_explicit",
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_plan_id_binds_every_ordered_identity_field",
+    ),
+    "CR-24": (
+        "tests/test_agentretro_cli.py::test_cli_recent_capture_preview_apply_and_reuse_are_explicit",
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_partial_failure_stops_and_new_plan_reuses_commits",
+    ),
+    "CR-25": (
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_plan_binds_mapping_identity_before_first_write",
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_plan_id_binds_every_ordered_identity_field",
+    ),
+    "CR-26": (
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_bounds_fail_before_discovery",
+    ),
+    "CR-27": (
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_partial_failure_stops_and_new_plan_reuses_commits",
+    ),
+    "CR-28": (
+        "tests/test_agentretro_recent_session_hardening.py::test_recent_capture_partial_failure_stops_and_new_plan_reuses_commits",
     ),
     # Retrospective knowledge review
     "KR-01": (
@@ -146,6 +173,27 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     ),
     "KR-24": (
         "tests/test_agentretro_review.py::test_retry_session_only_calls_model_for_pending_model_dependent_candidates",
+    ),
+    "KR-25": (
+        "tests/test_agentretro_value_loop.py::test_review_inbox_is_bounded_ordered_retryable_and_read_only",
+        "tests/test_agentretro_value_loop.py::test_cli_review_inbox_outputs_only_safe_ids_counts_and_commands",
+    ),
+    "KR-26": (
+        "tests/test_agentretro_value_loop.py::test_review_inbox_is_bounded_ordered_retryable_and_read_only",
+        "tests/test_agentretro_value_loop.py::test_review_inbox_rejects_unsafe_limits_before_repository_reads[0]",
+    ),
+    "KR-27": (
+        "tests/test_agentretro_value_loop.py::test_cli_review_inbox_outputs_only_safe_ids_counts_and_commands",
+    ),
+    "KR-28": (
+        "tests/test_agentretro_value_loop.py::test_review_inbox_is_bounded_ordered_retryable_and_read_only",
+        "tests/test_agentretro_value_loop.py::test_cli_review_inbox_outputs_only_safe_ids_counts_and_commands",
+    ),
+    "KR-29": (
+        "tests/test_agentretro_value_loop.py::test_empty_brief_reports_safe_health_without_mutating_lifecycle",
+    ),
+    "KR-30": (
+        "tests/test_agentretro_value_loop.py::test_brief_health_counts_current_task_state_as_active",
     ),
     # Obsidian knowledge sync
     "OS-01": (
@@ -267,6 +315,7 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "BR-06": (
         "tests/test_agentretro_briefing.py::test_brief_selects_only_active_accepted_knowledge_in_fixed_category_order",
         "tests/test_agentretro_briefing.py::test_brief_reports_evidence_conflict_sync_rollback_and_purge_health",
+        "tests/test_agentretro_recent_session_hardening.py::test_project_reference_resolves_canonical_remote_and_longest_workspace",
     ),
     "BR-07": (
         "tests/test_agentretro_briefing.py::test_brief_selects_only_active_accepted_knowledge_in_fixed_category_order",
@@ -342,6 +391,32 @@ SCENARIO_TESTS: dict[str, tuple[str, ...]] = {
     "BR-28": (
         "tests/test_agentretro_review.py::test_review_failure_is_sanitized_immutable_and_keeps_candidate_pending[timeout]",
         "tests/test_agentretro_foundation.py::test_effective_model_timeout_uses_documented_precedence[None-legacy3-120]",
+    ),
+    "BR-29": (
+        "tests/test_agentretro_task7_cli.py::test_cli_brief_unknown_and_ambiguous_references_fail_before_knowledge_read",
+    ),
+    "BR-30": (
+        "tests/test_agentretro_task7_cli.py::test_cli_brief_unknown_and_ambiguous_references_fail_before_knowledge_read",
+        "tests/test_agentretro_recent_session_hardening.py::test_project_reference_fails_closed_for_unknown_equal_root_and_identity_conflict",
+    ),
+    "BR-31": (
+        "tests/test_agentretro_value_loop.py::test_empty_brief_reports_safe_health_without_mutating_lifecycle",
+    ),
+    "BR-32": (
+        "tests/test_agentretro_task7_cli.py::test_cli_brief_uses_sqlite_service_and_emits_stable_path_free_json",
+    ),
+    "BR-33": (
+        "tests/test_agentretro_briefing.py::test_brief_selects_only_active_accepted_knowledge_in_fixed_category_order",
+        "tests/test_agentretro_briefing.py::test_brief_reports_evidence_conflict_sync_rollback_and_purge_health",
+    ),
+    "BR-34": (
+        "tests/test_agentretro_value_loop.py::test_empty_brief_reports_safe_health_without_mutating_lifecycle",
+    ),
+    "BR-35": (
+        "tests/test_agentretro_recent_session_hardening.py::test_project_reference_resolves_canonical_remote_and_longest_workspace",
+    ),
+    "BR-36": (
+        "tests/test_agentretro_recent_session_hardening.py::test_project_reference_uses_worktree_remote_without_exposing_credentials",
     ),
 }
 

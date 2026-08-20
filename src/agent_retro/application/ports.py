@@ -10,6 +10,8 @@ from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 from agent_retro.domain.models import (
     AcceptanceDecision,
     AuditEntry,
+    AwaitingSessionSummary,
+    BriefHealthCounts,
     Candidate,
     CandidateStatus,
     Evidence,
@@ -17,6 +19,7 @@ from agent_retro.domain.models import (
     KnowledgeConflict,
     KnowledgeType,
     NormalizedSession,
+    PendingCandidateSummary,
     ProjectMapping,
     ProjectionEvent,
     ProjectionStatus,
@@ -58,6 +61,16 @@ class RetroRepository(Protocol):
     ) -> None: ...
 
     def list_evidence(self, session_id: str) -> list[Evidence]: ...
+
+    def list_pending_candidate_summaries(
+        self, project_id: str | None = None
+    ) -> list[PendingCandidateSummary]: ...
+
+    def list_awaiting_session_summaries(self) -> list[AwaitingSessionSummary]: ...
+
+    def brief_health_counts(
+        self, project_id: str, at: datetime
+    ) -> BriefHealthCounts: ...
 
     def save_candidates(self, candidates: Sequence[Candidate]) -> None: ...
 

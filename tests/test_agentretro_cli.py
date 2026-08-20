@@ -650,6 +650,16 @@ def test_cli_brief_reports_effective_expiry_without_persisted_or_vault_writes(
 ):
     state_home = tmp_path / "state"
     repository = _seed_repository(state_home, with_candidate=False)
+    repository.save_project_mapping(
+        ProjectMapping(
+            "mapping-project-1",
+            tmp_path,
+            "",
+            "project-1",
+            mapping_kind="workspace",
+        ),
+        "tester",
+    )
     candidate = Candidate(
         id="candidate-effectively-expired",
         knowledge_type=KnowledgeType.TASK_STATE,
@@ -710,6 +720,113 @@ def test_cli_brief_reports_effective_expiry_without_persisted_or_vault_writes(
     assert repository.list_audit_entries() == before_audits
     assert repository.list_projection_events("project-1") == before_events
     assert after_vault == before_vault
+
+
+def test_cli_recent_capture_preview_apply_and_reuse_are_explicit(tmp_path, capsys):
+    state_home = tmp_path / "state"
+    codex_home = tmp_path / "codex"
+    vault = tmp_path / "vault"
+    workspace = tmp_path / "workspace"
+    vault.mkdir()
+    workspace.mkdir()
+    repository = SQLiteRetroRepository(state_home / "retro.db", state_home / "backups")
+    repository.migrate()
+    repository.save_project_mapping(
+        ProjectMapping(
+            "mapping-project",
+            workspace,
+            "",
+            "PROJECT",
+            mapping_kind="workspace",
+        ),
+        "tester",
+    )
+    source_id = "00000000-0000-0000-0000-000000000081"
+    source = (
+        codex_home
+        / "sessions"
+        / "2026"
+        / "08"
+        / "20"
+        / f"rollout-2026-08-20T12-00-00-{source_id}.jsonl"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": source_id, "cwd": str(workspace)},
+                    }
+                ),
+                json.dumps(
+                    {"type": "event_msg", "payload": {"type": "turn_complete"}}
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sentinel = vault / "user-note.md"
+    sentinel.write_text("untouched", encoding="utf-8")
+    env = {
+        "AGENTRETRO_HOME": str(state_home),
+        "AGENTRETRO_OBSIDIAN_ROOT": str(vault),
+        "CODEX_HOME": str(codex_home),
+    }
+    before_audits = repository.list_audit_entries()
+    before_projection = repository.list_projection_events("PROJECT")
+    before_vault = {path: path.read_bytes() for path in vault.rglob("*") if path.is_file()}
+
+    assert (
+        retro_cli.main(
+            ["--json", "capture", "--recent", "1", "--dry-run"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    preview = _json_output(capsys)
+    assert preview["code"] == "RETRO_CAPTURE_RECENT_PREVIEW"
+    assert preview["data"]["items"][0]["reuse_status"] == "new"
+    assert repository.find_session_by_source_id(source_id) is None
+    assert repository.list_audit_entries() == before_audits
+    assert repository.list_projection_events("PROJECT") == before_projection
+    assert {
+        path: path.read_bytes() for path in vault.rglob("*") if path.is_file()
+    } == before_vault
+
+    assert (
+        retro_cli.main(
+            [
+                "--json",
+                "capture",
+                "--recent",
+                "1",
+                "--apply",
+                preview["data"]["plan_id"],
+            ],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    applied = _json_output(capsys)
+    assert [item["session_id"] for item in applied["data"]["captured"]] == [
+        source_id
+    ]
+
+    assert (
+        retro_cli.main(
+            ["--json", "capture", "--recent", "1", "--dry-run"],
+            home=tmp_path,
+            env=env,
+        )
+        == 0
+    )
+    reuse_preview = _json_output(capsys)
+    assert reuse_preview["data"]["items"][0]["reuse_status"] == "reused"
 
 
 @pytest.mark.parametrize(
