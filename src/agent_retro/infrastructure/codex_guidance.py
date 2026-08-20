@@ -133,6 +133,16 @@ class _ManagedBlock:
     managed_hash: str | None = None
 
 
+@dataclass(frozen=True)
+class _GuidanceExecution:
+    preview: GuidancePreview
+    home: Path
+    target: Path
+    target_exists: bool
+    current: bytes
+    current_hash: str | None
+
+
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -233,6 +243,27 @@ class CodexGuidance:
         return preview
 
     def _execute(self, preview_id: str, action: str) -> GuidanceResult:
+        execution = self._execution_context(preview_id, action)
+        if not execution.preview.changed:
+            return self._unchanged_result(execution, action)
+        backup_path = self._backup_current(execution)
+        self._replace_and_verify(execution, action, backup_path)
+        self._current_preview = None
+        return GuidanceResult(
+            preview_id=execution.preview.id,
+            action=action,
+            status="applied" if action == "apply" else "removed",
+            changed=True,
+            target_hash=(
+                _sha256(execution.preview._planned_bytes)
+                if execution.preview._planned_exists
+                else None
+            ),
+            backup_path=backup_path,
+            discoverable=True if action == "apply" else None,
+        )
+
+    def _execution_context(self, preview_id: str, action: str) -> _GuidanceExecution:
         preview = self._current_preview
         if preview is None or preview.id != preview_id or preview.action != action:
             raise GuidanceStalePreview("preview_not_current")
@@ -252,90 +283,112 @@ class CodexGuidance:
         block = self._managed_block(decoded)
         if block.managed_hash != preview.managed_hash:
             raise GuidanceStalePreview("target_hash_changed")
-        if not preview.changed:
-            discoverable: bool | None = None
-            if action == "apply":
-                try:
-                    discoverable = bool(self.discoverer(home))
-                except Exception as exc:
-                    raise GuidanceWriteError("discoverability_failed") from exc
-                if not discoverable:
-                    raise GuidanceWriteError("discoverability_failed")
-            self._current_preview = None
-            return GuidanceResult(
-                preview_id=preview.id,
-                action=action,
-                status="unchanged",
-                changed=False,
-                target_hash=current_hash,
-                backup_path=None,
-                discoverable=discoverable,
-            )
+        return _GuidanceExecution(
+            preview=preview,
+            home=home,
+            target=target,
+            target_exists=target_exists,
+            current=current,
+            current_hash=current_hash,
+        )
 
-        backup_path: Path | None = None
-        if target_exists:
-            backup_path = preview.backup_path
+    def _unchanged_result(
+        self, execution: _GuidanceExecution, action: str
+    ) -> GuidanceResult:
+        discoverable: bool | None = None
+        if action == "apply":
             try:
-                self.backup_writer(backup_path, current)
+                discoverable = bool(self.discoverer(execution.home))
             except Exception as exc:
-                try:
-                    backup_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise GuidanceWriteError("backup_failed") from exc
-
-        replaced = False
-        try:
-            if preview._planned_exists:
-                self._atomic_replace(target, preview._planned_bytes)
-            else:
-                target.unlink()
-            replaced = True
-            actual = self.readback(target) if preview._planned_exists else b""
-            if (preview._planned_exists and actual != preview._planned_bytes) or (
-                not preview._planned_exists and target.exists()
-            ):
-                raise OSError("readback mismatch")
-            if preview._planned_exists:
-                verified = self._managed_block(self._decode(actual)).present
-                if action == "apply" and not verified:
-                    raise OSError("managed block readback mismatch")
-                if action == "remove" and verified:
-                    raise OSError("managed block removal mismatch")
-            if action == "apply":
-                try:
-                    discoverable = bool(self.discoverer(home))
-                except Exception as exc:
-                    raise _GuidanceDiscoverabilityFailure from exc
-                if not discoverable:
-                    raise _GuidanceDiscoverabilityFailure
-        except Exception as exc:
-            reason = (
-                "discoverability_failed"
-                if isinstance(exc, _GuidanceDiscoverabilityFailure)
-                else "readback_failed"
-                if replaced
-                else "replace_failed"
-            )
-            if replaced:
-                try:
-                    self._restore(target, current, target_exists)
-                except Exception as restore_exc:
-                    raise GuidanceRollbackRequired(backup_path) from restore_exc
-            raise GuidanceWriteError(reason, backup_path) from exc
-
+                raise GuidanceWriteError("discoverability_failed") from exc
+            if not discoverable:
+                raise GuidanceWriteError("discoverability_failed")
         self._current_preview = None
         return GuidanceResult(
-            preview_id=preview.id,
+            preview_id=execution.preview.id,
             action=action,
-            status="applied" if action == "apply" else "removed",
-            changed=True,
-            target_hash=(
-                _sha256(preview._planned_bytes) if preview._planned_exists else None
-            ),
-            backup_path=backup_path,
-            discoverable=True if action == "apply" else None,
+            status="unchanged",
+            changed=False,
+            target_hash=execution.current_hash,
+            backup_path=None,
+            discoverable=discoverable,
         )
+
+    def _backup_current(self, execution: _GuidanceExecution) -> Path | None:
+        if not execution.target_exists:
+            return None
+        backup_path = execution.preview.backup_path
+        try:
+            self.backup_writer(backup_path, execution.current)
+        except Exception as exc:
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise GuidanceWriteError("backup_failed") from exc
+        return backup_path
+
+    def _replace_and_verify(
+        self,
+        execution: _GuidanceExecution,
+        action: str,
+        backup_path: Path | None,
+    ) -> None:
+        replaced = False
+        try:
+            self._replace_target(execution)
+            replaced = True
+            self._verify_target(execution, action)
+            if action == "apply":
+                self._require_discoverable(execution.home)
+        except Exception as exc:
+            reason = self._write_failure_reason(exc, replaced)
+            if replaced:
+                self._restore_failed_write(execution, backup_path)
+            raise GuidanceWriteError(reason, backup_path) from exc
+
+    def _replace_target(self, execution: _GuidanceExecution) -> None:
+        if execution.preview._planned_exists:
+            self._atomic_replace(execution.target, execution.preview._planned_bytes)
+        else:
+            execution.target.unlink()
+
+    def _verify_target(self, execution: _GuidanceExecution, action: str) -> None:
+        preview = execution.preview
+        actual = self.readback(execution.target) if preview._planned_exists else b""
+        if (preview._planned_exists and actual != preview._planned_bytes) or (
+            not preview._planned_exists and execution.target.exists()
+        ):
+            raise OSError("readback mismatch")
+        if not preview._planned_exists:
+            return
+        verified = self._managed_block(self._decode(actual)).present
+        if action == "apply" and not verified:
+            raise OSError("managed block readback mismatch")
+        if action == "remove" and verified:
+            raise OSError("managed block removal mismatch")
+
+    def _require_discoverable(self, home: Path) -> None:
+        try:
+            discoverable = bool(self.discoverer(home))
+        except Exception as exc:
+            raise _GuidanceDiscoverabilityFailure from exc
+        if not discoverable:
+            raise _GuidanceDiscoverabilityFailure
+
+    @staticmethod
+    def _write_failure_reason(exc: Exception, replaced: bool) -> str:
+        if isinstance(exc, _GuidanceDiscoverabilityFailure):
+            return "discoverability_failed"
+        return "readback_failed" if replaced else "replace_failed"
+
+    def _restore_failed_write(
+        self, execution: _GuidanceExecution, backup_path: Path | None
+    ) -> None:
+        try:
+            self._restore(execution.target, execution.current, execution.target_exists)
+        except Exception as restore_exc:
+            raise GuidanceRollbackRequired(backup_path) from restore_exc
 
     def _canonical_paths(self) -> tuple[Path, Path, Path]:
         if (
