@@ -310,15 +310,17 @@ class ObsidianProjection:
         )
 
     def _safe_existing_target(self, target: Path) -> Path:
-        relative = target.relative_to(self.vault_root)
+        vault_root = self._configured_vault_root()
+        relative = target.relative_to(vault_root)
         return self._safe_target(relative)
 
     def _safe_target(self, relative: Path) -> Path:
         if relative.is_absolute() or ".." in relative.parts:
             raise UnsafeVaultPathError("vault target must be a contained relative path")
-        root = self.vault_root.resolve()
-        target = self.vault_root / relative
-        current = self.vault_root
+        vault_root = self._configured_vault_root()
+        root = vault_root.resolve()
+        target = vault_root / relative
+        current = vault_root
         for part in relative.parts:
             current = current / part
             if current.exists() and current.is_symlink():
@@ -328,6 +330,11 @@ class ObsidianProjection:
         except ValueError as exc:
             raise UnsafeVaultPathError("vault target escapes configured root") from exc
         return target
+
+    def _configured_vault_root(self) -> Path:
+        if self.vault_root is None:
+            raise VaultNotConfiguredError("Obsidian vault is not configured")
+        return self.vault_root
 
     @staticmethod
     def _write(target: Path, after: bytes) -> PlannedWrite:

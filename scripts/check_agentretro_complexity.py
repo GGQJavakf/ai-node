@@ -44,6 +44,7 @@ def main() -> int:
     command_suffix = [
         "--select",
         "C901",
+        "--ignore-noqa",
         "--config",
         "lint.mccabe.max-complexity=15",
     ]

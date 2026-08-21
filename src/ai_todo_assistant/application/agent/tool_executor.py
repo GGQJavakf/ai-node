@@ -289,14 +289,15 @@ class ToolExecutor:
         report = CodexTaskReportService(report_dir).latest_report()
         if not report:
             return f"暂无 Codex 任务报告: {report_dir}"
-        imported = []
+        imported_count = 0
         if import_items:
             imported = WorkItemService(self.workflow_repository).import_codex_report(report)
+            imported_count = len(imported)
         return (
             f"Codex 报告: {report.generated_at}\n"
             f"未完成/阻塞: {report.total_unfinished}\n"
             f"最近完成: {len(report.completed)}\n"
-            f"已同步工作项: {len(imported)}"
+            f"已同步工作项: {imported_count}"
         )
 
     def _generate_daily_workflow_review(self) -> str:

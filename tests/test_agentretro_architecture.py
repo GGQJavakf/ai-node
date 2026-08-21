@@ -5,6 +5,8 @@ import importlib
 import inspect
 from pathlib import Path
 
+from scripts import check_agentretro_complexity
+
 from agent_retro.application.merge import MergeService
 from agent_retro.application.purge import PurgeService
 from agent_retro.application.sync import ProjectionCoordinator, SyncService
@@ -107,3 +109,26 @@ def test_complexity_manifest_covers_every_refactor_internal_module() -> None:
         if module.rsplit(".", 1)[-1].startswith("_")
     }
     assert imported_internal_modules <= modules
+
+
+def test_agentretro_complexity_gate_cannot_be_suppressed_with_noqa(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "src" / "agent_retro"
+    source_root.mkdir(parents=True)
+    target = source_root / "hotspot.py"
+    branches = "\n".join(
+        f"    if value == {index}:\n        return {index}" for index in range(16)
+    )
+    target.write_text(
+        f"def too_complex(value):  # noqa: C901\n{branches}\n    return -1\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "config" / "agentretro_complexity_targets.txt"
+    manifest.parent.mkdir()
+    manifest.write_text("src/agent_retro/hotspot.py\n", encoding="utf-8")
+    monkeypatch.setattr(check_agentretro_complexity, "ROOT", tmp_path)
+    monkeypatch.setattr(check_agentretro_complexity, "MANIFEST", manifest)
+    monkeypatch.setattr(check_agentretro_complexity, "SOURCE_ROOT", source_root)
+
+    assert check_agentretro_complexity.main() == 1
