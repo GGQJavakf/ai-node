@@ -353,6 +353,62 @@ class TestWorkflowSyncServices(unittest.TestCase):
         self.assertIn("命中多个工作项", preview.details[0])
         self.assertEqual(len(self.repository.list_work_items(include_closed=True)), 2)
 
+    def test_preview_and_import_share_classification_while_preview_is_zero_write(self):
+        existing = self.repository.save_work_item(
+            WorkItem(title="待闭环", source="codex", source_ref="thread-done")
+        )
+        identity_match = WorkItem(title="Redmine 原任务", source="manual")
+        identity_match.source_identities = ["redmine:232211"]
+        self.repository.save_work_item(identity_match)
+        report = CodexTaskReport(
+            path="report.json",
+            summary_path=None,
+            generated_at="2026-08-21T08:00:00+08:00",
+            total_unfinished=2,
+            completed=[{"thread_id": "thread-done", "title": "已闭环"}],
+            blocked=[{"thread_id": "thread-blocked", "title": "新阻塞项"}],
+            unfinished=[
+                {
+                    "thread_id": "thread-redmine",
+                    "title": "Redmine 232211 后续",
+                    "next_action": "继续 Redmine 232211",
+                }
+            ],
+        )
+        before = [item.to_dict() for item in self.repository.list_work_items(include_closed=True)]
+
+        service = WorkItemService(self.repository)
+        preview = service.preview_codex_report(report)
+
+        self.assertEqual(
+            [item.to_dict() for item in self.repository.list_work_items(include_closed=True)],
+            before,
+        )
+        self.assertEqual(self.repository.list_evidence(existing.id), [])
+
+        imported = service.import_codex_report(report)
+
+        result_fields = (
+            "created",
+            "updated",
+            "merged",
+            "skipped",
+            "completed",
+            "blocked",
+            "reactivated",
+            "unchanged",
+            "reopen_candidates",
+            "details",
+        )
+        self.assertEqual(
+            {field: getattr(preview, field) for field in result_fields},
+            {field: getattr(imported, field) for field in result_fields},
+        )
+        preview_core = [(item.title, item.status, item.source_ref, item.source_identities) for item in preview.items]
+        imported_core = [(item.title, item.status, item.source_ref, item.source_identities) for item in imported.items]
+        self.assertEqual(preview_core, imported_core)
+        self.assertTrue(self.repository.list_evidence(existing.id))
+
     def test_rollback_merge_restores_source_as_separate_work_item(self):
         existing = WorkItem(
             title="Redmine 232211",

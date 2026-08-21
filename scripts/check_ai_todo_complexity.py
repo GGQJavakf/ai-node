@@ -10,6 +10,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "config" / "ai_todo_complexity_targets.txt"
 SOURCE_ROOT = (ROOT / "src" / "ai_todo_assistant").resolve()
+TARGET_MAX_COMPLEXITY = 10
+PACKAGE_MAX_COMPLEXITY = 15
 
 
 def load_targets() -> tuple[Path, ...]:
@@ -40,14 +42,14 @@ def main() -> int:
         "--select",
         "C901",
         "--ignore-noqa",
-        "--config",
-        "lint.mccabe.max-complexity=15",
     ]
     manifest_result = subprocess.run(
         [
             *command_prefix,
             *(str(target.relative_to(ROOT)) for target in targets),
             *command_suffix,
+            "--config",
+            f"lint.mccabe.max-complexity={TARGET_MAX_COMPLEXITY}",
         ],
         cwd=ROOT,
         check=False,
@@ -55,7 +57,13 @@ def main() -> int:
     if manifest_result.returncode:
         return manifest_result.returncode
     return subprocess.run(
-        [*command_prefix, str(SOURCE_ROOT.relative_to(ROOT)), *command_suffix],
+        [
+            *command_prefix,
+            str(SOURCE_ROOT.relative_to(ROOT)),
+            *command_suffix,
+            "--config",
+            f"lint.mccabe.max-complexity={PACKAGE_MAX_COMPLEXITY}",
+        ],
         cwd=ROOT,
         check=False,
     ).returncode

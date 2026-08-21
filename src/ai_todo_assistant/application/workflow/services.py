@@ -52,6 +52,21 @@ class CloseoutGapRecord:
     excerpt: str = ""
 
 
+@dataclass(frozen=True)
+class _PreparedCodexEntry:
+    entry: dict
+    target_status: str
+    source_ref: str
+    title: str
+    summary: str
+    identities: list[str]
+    existing: WorkItem | None
+    matched_by_identity: bool
+    survivor_before: dict | None
+    previous_status: str | None
+    item: WorkItem
+
+
 class WorkItemService:
     def __init__(self, repository: WorkflowRepository):
         self.repository = repository
@@ -117,106 +132,103 @@ class WorkItemService:
     def import_codex_report(self, report) -> CodexImportResult:
         result = CodexImportResult()
         for entry, target_status in _ordered_codex_entries(report):
-            source_ref = _codex_source_ref(entry)
-            title = _codex_title(entry, source_ref, target_status)
-            summary = _codex_snapshot_summary(entry, report, target_status)
-            identities = _codex_identities(entry, source_ref)
-            existing = self.repository.find_work_item_by_source(WorkItemSource.CODEX.value, source_ref)
-            matched_by_identity = False
-            survivor_before = None
-            merge_conflicts: list[str] = []
-            if not existing:
-                identity_matches = _identity_matches(self.repository, identities)
-                if len(identity_matches) == 1:
-                    existing = identity_matches[0]
-                    matched_by_identity = True
-                    survivor_before = existing.to_dict()
-                elif len(identity_matches) > 1:
-                    result.skipped += 1
-                    conflict = (
-                        f"冲突: {title} | {','.join(identities)} "
-                        f"命中多个工作项，未自动合并"
-                    )
-                    result.details.append(conflict)
-                    merge_conflicts.append(conflict)
-                elif _has_title_collision(self.repository, title):
-                    result.skipped += 1
-                    result.details.append(f"跳过: {title} | 标题冲突，未自动合并")
-            previous_status = existing.status if existing else None
-            item = existing or WorkItem(title=title, source=WorkItemSource.CODEX.value, source_ref=source_ref)
-            item.title = title.strip() or item.title
-            item.sync_summary = summary
-            item.project_path = str(entry.get("cwd") or entry.get("project_path") or item.project_path or "")
-            item.last_synced_at = now_text()
-            for identity in identities:
-                _add_identity(item, identity)
-            _add_source_ref(item, WorkItemSource.CODEX.value, source_ref, "Codex thread")
-            for conflict in merge_conflicts:
-                if conflict not in item.merge_conflicts:
-                    item.merge_conflicts.append(conflict)
-            if target_status != WorkItemStatus.DONE.value:
-                item.next_action = str(entry.get("next_action") or item.next_action)
-
-            item.status = _next_codex_status(previous_status, target_status)
-            _record_reopen_candidate_detail(result, previous_status, target_status, item.title)
-            saved = self.repository.save_work_item(item)
-            if matched_by_identity:
-                result.merged += 1
-                matched_identity = next(
-                    (
-                        identity for identity in identities
-                        if identity.startswith("redmine:") and identity in saved.source_identities
-                    ),
-                    "",
-                ) or next((identity for identity in identities if identity in saved.source_identities), "")
-                detail_suffix = f" | {matched_identity}" if matched_identity else ""
-                result.details.append(f"合并: {title}{detail_suffix}")
-                _record_merge_audit(
-                    saved,
-                    WorkItemSource.CODEX.value,
-                    source_ref,
-                    "identity",
-                    survivor_before=survivor_before,
-                    separated_item=_separated_work_item_snapshot(
-                        title=title,
-                        source=WorkItemSource.CODEX.value,
-                        source_ref=source_ref,
-                        source_identities=identities,
-                        source_refs=[
-                            {
-                                "source": WorkItemSource.CODEX.value,
-                                "source_ref": source_ref,
-                                "label": "Codex thread",
-                            }
-                        ],
-                        status=target_status,
-                        priority=saved.priority,
-                        next_action=str(entry.get("next_action") or ""),
-                        project_path=str(entry.get("cwd") or entry.get("project_path") or ""),
-                        sync_summary=summary,
-                    ),
-                    moved_identities=_new_identities(survivor_before, identities),
-                    moved_source_refs=_new_source_refs(
-                        survivor_before,
-                        [
-                            {
-                                "source": WorkItemSource.CODEX.value,
-                                "source_ref": source_ref,
-                                "label": "Codex thread",
-                            }
-                        ],
-                    ),
-                )
+            prepared = self._prepare_codex_entry(entry, target_status, report, result, clone_existing=False)
+            saved = self.repository.save_work_item(prepared.item)
+            _record_codex_result_classification(result, prepared, saved)
+            if prepared.matched_by_identity:
+                self._record_codex_identity_merge(saved, prepared)
                 self.repository.save_work_item(saved)
-            elif existing:
-                result.updated += 1
-            else:
-                result.created += 1
-            if target_status == WorkItemStatus.DONE.value:
-                self._record_codex_completion_evidence(saved, entry, report)
-            _count_codex_outcome(result, previous_status, saved.status)
+            if prepared.target_status == WorkItemStatus.DONE.value:
+                self._record_codex_completion_evidence(saved, prepared.entry, report)
+            _count_codex_outcome(result, prepared.previous_status, saved.status)
             result.items.append(saved)
         return result
+
+    def _prepare_codex_entry(
+        self,
+        entry: dict,
+        target_status: str,
+        report,
+        result: CodexImportResult,
+        *,
+        clone_existing: bool,
+    ) -> _PreparedCodexEntry:
+        source_ref = _codex_source_ref(entry)
+        title = _codex_title(entry, source_ref, target_status)
+        summary = _codex_snapshot_summary(entry, report, target_status)
+        identities = _codex_identities(entry, source_ref)
+        existing, matched, survivor_before, conflicts = self._resolve_codex_entry(
+            source_ref,
+            title,
+            identities,
+            result,
+        )
+        previous_status = existing.status if existing else None
+        item = _clone_work_item(existing) if clone_existing else existing
+        item = item or WorkItem(title=title, source=WorkItemSource.CODEX.value, source_ref=source_ref)
+        _update_codex_item(item, entry, target_status, title, summary, identities, conflicts, previous_status)
+        _record_reopen_candidate_detail(result, previous_status, target_status, item.title)
+        return _PreparedCodexEntry(
+            entry=entry,
+            target_status=target_status,
+            source_ref=source_ref,
+            title=title,
+            summary=summary,
+            identities=identities,
+            existing=existing,
+            matched_by_identity=matched,
+            survivor_before=survivor_before,
+            previous_status=previous_status,
+            item=item,
+        )
+
+    def _resolve_codex_entry(
+        self,
+        source_ref: str,
+        title: str,
+        identities: list[str],
+        result: CodexImportResult,
+    ) -> tuple[WorkItem | None, bool, dict | None, list[str]]:
+        existing = self.repository.find_work_item_by_source(WorkItemSource.CODEX.value, source_ref)
+        if existing:
+            return existing, False, None, []
+        identity_matches = _identity_matches(self.repository, identities)
+        if len(identity_matches) == 1:
+            existing = identity_matches[0]
+            return existing, True, existing.to_dict(), []
+        if len(identity_matches) > 1:
+            conflict = f"冲突: {title} | {','.join(identities)} 命中多个工作项，未自动合并"
+            result.skipped += 1
+            result.details.append(conflict)
+            return None, False, None, [conflict]
+        if _has_title_collision(self.repository, title):
+            result.skipped += 1
+            result.details.append(f"跳过: {title} | 标题冲突，未自动合并")
+        return None, False, None, []
+
+    def _record_codex_identity_merge(self, saved: WorkItem, prepared: _PreparedCodexEntry) -> None:
+        source_refs = _codex_source_refs(prepared.source_ref)
+        _record_merge_audit(
+            saved,
+            WorkItemSource.CODEX.value,
+            prepared.source_ref,
+            "identity",
+            survivor_before=prepared.survivor_before,
+            separated_item=_separated_work_item_snapshot(
+                title=prepared.title,
+                source=WorkItemSource.CODEX.value,
+                source_ref=prepared.source_ref,
+                source_identities=prepared.identities,
+                source_refs=source_refs,
+                status=prepared.target_status,
+                priority=saved.priority,
+                next_action=str(prepared.entry.get("next_action") or ""),
+                project_path=str(prepared.entry.get("cwd") or prepared.entry.get("project_path") or ""),
+                sync_summary=prepared.summary,
+            ),
+            moved_identities=_new_identities(prepared.survivor_before, prepared.identities),
+            moved_source_refs=_new_source_refs(prepared.survivor_before, source_refs),
+        )
 
     def rollback_merge(self, work_item_id: str, audit_id: str) -> WorkItem:
         item = self.repository.get_work_item(work_item_id)
@@ -263,62 +275,10 @@ class WorkItemService:
     def preview_codex_report(self, report) -> CodexImportResult:
         result = CodexImportResult()
         for entry, target_status in _ordered_codex_entries(report):
-            source_ref = _codex_source_ref(entry)
-            title = _codex_title(entry, source_ref, target_status)
-            summary = _codex_snapshot_summary(entry, report, target_status)
-            identities = _codex_identities(entry, source_ref)
-            existing = self.repository.find_work_item_by_source(WorkItemSource.CODEX.value, source_ref)
-            matched_by_identity = False
-            merge_conflicts: list[str] = []
-            if not existing:
-                identity_matches = _identity_matches(self.repository, identities)
-                if len(identity_matches) == 1:
-                    existing = identity_matches[0]
-                    matched_by_identity = True
-                elif len(identity_matches) > 1:
-                    result.skipped += 1
-                    conflict = (
-                        f"冲突: {title} | {','.join(identities)} "
-                        f"命中多个工作项，未自动合并"
-                    )
-                    result.details.append(conflict)
-                    merge_conflicts.append(conflict)
-                elif _has_title_collision(self.repository, title):
-                    result.skipped += 1
-                    result.details.append(f"跳过: {title} | 标题冲突，未自动合并")
-            previous_status = existing.status if existing else None
-            item = _clone_work_item(existing) if existing else WorkItem(title=title, source=WorkItemSource.CODEX.value, source_ref=source_ref)
-            item.title = title.strip() or item.title
-            item.sync_summary = summary
-            item.project_path = str(entry.get("cwd") or entry.get("project_path") or item.project_path or "")
-            item.last_synced_at = now_text()
-            for identity in identities:
-                _add_identity(item, identity)
-            _add_source_ref(item, WorkItemSource.CODEX.value, source_ref, "Codex thread")
-            for conflict in merge_conflicts:
-                if conflict not in item.merge_conflicts:
-                    item.merge_conflicts.append(conflict)
-            if target_status != WorkItemStatus.DONE.value:
-                item.next_action = str(entry.get("next_action") or item.next_action)
-            item.status = _next_codex_status(previous_status, target_status)
-            _record_reopen_candidate_detail(result, previous_status, target_status, item.title)
-            if matched_by_identity:
-                result.merged += 1
-                matched_identity = next(
-                    (
-                        identity for identity in identities
-                        if identity.startswith("redmine:") and identity in item.source_identities
-                    ),
-                    "",
-                ) or next((identity for identity in identities if identity in item.source_identities), "")
-                detail_suffix = f" | {matched_identity}" if matched_identity else ""
-                result.details.append(f"合并: {title}{detail_suffix}")
-            elif existing:
-                result.updated += 1
-            else:
-                result.created += 1
-            _count_codex_outcome(result, previous_status, item.status)
-            result.items.append(item)
+            prepared = self._prepare_codex_entry(entry, target_status, report, result, clone_existing=True)
+            _record_codex_result_classification(result, prepared, prepared.item)
+            _count_codex_outcome(result, prepared.previous_status, prepared.item.status)
+            result.items.append(prepared.item)
         return result
 
     def split_source_ref(self, work_item_id: str, source: str, source_ref: str, title: str = "") -> WorkItem:
@@ -714,7 +674,7 @@ def _record_merge_audit(
             existing["moved_source_refs"] = list(moved_source_refs or existing.get("moved_source_refs") or [])
             existing["moved_evidence_ids"] = list(moved_evidence_ids or existing.get("moved_evidence_ids") or [])
             return
-    event = {
+    event: dict = {
         "id": f"audit-{uuid.uuid4().hex[:12]}",
         "source": source,
         "source_ref": source_ref,
@@ -733,6 +693,68 @@ def _record_merge_audit(
 
 def _clone_work_item(item: WorkItem | None) -> WorkItem | None:
     return WorkItem.from_dict(item.to_dict()) if item else None
+
+
+def _update_codex_item(
+    item: WorkItem,
+    entry: dict,
+    target_status: str,
+    title: str,
+    summary: str,
+    identities: list[str],
+    conflicts: list[str],
+    previous_status: str | None,
+) -> None:
+    item.title = title.strip() or item.title
+    item.sync_summary = summary
+    item.project_path = str(entry.get("cwd") or entry.get("project_path") or item.project_path or "")
+    item.last_synced_at = now_text()
+    for identity in identities:
+        _add_identity(item, identity)
+    _add_source_ref(item, WorkItemSource.CODEX.value, _codex_source_ref(entry), "Codex thread")
+    for conflict in conflicts:
+        if conflict not in item.merge_conflicts:
+            item.merge_conflicts.append(conflict)
+    if target_status != WorkItemStatus.DONE.value:
+        item.next_action = str(entry.get("next_action") or item.next_action)
+    item.status = _next_codex_status(previous_status, target_status)
+
+
+def _record_codex_result_classification(
+    result: CodexImportResult,
+    prepared: _PreparedCodexEntry,
+    item: WorkItem,
+) -> None:
+    if prepared.matched_by_identity:
+        result.merged += 1
+        matched_identity = _matched_codex_identity(prepared.identities, item.source_identities)
+        detail_suffix = f" | {matched_identity}" if matched_identity else ""
+        result.details.append(f"合并: {prepared.title}{detail_suffix}")
+    elif prepared.existing:
+        result.updated += 1
+    else:
+        result.created += 1
+
+
+def _matched_codex_identity(identities: list[str], item_identities: list[str]) -> str:
+    return next(
+        (
+            identity
+            for identity in identities
+            if identity.startswith("redmine:") and identity in item_identities
+        ),
+        "",
+    ) or next((identity for identity in identities if identity in item_identities), "")
+
+
+def _codex_source_refs(source_ref: str) -> list[dict[str, str]]:
+    return [
+        {
+            "source": WorkItemSource.CODEX.value,
+            "source_ref": source_ref,
+            "label": "Codex thread",
+        }
+    ]
 
 
 def _find_merge_audit(item: WorkItem, audit_id: str) -> dict | None:
@@ -1140,7 +1162,7 @@ def _closeout_gap_records(snapshots: list[SourceSnapshot], project_path: str) ->
 
 def _closeout_gap_candidates(value) -> list:
     if isinstance(value, dict):
-        candidates = []
+        candidates: list[dict | str] = []
         gaps = value.get("gaps")
         if isinstance(gaps, list):
             candidates.extend(item for item in gaps if isinstance(item, (dict, str)))
@@ -1277,9 +1299,9 @@ def _closeout_gap_target(repository: WorkflowRepository, gap: CloseoutGapRecord,
                 matches[item.id] = item
         source, _, source_ref = identity.partition(":")
         if source in {WorkItemSource.REDMINE.value, WorkItemSource.OPENSPEC.value} and source_ref:
-            item = repository.find_work_item_by_source(source, source_ref)
-            if item and item.status != WorkItemStatus.ARCHIVED.value:
-                matches[item.id] = item
+            source_item = repository.find_work_item_by_source(source, source_ref)
+            if source_item and source_item.status != WorkItemStatus.ARCHIVED.value:
+                matches[source_item.id] = source_item
     if len(matches) == 1:
         return next(iter(matches.values()))
     return fallback
