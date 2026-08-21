@@ -28,4 +28,4 @@
 - [x] 5.1 Run focused and full branch-aware pytest, Ruff, both C901 gates, focused mypy, compileall, architecture checks, and diff check.
 - [x] 5.2 Run package build/Twine/isolated-wheel smoke, UTF-8/GBK command smoke, and strict validation for this change and all OpenSpec artifacts.
 - [x] 5.3 Run OCR delegate preview/rule over the exact diff and one fresh compatibility review; resolve material findings and account for exclusions.
-- [ ] 5.4 Publish responsibility-sized commits to a Draft PR with exact evidence, verify remote CI on the immutable head, then perform authorized Ready/merge and archive readback.
+- [x] 5.4 Publish responsibility-sized commits to a Draft PR with exact evidence, verify remote CI on the immutable head, then perform authorized Ready/merge and archive readback.
