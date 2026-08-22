@@ -856,7 +856,9 @@ def _lock_file(handle) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        getattr(msvcrt, "locking")(
+            handle.fileno(), getattr(msvcrt, "LK_NBLCK"), 1
+        )
     else:
         import fcntl
 
@@ -870,7 +872,9 @@ def _unlock_file(handle) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        getattr(msvcrt, "locking")(
+            handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+        )
     else:
         import fcntl
 

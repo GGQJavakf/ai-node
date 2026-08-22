@@ -38,8 +38,8 @@ jobs:
         with:
           node-version: "24"
 
-      - name: Install pinned quality tools
-        run: python -m pip install -r requirements-ci.txt
+      - name: Install package and pinned quality tools
+        run: python -m pip install -r requirements-ci.txt .
 
       - name: Check repository lint
         run: python -m ruff check .
@@ -52,6 +52,9 @@ jobs:
 
       - name: Compile source modules
         run: python -m compileall -q src
+
+      - name: Check static types
+        run: python -m mypy src
 
       - name: Validate all OpenSpec artifacts
         run: npx --yes @fission-ai/openspec@1.4.1 validate --all --strict

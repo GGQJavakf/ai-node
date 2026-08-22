@@ -16,7 +16,7 @@ class SessionMemory:
         if max_messages <= 0:
             raise ValueError("max_messages 必须大于 0")
         self.max_messages = max_messages
-        self._messages = deque(maxlen=max_messages)
+        self._messages: deque[dict] = deque(maxlen=max_messages)
 
     def add_user_message(self, content: str) -> None:
         """记录用户消息。"""
